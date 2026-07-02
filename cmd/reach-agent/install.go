@@ -1118,10 +1118,18 @@ func agentCommandArgs(cfgPath string) []string {
 }
 
 func agentCommand(agentPath, cfgPath string) string {
+	quotedAgent := commandPathQuote(agentPath)
 	if isDiscoverableAgentConfig(cfgPath) {
-		return agentPath
+		return quotedAgent
 	}
-	return agentPath + " run --config " + cfgPath
+	return quotedAgent + " run --config " + commandPathQuote(cfgPath)
+}
+
+func commandPathQuote(path string) string {
+	if runtime.GOOS != "windows" {
+		return path
+	}
+	return `"` + strings.ReplaceAll(path, `"`, `\"`) + `"`
 }
 
 func agentExecStart(agentPath, cfgPath string) string {

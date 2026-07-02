@@ -224,6 +224,8 @@ func installWindowsScheduledTask(ctx context.Context, opt installOptions, cfgPat
 	}
 	script := `
 param([string]$Exe, [string]$Cfg)
+if ([string]::IsNullOrWhiteSpace($Exe)) { throw 'missing reach-agent executable path' }
+if ([string]::IsNullOrWhiteSpace($Cfg)) { throw 'missing reach-agent config path' }
 $taskPath = '\Reach\'
 $taskName = 'reach-agent'
 $taskArgs = 'run --config "' + ($Cfg -replace '"', '\"') + '"'
@@ -290,7 +292,20 @@ func windowsDistroString() string {
 }
 
 func powershellOutput(ctx context.Context, script string, args ...string) (string, error) {
-	cmdArgs := []string{"-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script}
+	f, err := os.CreateTemp("", "reach-powershell-*.ps1")
+	if err != nil {
+		return "", err
+	}
+	scriptPath := f.Name()
+	defer func() { _ = os.Remove(scriptPath) }()
+	if _, err := f.WriteString(script); err != nil {
+		_ = f.Close()
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		return "", err
+	}
+	cmdArgs := []string{"-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", scriptPath}
 	cmdArgs = append(cmdArgs, args...)
 	cmd := exec.CommandContext(ctx, "powershell.exe", cmdArgs...)
 	out, err := cmd.CombinedOutput()
