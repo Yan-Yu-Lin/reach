@@ -31,7 +31,7 @@ prompt() {
 
 usage() {
   cat <<'USAGE'
-Reach Linux setup
+Reach target setup
 
 Usage:
   setup.sh [--name NAME] [--token GOD_CODE] [--target-user USER] [--transport auto|direct|websocket] [--yes]
@@ -64,7 +64,8 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-[ "$(uname -s 2>/dev/null || true)" = "Linux" ] || die "Reach setup currently supports Linux only."
+os="$(uname -s 2>/dev/null || true)"
+case "$os" in Linux|Darwin) ;; *) die "Reach setup currently supports Linux and macOS only (got ${os:-unknown})." ;; esac
 case "$TRANSPORT" in auto|direct|websocket) ;; *) die "--transport must be one of: auto, direct, websocket" ;; esac
 have curl || die "curl is required"
 if [ -z "$TOKEN" ] && [ -n "$TOKEN_FILE" ] && [ -r "$TOKEN_FILE" ]; then
@@ -119,6 +120,10 @@ run_priv() {
 repair_user() {
   [ -x "$AGENT_PATH" ] || die "$AGENT_PATH is missing; rerun setup.sh install."
   "$AGENT_PATH" check --config "$HOME/.config/reach/agent.yaml" || true
+  if [ "${os:-}" = "Darwin" ] && have launchctl; then
+    launchctl kickstart -k "gui/$(id -u)/dev.arthurlin.reach-agent" 2>/dev/null || true
+    launchctl print "gui/$(id -u)/dev.arthurlin.reach-agent" >/dev/null 2>&1 && { log "User reach-agent restarted."; exit 0; }
+  fi
   if have systemctl && systemctl --user list-units >/dev/null 2>&1; then
     systemctl --user restart reach-agent.service || true
     systemctl --user --quiet is-active reach-agent.service && { log "User reach-agent restarted."; exit 0; }
@@ -131,9 +136,15 @@ if [ "$ACTION" = "repair" ] && [ "$UPDATE_AGENT" != 1 ]; then
   if [ "$INSTALL_MODE" = "system" ] && [ -x /opt/reach/reach-agent ]; then
     log "Checking system reach-agent configuration."
     run_priv /opt/reach/reach-agent check --config /etc/reach/agent.yaml || true
-    log "Restarting reach-agent.service."
-    run_priv systemctl restart reach-agent.service
-    run_priv systemctl --no-pager --quiet is-active reach-agent.service || die "reach-agent.service is not active; check journalctl -u reach-agent"
+    if [ "$os" = "Darwin" ] && have launchctl; then
+      log "Restarting launchd Reach agent."
+      run_priv launchctl kickstart -k system/dev.arthurlin.reach-agent || true
+      run_priv launchctl print system/dev.arthurlin.reach-agent >/dev/null 2>&1 || die "launchd service is not loaded"
+    else
+      log "Restarting reach-agent.service."
+      run_priv systemctl restart reach-agent.service
+      run_priv systemctl --no-pager --quiet is-active reach-agent.service || die "reach-agent.service is not active; check journalctl -u reach-agent"
+    fi
     log "Repair complete."
   else
     repair_user
@@ -151,12 +162,22 @@ if [ "$ACTION" = "uninstall" ] || [ "$ACTION" = "reinstall" ]; then
   fi
   # Best-effort cleanup for very old installs or missing binaries.
   if [ "$USE_SUDO" = 1 ]; then
-    $SUDO systemctl disable --now reach-agent.service 2>/dev/null || true
-    $SUDO systemctl disable --now reach-tunnel.service 2>/dev/null || true
-    $SUDO rm -f /etc/systemd/system/reach-agent.service /etc/systemd/system/reach-tunnel.service
-    $SUDO systemctl daemon-reload 2>/dev/null || true
+    if [ "$os" = "Darwin" ] && have launchctl; then
+      $SUDO launchctl bootout system/dev.arthurlin.reach-agent 2>/dev/null || true
+      $SUDO launchctl disable system/dev.arthurlin.reach-agent 2>/dev/null || true
+      $SUDO rm -f /Library/LaunchDaemons/dev.arthurlin.reach-agent.plist
+    else
+      $SUDO systemctl disable --now reach-agent.service 2>/dev/null || true
+      $SUDO systemctl disable --now reach-tunnel.service 2>/dev/null || true
+      $SUDO rm -f /etc/systemd/system/reach-agent.service /etc/systemd/system/reach-tunnel.service
+      $SUDO systemctl daemon-reload 2>/dev/null || true
+    fi
   fi
-  if have systemctl; then
+  if [ "$os" = "Darwin" ] && have launchctl; then
+    launchctl bootout "gui/$(id -u)/dev.arthurlin.reach-agent" 2>/dev/null || true
+    launchctl disable "gui/$(id -u)/dev.arthurlin.reach-agent" 2>/dev/null || true
+    rm -f "$HOME/Library/LaunchAgents/dev.arthurlin.reach-agent.plist"
+  elif have systemctl; then
     systemctl --user disable --now reach-agent.service 2>/dev/null || true
     rm -f "$HOME/.config/systemd/user/reach-agent.service"
     systemctl --user daemon-reload 2>/dev/null || true
@@ -167,13 +188,15 @@ if [ "$ACTION" = "uninstall" ] || [ "$ACTION" = "reinstall" ]; then
 fi
 
 arch="$(uname -m 2>/dev/null || echo unknown)"
-case "$arch" in
-  x86_64|amd64) asset="reach-agent_linux_amd64" ;;
-  aarch64|arm64) asset="reach-agent_linux_arm64" ;;
-  armv7l|armv7*) asset="reach-agent_linux_armv7" ;;
-  armv6l|armv6*) asset="reach-agent_linux_armv6" ;;
-  i386|i686) asset="reach-agent_linux_386" ;;
-  *) die "Unsupported architecture: $arch" ;;
+case "$os/$arch" in
+  Linux/x86_64|Linux/amd64) asset="reach-agent_linux_amd64" ;;
+  Linux/aarch64|Linux/arm64) asset="reach-agent_linux_arm64" ;;
+  Linux/armv7l|Linux/armv7*) asset="reach-agent_linux_armv7" ;;
+  Linux/armv6l|Linux/armv6*) asset="reach-agent_linux_armv6" ;;
+  Linux/i386|Linux/i686) asset="reach-agent_linux_386" ;;
+  Darwin/x86_64|Darwin/amd64) asset="reach-agent_darwin_amd64" ;;
+  Darwin/arm64|Darwin/aarch64) asset="reach-agent_darwin_arm64" ;;
+  *) die "Unsupported platform/architecture: $os/$arch" ;;
 esac
 
 base_url="${API_URL%/}/downloads/reach-agent/v${REACH_AGENT_VERSION}"
@@ -181,7 +204,7 @@ tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 
 log "Source code: $SOURCE_URL"
-log "Downloading reach-agent $REACH_AGENT_VERSION for $arch."
+log "Downloading reach-agent $REACH_AGENT_VERSION for $os/$arch."
 curl -fsSL "$base_url/$asset" -o "$tmpdir/reach-agent"
 curl -fsSL "$base_url/checksums.txt" -o "$tmpdir/checksums.txt"
 expected="$(awk -v f="$asset" '$2 == f {print $1}' "$tmpdir/checksums.txt")"

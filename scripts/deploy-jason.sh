@@ -35,13 +35,14 @@ version_from_git() {
 
 build_agent() {
   local out="$1"
-  local arch="$2"
-  local arm="${3:-}"
-  echo "[deploy] building reach-agent (${arch}${arm:+ GOARM=$arm})..."
+  local goos="$2"
+  local arch="$3"
+  local arm="${4:-}"
+  echo "[deploy] building reach-agent (${goos}/${arch}${arm:+ GOARM=$arm})..."
   if [ -n "$arm" ]; then
-    GOOS=linux GOARCH="$arch" GOARM="$arm" CGO_ENABLED=0 go build -ldflags "$AGENT_LDFLAGS" -o "$out" ./cmd/reach-agent
+    GOOS="$goos" GOARCH="$arch" GOARM="$arm" CGO_ENABLED=0 go build -ldflags "$AGENT_LDFLAGS" -o "$out" ./cmd/reach-agent
   else
-    GOOS=linux GOARCH="$arch" CGO_ENABLED=0 go build -ldflags "$AGENT_LDFLAGS" -o "$out" ./cmd/reach-agent
+    GOOS="$goos" GOARCH="$arch" CGO_ENABLED=0 go build -ldflags "$AGENT_LDFLAGS" -o "$out" ./cmd/reach-agent
   fi
 }
 
@@ -49,7 +50,7 @@ write_checksums() {
   local dir="$1"
   (
     cd "$dir"
-    sha256sum reach-agent_linux_* > checksums.txt
+    sha256sum reach-agent_* > checksums.txt
   )
 }
 
@@ -80,6 +81,8 @@ require_agent_artifacts() {
     reach-agent_linux_386 \
     reach-agent_linux_armv6 \
     reach-agent_linux_armv7 \
+    reach-agent_darwin_amd64 \
+    reach-agent_darwin_arm64 \
     checksums.txt \
     manifest.json \
     manifest.json.minisig; do
@@ -105,11 +108,13 @@ if [ -z "$ARTIFACT_DIR" ]; then
   ARTIFACT_DIR="$BUILD_ARTIFACT_DIR"
   trap 'rm -rf "$BUILD_ARTIFACT_DIR"' EXIT
 
-  build_agent "$ARTIFACT_DIR/reach-agent_linux_amd64" amd64
-  build_agent "$ARTIFACT_DIR/reach-agent_linux_arm64" arm64
-  build_agent "$ARTIFACT_DIR/reach-agent_linux_386" 386
-  build_agent "$ARTIFACT_DIR/reach-agent_linux_armv6" arm 6
-  build_agent "$ARTIFACT_DIR/reach-agent_linux_armv7" arm 7
+  build_agent "$ARTIFACT_DIR/reach-agent_linux_amd64" linux amd64
+  build_agent "$ARTIFACT_DIR/reach-agent_linux_arm64" linux arm64
+  build_agent "$ARTIFACT_DIR/reach-agent_linux_386" linux 386
+  build_agent "$ARTIFACT_DIR/reach-agent_linux_armv6" linux arm 6
+  build_agent "$ARTIFACT_DIR/reach-agent_linux_armv7" linux arm 7
+  build_agent "$ARTIFACT_DIR/reach-agent_darwin_amd64" darwin amd64
+  build_agent "$ARTIFACT_DIR/reach-agent_darwin_arm64" darwin arm64
   write_checksums "$ARTIFACT_DIR"
   create_manifest "$ARTIFACT_DIR"
   if sign_manifest_if_configured "$ARTIFACT_DIR"; then
@@ -136,6 +141,7 @@ GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o /tmp/reachd-build .
 echo "[deploy] building reach-ws-carrier (linux/amd64 static)..."
 GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o /tmp/reach-ws-carrier ./cmd/reach-ws-carrier
 
+
 echo "[deploy] installing binaries..."
 sudo install -m 0755 /tmp/reachd-build /opt/reach/reachd
 sudo install -m 0755 /tmp/reach-ws-carrier /opt/reach/reach-ws-carrier
@@ -153,6 +159,8 @@ sudo install -m 0755 "$ARTIFACT_DIR/reach-agent_linux_arm64" "$AGENT_STAGING_DIR
 sudo install -m 0755 "$ARTIFACT_DIR/reach-agent_linux_386" "$AGENT_STAGING_DIR/reach-agent_linux_386"
 sudo install -m 0755 "$ARTIFACT_DIR/reach-agent_linux_armv6" "$AGENT_STAGING_DIR/reach-agent_linux_armv6"
 sudo install -m 0755 "$ARTIFACT_DIR/reach-agent_linux_armv7" "$AGENT_STAGING_DIR/reach-agent_linux_armv7"
+sudo install -m 0755 "$ARTIFACT_DIR/reach-agent_darwin_amd64" "$AGENT_STAGING_DIR/reach-agent_darwin_amd64"
+sudo install -m 0755 "$ARTIFACT_DIR/reach-agent_darwin_arm64" "$AGENT_STAGING_DIR/reach-agent_darwin_arm64"
 sudo install -m 0644 "$ARTIFACT_DIR/checksums.txt" "$AGENT_STAGING_DIR/checksums.txt"
 sudo install -m 0644 "$ARTIFACT_DIR/manifest.json" "$AGENT_STAGING_DIR/manifest.json"
 if [ -f "$ARTIFACT_DIR/manifest.json.minisig" ]; then

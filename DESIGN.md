@@ -44,7 +44,7 @@ The operator can provide a pre-authorized invite/admin token to skip the approva
 ```text
 curl -fsSL https://your-domain.example.com/setup.sh | bash
 
-1. Detect Linux environment and install mode.
+1. Detect Linux/macOS environment and install mode.
 2. Collect machine name, target user, and auth token or approval request.
 3. Generate a tunnel keypair locally.
 4. Send only the tunnel public key to the API.
