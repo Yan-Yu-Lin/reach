@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -764,6 +765,9 @@ func (d *Daemon) startLocalSSH(ctx context.Context) error {
 	}
 	if d.cfg.LocalSSH.UserSSHD {
 		return d.startUserSSHD(ctx)
+	}
+	if runtime.GOOS == "darwin" {
+		return startDarwinSystemSSHD(ctx)
 	}
 	if _, err := exec.LookPath("systemctl"); err == nil {
 		for _, svc := range d.cfg.LocalSSH.ServiceNames {

@@ -210,8 +210,10 @@ func stripUpdateWorkerOnlyArgs(args []string) []string {
 }
 
 func performBinaryUpdate(ctx context.Context, st reachInstallState, opt updateBinaryOptions) error {
-	if runtime.GOOS != "linux" {
-		return fmt.Errorf("reach-agent update-binary currently supports Linux only")
+	switch runtime.GOOS {
+	case "linux", "darwin":
+	default:
+		return fmt.Errorf("reach-agent update-binary currently supports Linux and macOS only (got %s)", runtime.GOOS)
 	}
 	if st.InstallMode == "system" && os.Geteuid() != 0 {
 		return fmt.Errorf("system Reach install at %s requires root to update; rerun with sudo", st.AgentPath)
@@ -300,24 +302,38 @@ func detectAgentAsset() (string, error) {
 	if arch == "" {
 		arch = runtime.GOARCH
 	}
-	return agentAssetForArch(arch)
+	return agentAssetForOSArch(runtime.GOOS, arch)
 }
 
 func agentAssetForArch(arch string) (string, error) {
-	switch strings.ToLower(strings.TrimSpace(arch)) {
-	case "x86_64", "amd64":
-		return "reach-agent_linux_amd64", nil
-	case "aarch64", "arm64":
-		return "reach-agent_linux_arm64", nil
-	case "armv7l", "armv7", "armv7hl":
-		return "reach-agent_linux_armv7", nil
-	case "armv6l", "armv6":
-		return "reach-agent_linux_armv6", nil
-	case "i386", "i686", "386":
-		return "reach-agent_linux_386", nil
-	default:
-		return "", fmt.Errorf("unsupported architecture %q", arch)
+	return agentAssetForOSArch("linux", arch)
+}
+
+func agentAssetForOSArch(goos, arch string) (string, error) {
+	normArch := strings.ToLower(strings.TrimSpace(arch))
+	switch goos {
+	case "linux":
+		switch normArch {
+		case "x86_64", "amd64":
+			return "reach-agent_linux_amd64", nil
+		case "aarch64", "arm64":
+			return "reach-agent_linux_arm64", nil
+		case "armv7l", "armv7", "armv7hl":
+			return "reach-agent_linux_armv7", nil
+		case "armv6l", "armv6":
+			return "reach-agent_linux_armv6", nil
+		case "i386", "i686", "386":
+			return "reach-agent_linux_386", nil
+		}
+	case "darwin":
+		switch normArch {
+		case "x86_64", "amd64":
+			return "reach-agent_darwin_amd64", nil
+		case "aarch64", "arm64":
+			return "reach-agent_darwin_arm64", nil
+		}
 	}
+	return "", fmt.Errorf("unsupported platform %s/%s", goos, arch)
 }
 
 func verifyCandidateChecksum(ctx context.Context, apiURL, version, asset, candidatePath string) error {
@@ -631,7 +647,32 @@ func confirmUpdate(st reachInstallState) error {
 	return nil
 }
 
+func restartLaunchdAgent(ctx context.Context, st reachInstallState) error {
+	if _, err := exec.LookPath("launchctl"); err == nil {
+		label := launchdLabel
+		if st.InstallMode == "system" {
+			service := "system/" + label
+			if out, err := exec.CommandContext(ctx, "launchctl", "kickstart", "-k", service).CombinedOutput(); err == nil {
+				return nil
+			} else {
+				fmt.Printf("[reach warning] launchctl kickstart failed, trying pid-file fallback: %s\n", strings.TrimSpace(string(out)))
+			}
+		} else {
+			service := fmt.Sprintf("gui/%d/%s", os.Getuid(), label)
+			if out, err := exec.CommandContext(ctx, "launchctl", "kickstart", "-k", service).CombinedOutput(); err == nil {
+				return nil
+			} else {
+				fmt.Printf("[reach warning] launchctl kickstart failed, trying pid-file fallback: %s\n", strings.TrimSpace(string(out)))
+			}
+		}
+	}
+	return restartDetachedAgent(st)
+}
+
 func restartReachAgent(ctx context.Context, st reachInstallState) error {
+	if runtime.GOOS == "darwin" {
+		return restartLaunchdAgent(ctx, st)
+	}
 	if st.InstallMode == "system" {
 		if _, err := exec.LookPath("systemctl"); err == nil {
 			cmd := exec.CommandContext(ctx, "systemctl", "restart", "reach-agent.service")

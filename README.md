@@ -12,7 +12,7 @@ Reach is designed to be transparent. If someone asks “what did that setup comm
 
 ## What Reach is for
 
-Reach is useful when you want SSH access to Linux machines that live behind NAT, campus/company networks, home routers, mobile hotspots, or other restrictive networks.
+Reach is useful when you want SSH access to Linux or macOS machines that live behind NAT, campus/company networks, home routers, mobile hotspots, or other restrictive networks.
 
 Typical flows:
 
@@ -41,7 +41,7 @@ Hub server
   └─ optional WebSocket carrier
        │
        ▼
-Target Linux machine
+Target Linux/macOS machine
   ├─ reach-agent service
   ├─ outbound SSH tunnel to the hub
   └─ local sshd / user sshd / internal Go SSH server
@@ -84,8 +84,8 @@ The setup script supports two install modes.
 
 | Mode | When used | Main paths |
 |---|---|---|
-| System mode | Run as root, or with accepted passwordless sudo | `/opt/reach`, `/etc/reach`, `/var/lib/reach`, `/etc/systemd/system/reach-agent.service` |
-| User mode | No root/sudo | `~/.local/bin/reach-agent`, `~/.config/reach`, `~/.local/share/reach`, `~/.config/systemd/user/reach-agent.service` |
+| System mode | Run as root, or with accepted passwordless sudo | Linux: `/opt/reach`, `/etc/reach`, `/var/lib/reach`, `/etc/systemd/system/reach-agent.service`; macOS: same Reach paths with `/Library/LaunchDaemons/dev.arthurlin.reach-agent.plist` |
+| User mode | No root/sudo | Linux: `~/.local/bin/reach-agent`, `~/.config/reach`, `~/.local/share/reach`, `~/.config/systemd/user/reach-agent.service`; macOS: same Reach paths with `~/Library/LaunchAgents/dev.arthurlin.reach-agent.plist` |
 
 ### Files and directories
 
@@ -124,8 +124,10 @@ Depending on the target’s SSH setup, user mode may also create:
 
 Reach tries persistence in this order:
 
-- system install: systemd service, then root crontab, then detached process fallback;
-- user install: user systemd service, then user crontab, then detached process fallback.
+- Linux system install: systemd service, then root crontab, then detached process fallback;
+- Linux user install: user systemd service, then user crontab, then detached process fallback;
+- macOS system install: LaunchDaemon, then detached process fallback;
+- macOS user install: LaunchAgent, then detached process fallback.
 
 Service names/files include:
 
@@ -155,7 +157,7 @@ Reach needs something listening on the target loopback address so the reverse tu
 It tries:
 
 1. **Existing system sshd** on `127.0.0.1:22`.
-2. **System-managed sshd** in system mode; on apt-based systems it may install `openssh-server` if needed.
+2. **System-managed sshd** in system mode; on apt-based Linux systems it may install `openssh-server` if needed, and on macOS it can enable Remote Login via `systemsetup`/launchd when run with sufficient privileges.
 3. **User-mode sshd** if an `sshd` binary exists but root is unavailable.
 4. **Internal Go SSH server** if no usable sshd exists. This is shell-only, loopback-only, public-key-only, and has no SFTP/agent/X11/port forwarding.
 
@@ -333,9 +335,11 @@ sudo mkdir -p "$OUT"
 
 GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-X main.version=${VERSION}" -o /tmp/reach-agent_linux_amd64 ./cmd/reach-agent
 GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags "-X main.version=${VERSION}" -o /tmp/reach-agent_linux_arm64 ./cmd/reach-agent
+GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-X main.version=${VERSION}" -o /tmp/reach-agent_darwin_amd64 ./cmd/reach-agent
+GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -ldflags "-X main.version=${VERSION}" -o /tmp/reach-agent_darwin_arm64 ./cmd/reach-agent
 
-sudo install -m 0755 /tmp/reach-agent_linux_* "$OUT/"
-(cd "$OUT" && sudo sha256sum reach-agent_linux_* | sudo tee checksums.txt >/dev/null)
+sudo install -m 0755 /tmp/reach-agent_linux_* /tmp/reach-agent_darwin_* "$OUT/"
+(cd "$OUT" && sudo sha256sum reach-agent_* | sudo tee checksums.txt >/dev/null)
 ```
 
 ### 2. Install hub files

@@ -31,6 +31,24 @@ func TestAgentAssetForArch(t *testing.T) {
 	}
 }
 
+func TestAgentAssetForOSArchDarwin(t *testing.T) {
+	tests := map[string]string{
+		"x86_64":  "reach-agent_darwin_amd64",
+		"amd64":   "reach-agent_darwin_amd64",
+		"aarch64": "reach-agent_darwin_arm64",
+		"arm64":   "reach-agent_darwin_arm64",
+	}
+	for arch, want := range tests {
+		got, err := agentAssetForOSArch("darwin", arch)
+		if err != nil {
+			t.Fatalf("agentAssetForOSArch(darwin, %q) returned error: %v", arch, err)
+		}
+		if got != want {
+			t.Fatalf("agentAssetForOSArch(darwin, %q)=%q want %q", arch, got, want)
+		}
+	}
+}
+
 func TestChecksumForAsset(t *testing.T) {
 	sum := sha256.Sum256([]byte("agent"))
 	hexSum := hex.EncodeToString(sum[:])

@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	osuser "os/user"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -126,8 +127,10 @@ func installCommand(ctx context.Context, args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if runtime.GOOS != "linux" {
-		return fmt.Errorf("reach-agent install currently supports Linux only")
+	switch runtime.GOOS {
+	case "linux", "darwin":
+	default:
+		return fmt.Errorf("reach-agent install currently supports Linux and macOS only (got %s)", runtime.GOOS)
 	}
 	if opt.InstallMode == "auto" {
 		if os.Geteuid() == 0 {
@@ -304,7 +307,7 @@ func hostnameDefault() string {
 	if h, err := os.Hostname(); err == nil && h != "" {
 		return normalizeSlug(h)
 	}
-	return "linux"
+	return runtime.GOOS
 }
 
 func defaultTargetUser() string {
@@ -367,20 +370,31 @@ func validateTargetUserLocal(s string) error {
 }
 
 func userHome(user string) (string, error) {
-	out, err := exec.Command("getent", "passwd", user).Output()
-	if err != nil {
-		if user == currentUsername() {
-			if home, homeErr := os.UserHomeDir(); homeErr == nil && home != "" {
-				return home, nil
+	if u, err := osuser.Lookup(user); err == nil && u.HomeDir != "" {
+		return u.HomeDir, nil
+	}
+	if runtime.GOOS == "darwin" {
+		if out, err := exec.Command("dscl", ".", "-read", "/Users/"+user, "NFSHomeDirectory").Output(); err == nil {
+			if _, home, ok := strings.Cut(strings.TrimSpace(string(out)), ":"); ok && strings.TrimSpace(home) != "" {
+				return strings.TrimSpace(home), nil
 			}
 		}
-		return "", fmt.Errorf("user %q does not exist according to getent passwd", user)
 	}
-	parts := strings.Split(strings.TrimSpace(string(out)), ":")
-	if len(parts) < 6 || parts[5] == "" {
-		return "", fmt.Errorf("could not determine home for user %q", user)
+	if _, lookErr := exec.LookPath("getent"); lookErr == nil {
+		out, err := exec.Command("getent", "passwd", user).Output()
+		if err == nil {
+			parts := strings.Split(strings.TrimSpace(string(out)), ":")
+			if len(parts) >= 6 && parts[5] != "" {
+				return parts[5], nil
+			}
+		}
 	}
-	return parts[5], nil
+	if user == currentUsername() {
+		if home, homeErr := os.UserHomeDir(); homeErr == nil && home != "" {
+			return home, nil
+		}
+	}
+	return "", fmt.Errorf("could not determine home for user %q", user)
 }
 
 func prepareLocalSSH(ctx context.Context, opt installOptions, targetHome string, compat SSHCompatConfig) (localSSHPlan, error) {
@@ -618,6 +632,9 @@ func keyTypeFileStem(keyType string) string {
 }
 
 func ensureSystemSSHD(ctx context.Context) error {
+	if runtime.GOOS == "darwin" {
+		return startDarwinSystemSSHD(ctx)
+	}
 	if err := startSSHServices(ctx); err == nil {
 		return nil
 	}
@@ -634,6 +651,9 @@ func ensureSystemSSHD(ctx context.Context) error {
 }
 
 func startSSHServices(ctx context.Context) error {
+	if runtime.GOOS == "darwin" {
+		return startDarwinSystemSSHD(ctx)
+	}
 	services := []string{"ssh", "sshd"}
 	if _, err := exec.LookPath("systemctl"); err == nil {
 		for _, svc := range services {
@@ -748,7 +768,7 @@ func installAdminKeys(authFile, user string, prov provisionResponse, chownFiles 
 		return err
 	}
 	if chownFiles {
-		_ = exec.Command("chown", "-R", user+":"+user, sshDir).Run()
+		chownPathToUser(sshDir, user)
 	}
 	return nil
 }
@@ -820,6 +840,14 @@ func extractTarGzFile(data []byte, base string) ([]byte, error) {
 }
 
 func runtimeArchKey() string {
+	if runtime.GOOS == "darwin" {
+		switch runtime.GOARCH {
+		case "amd64":
+			return "darwin_amd64"
+		case "arm64":
+			return "darwin_arm64"
+		}
+	}
 	switch runtime.GOARCH {
 	case "amd64":
 		return "linux_amd64"
@@ -864,9 +892,9 @@ func buildAgentConfig(opt installOptions, prov provisionResponse, keyPath, known
 	cfg.Install.ConfigDir = opt.ConfigDir
 	cfg.Install.DataDir = opt.DataDir
 	cfg.Install.AgentPath = opt.AgentPath
-	cfg.Install.PersistenceBackend = "reach-agent-" + opt.InstallMode
+	cfg.Install.PersistenceBackend = persistenceBackendName(opt.InstallMode)
 	cfg.Install.PersistenceQuality = "unknown"
-	cfg.Install.PersistenceRebootSafe = opt.InstallMode == "system"
+	cfg.Install.PersistenceRebootSafe = opt.InstallMode == "system" || runtime.GOOS == "darwin"
 	cfg.Transport.Mode = opt.Transport
 	cfg.Transport.ProbeHost = prov.Hub.PublicHost
 	cfg.Transport.ProbePort = prov.Hub.SSHPort
@@ -895,6 +923,24 @@ func writeYAML0600(path string, v any) error {
 }
 
 func installPersistence(ctx context.Context, opt installOptions, cfgPath string) error {
+	if runtime.GOOS == "darwin" {
+		if opt.InstallMode == "system" {
+			if err := installLaunchDaemon(ctx, opt.AgentPath, cfgPath, opt.DataDir); err == nil {
+				return nil
+			} else {
+				fmt.Printf("[reach warning] launchd daemon unavailable: %v\n", err)
+			}
+			fmt.Printf("[reach warning] no reboot-safe system persistence available; starting a detached agent for this boot only.\n")
+			return startDetached(opt.AgentPath, cfgPath, filepath.Join(opt.DataDir, "agent.log"), filepath.Join(opt.DataDir, "reach-agent.pid"))
+		}
+		if err := installLaunchAgent(ctx, opt.AgentPath, cfgPath, opt.DataDir); err == nil {
+			return nil
+		} else {
+			fmt.Printf("[reach warning] launchd agent unavailable: %v\n", err)
+		}
+		fmt.Printf("[reach warning] no login persistence available; starting a detached agent for this login only.\n")
+		return startDetached(opt.AgentPath, cfgPath, filepath.Join(opt.DataDir, "agent.log"), filepath.Join(opt.DataDir, "reach-agent.pid"))
+	}
 	if opt.InstallMode == "system" {
 		if err := installSystemdService(ctx, opt.AgentPath, cfgPath); err == nil {
 			return nil
@@ -921,6 +967,184 @@ func installPersistence(ctx context.Context, opt installOptions, cfgPath string)
 	}
 	fmt.Printf("[reach warning] no reboot-safe user persistence available; starting a detached agent for this login only.\n")
 	return startDetached(opt.AgentPath, cfgPath, filepath.Join(opt.DataDir, "agent.log"), filepath.Join(opt.DataDir, "reach-agent.pid"))
+}
+
+const launchdLabel = "dev.arthurlin.reach-agent"
+
+func persistenceBackendName(mode string) string {
+	if runtime.GOOS == "darwin" {
+		if mode == "system" {
+			return "launchd-daemon"
+		}
+		return "launchd-agent"
+	}
+	return "reach-agent-" + mode
+}
+
+func persistenceServiceName(mode string) string {
+	if runtime.GOOS == "darwin" {
+		return launchdLabel
+	}
+	return "reach-agent.service"
+}
+
+func startDarwinSystemSSHD(ctx context.Context) error {
+	if err := probeSSH(ctx, "127.0.0.1", 22, 3*time.Second); err == nil {
+		return nil
+	}
+	var attempts []string
+	if _, err := exec.LookPath("systemsetup"); err == nil {
+		if out, err := exec.CommandContext(ctx, "systemsetup", "-setremotelogin", "on").CombinedOutput(); err != nil {
+			attempts = append(attempts, fmt.Sprintf("systemsetup: %s", strings.TrimSpace(string(out))))
+		}
+	}
+	if _, err := exec.LookPath("launchctl"); err == nil {
+		if out, err := exec.CommandContext(ctx, "launchctl", "enable", "system/com.openssh.sshd").CombinedOutput(); err != nil {
+			attempts = append(attempts, fmt.Sprintf("launchctl enable: %s", strings.TrimSpace(string(out))))
+		}
+		if out, err := exec.CommandContext(ctx, "launchctl", "kickstart", "-k", "system/com.openssh.sshd").CombinedOutput(); err != nil {
+			attempts = append(attempts, fmt.Sprintf("launchctl kickstart: %s", strings.TrimSpace(string(out))))
+		}
+	}
+	if err := probeSSH(ctx, "127.0.0.1", 22, 5*time.Second); err == nil {
+		return nil
+	}
+	if len(attempts) == 0 {
+		attempts = append(attempts, "no systemsetup/launchctl attempt output")
+	}
+	return fmt.Errorf("could not enable macOS Remote Login on 127.0.0.1:22; admin/root and Full Disk Access may be required: %s", strings.Join(attempts, "; "))
+}
+
+func chownPathToUser(path, username string) {
+	uid, gid := lookupUIDGID(username)
+	if uid != "" && gid != "" {
+		_ = exec.Command("chown", "-R", uid+":"+gid, path).Run()
+		return
+	}
+	_ = exec.Command("chown", "-R", username+":"+username, path).Run()
+}
+
+func lookupUIDGID(username string) (string, string) {
+	if u, err := osuser.Lookup(username); err == nil && u.Uid != "" && u.Gid != "" {
+		return u.Uid, u.Gid
+	}
+	uidOut, uidErr := exec.Command("id", "-u", username).Output()
+	gidOut, gidErr := exec.Command("id", "-g", username).Output()
+	if uidErr == nil && gidErr == nil {
+		return strings.TrimSpace(string(uidOut)), strings.TrimSpace(string(gidOut))
+	}
+	return "", ""
+}
+
+func installLaunchAgent(ctx context.Context, agentPath, cfgPath, dataDir string) error {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return fmt.Errorf("could not determine home for LaunchAgent")
+	}
+	plistDir := filepath.Join(home, "Library", "LaunchAgents")
+	plistPath := filepath.Join(plistDir, launchdLabel+".plist")
+	if err := os.MkdirAll(plistDir, 0o755); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		return err
+	}
+	logPath := filepath.Join(dataDir, "agent.log")
+	if err := os.WriteFile(plistPath, []byte(launchdPlist(launchdLabel, agentPath, cfgPath, dataDir, logPath)), 0o644); err != nil {
+		return err
+	}
+	domain := fmt.Sprintf("gui/%d", os.Getuid())
+	return bootstrapLaunchd(ctx, domain, launchdLabel, plistPath)
+}
+
+func installLaunchDaemon(ctx context.Context, agentPath, cfgPath, dataDir string) error {
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("LaunchDaemon install needs root")
+	}
+	plistDir := "/Library/LaunchDaemons"
+	plistPath := filepath.Join(plistDir, launchdLabel+".plist")
+	if err := os.MkdirAll(plistDir, 0o755); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		return err
+	}
+	logPath := filepath.Join(dataDir, "agent.log")
+	if err := os.WriteFile(plistPath, []byte(launchdPlist(launchdLabel, agentPath, cfgPath, dataDir, logPath)), 0o644); err != nil {
+		return err
+	}
+	return bootstrapLaunchd(ctx, "system", launchdLabel, plistPath)
+}
+
+func bootstrapLaunchd(ctx context.Context, domain, label, plistPath string) error {
+	if _, err := exec.LookPath("launchctl"); err != nil {
+		return err
+	}
+	service := domain + "/" + label
+	_ = exec.CommandContext(ctx, "launchctl", "bootout", service).Run()
+	_ = exec.CommandContext(ctx, "launchctl", "bootout", domain, plistPath).Run()
+	if out, err := exec.CommandContext(ctx, "launchctl", "bootstrap", domain, plistPath).CombinedOutput(); err != nil {
+		return fmt.Errorf("launchctl bootstrap %s failed: %w: %s", domain, err, strings.TrimSpace(string(out)))
+	}
+	if out, err := exec.CommandContext(ctx, "launchctl", "enable", service).CombinedOutput(); err != nil {
+		return fmt.Errorf("launchctl enable %s failed: %w: %s", service, err, strings.TrimSpace(string(out)))
+	}
+	if out, err := exec.CommandContext(ctx, "launchctl", "kickstart", "-k", service).CombinedOutput(); err != nil {
+		return fmt.Errorf("launchctl kickstart %s failed: %w: %s", service, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func launchdPlist(label, agentPath, cfgPath, dataDir, logPath string) string {
+	args := append([]string{agentPath}, agentCommandArgs(cfgPath)...)
+	var b strings.Builder
+	b.WriteString(`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+`)
+	b.WriteString("  <key>Label</key>\n  <string>" + plistEscape(label) + "</string>\n")
+	b.WriteString("  <key>ProgramArguments</key>\n  <array>\n")
+	for _, arg := range args {
+		b.WriteString("    <string>" + plistEscape(arg) + "</string>\n")
+	}
+	b.WriteString("  </array>\n")
+	b.WriteString("  <key>RunAtLoad</key>\n  <true/>\n")
+	b.WriteString("  <key>KeepAlive</key>\n  <true/>\n")
+	b.WriteString("  <key>WorkingDirectory</key>\n  <string>" + plistEscape(dataDir) + "</string>\n")
+	b.WriteString("  <key>StandardOutPath</key>\n  <string>" + plistEscape(logPath) + "</string>\n")
+	b.WriteString("  <key>StandardErrorPath</key>\n  <string>" + plistEscape(logPath) + "</string>\n")
+	b.WriteString("</dict>\n</plist>\n")
+	return b.String()
+}
+
+func plistEscape(s string) string {
+	r := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", "\"", "&quot;", "'", "&apos;")
+	return r.Replace(s)
+}
+
+func stopLaunchd(ctx context.Context, opt installOptions) {
+	if _, err := exec.LookPath("launchctl"); err != nil {
+		return
+	}
+	label := launchdLabel
+	if svc := readInstallEnv(filepath.Join(opt.ConfigDir, "install.env"))["SERVICE_NAME"]; svc != "" {
+		label = svc
+	}
+	if opt.InstallMode == "system" {
+		service := "system/" + label
+		_ = exec.CommandContext(ctx, "launchctl", "bootout", service).Run()
+		_ = exec.CommandContext(ctx, "launchctl", "disable", service).Run()
+		_ = os.Remove(filepath.Join("/Library/LaunchDaemons", label+".plist"))
+		return
+	}
+	domain := fmt.Sprintf("gui/%d", os.Getuid())
+	service := domain + "/" + label
+	_ = exec.CommandContext(ctx, "launchctl", "bootout", service).Run()
+	_ = exec.CommandContext(ctx, "launchctl", "disable", service).Run()
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		_ = os.Remove(filepath.Join(home, "Library", "LaunchAgents", label+".plist"))
+	}
 }
 
 func installSystemdService(ctx context.Context, agentPath, cfgPath string) error {
@@ -1112,7 +1336,7 @@ func firstField(s string) string {
 }
 
 func writeInstallEnv(opt installOptions, prov provisionResponse, cfgPath string, plan localSSHPlan) {
-	content := fmt.Sprintf("MACHINE_ID='%s'\nSLUG='%s'\nREMOTE_PORT='%d'\nTUNNEL_USER='%s'\nTRANSPORT='%s'\nINSTALL_MODE='%s'\nSERVICE_NAME='reach-agent.service'\nCONFIG_DIR='%s'\nDATA_DIR='%s'\nAGENT_CONFIG='%s'\nAGENT_PATH='%s'\nPID_FILE='%s'\nTARGET_AUTH_FILE='%s'\nLOCAL_SSH_MODE='%s'\nLOCAL_FORWARD_PORT='%d'\n", prov.Machine.ID, prov.Machine.Slug, prov.Tunnel.RemotePort, prov.Tunnel.UnixUser, opt.Transport, opt.InstallMode, opt.ConfigDir, opt.DataDir, cfgPath, opt.AgentPath, filepath.Join(opt.DataDir, "reach-agent.pid"), plan.AuthFile, plan.Mode, plan.LocalPort)
+	content := fmt.Sprintf("MACHINE_ID='%s'\nSLUG='%s'\nREMOTE_PORT='%d'\nTUNNEL_USER='%s'\nTRANSPORT='%s'\nINSTALL_MODE='%s'\nSERVICE_NAME='%s'\nCONFIG_DIR='%s'\nDATA_DIR='%s'\nAGENT_CONFIG='%s'\nAGENT_PATH='%s'\nPID_FILE='%s'\nTARGET_AUTH_FILE='%s'\nLOCAL_SSH_MODE='%s'\nLOCAL_FORWARD_PORT='%d'\n", prov.Machine.ID, prov.Machine.Slug, prov.Tunnel.RemotePort, prov.Tunnel.UnixUser, opt.Transport, opt.InstallMode, persistenceServiceName(opt.InstallMode), opt.ConfigDir, opt.DataDir, cfgPath, opt.AgentPath, filepath.Join(opt.DataDir, "reach-agent.pid"), plan.AuthFile, plan.Mode, plan.LocalPort)
 	_ = os.WriteFile(filepath.Join(opt.ConfigDir, "install.env"), []byte(content), 0o600)
 }
 
@@ -1220,6 +1444,13 @@ func readInstallEnv(path string) map[string]string {
 }
 
 func stopPersistence(ctx context.Context, opt installOptions) {
+	if runtime.GOOS == "darwin" {
+		stopLaunchd(ctx, opt)
+		removeReachCrontab(ctx)
+		_ = exec.CommandContext(ctx, "pkill", "-f", "reach-agent run --config").Run()
+		_ = exec.CommandContext(ctx, "pkill", "-f", "user-sshd/sshd_config").Run()
+		return
+	}
 	if opt.InstallMode == "system" {
 		_ = exec.CommandContext(ctx, "systemctl", "disable", "--now", "reach-agent.service").Run()
 		_ = exec.CommandContext(ctx, "systemctl", "disable", "--now", "reach-tunnel.service").Run()
@@ -1322,7 +1553,7 @@ func normalizeSlug(s string) string {
 		s = "box-" + s
 	}
 	if len(s) < 3 {
-		s = "box-linux"
+		s = "box-" + runtime.GOOS
 	}
 	return s
 }

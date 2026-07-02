@@ -14,13 +14,14 @@ AGENT_DOWNLOAD_DIR="/var/lib/reach/downloads/reach-agent/v${AGENT_VERSION}"
 
 build_agent() {
   local out="$1"
-  local arch="$2"
-  local arm="${3:-}"
-  echo "[deploy] building reach-agent (${arch}${arm:+ GOARM=$arm})..."
+  local goos="$2"
+  local arch="$3"
+  local arm="${4:-}"
+  echo "[deploy] building reach-agent (${goos}/${arch}${arm:+ GOARM=$arm})..."
   if [ -n "$arm" ]; then
-    GOOS=linux GOARCH="$arch" GOARM="$arm" CGO_ENABLED=0 go build -ldflags "$AGENT_LDFLAGS" -o "$out" ./cmd/reach-agent
+    GOOS="$goos" GOARCH="$arch" GOARM="$arm" CGO_ENABLED=0 go build -ldflags "$AGENT_LDFLAGS" -o "$out" ./cmd/reach-agent
   else
-    GOOS=linux GOARCH="$arch" CGO_ENABLED=0 go build -ldflags "$AGENT_LDFLAGS" -o "$out" ./cmd/reach-agent
+    GOOS="$goos" GOARCH="$arch" CGO_ENABLED=0 go build -ldflags "$AGENT_LDFLAGS" -o "$out" ./cmd/reach-agent
   fi
 }
 
@@ -33,11 +34,13 @@ GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o /tmp/reachd-build .
 echo "[deploy] building reach-ws-carrier (linux/amd64 static)..."
 GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o /tmp/reach-ws-carrier ./cmd/reach-ws-carrier
 
-build_agent /tmp/reach-agent-amd64 amd64
-build_agent /tmp/reach-agent-arm64 arm64
-build_agent /tmp/reach-agent-386 386
-build_agent /tmp/reach-agent-armv6 arm 6
-build_agent /tmp/reach-agent-armv7 arm 7
+build_agent /tmp/reach-agent-amd64 linux amd64
+build_agent /tmp/reach-agent-arm64 linux arm64
+build_agent /tmp/reach-agent-386 linux 386
+build_agent /tmp/reach-agent-armv6 linux arm 6
+build_agent /tmp/reach-agent-armv7 linux arm 7
+build_agent /tmp/reach-agent-darwin-amd64 darwin amd64
+build_agent /tmp/reach-agent-darwin-arm64 darwin arm64
 
 echo "[deploy] installing binaries..."
 sudo install -m 0755 /tmp/reachd-build /opt/reach/reachd
@@ -52,9 +55,11 @@ sudo install -m 0755 /tmp/reach-agent-arm64 "$AGENT_DOWNLOAD_DIR/reach-agent_lin
 sudo install -m 0755 /tmp/reach-agent-386 "$AGENT_DOWNLOAD_DIR/reach-agent_linux_386"
 sudo install -m 0755 /tmp/reach-agent-armv6 "$AGENT_DOWNLOAD_DIR/reach-agent_linux_armv6"
 sudo install -m 0755 /tmp/reach-agent-armv7 "$AGENT_DOWNLOAD_DIR/reach-agent_linux_armv7"
-rm -f /tmp/reach-agent-amd64 /tmp/reach-agent-arm64 /tmp/reach-agent-386 /tmp/reach-agent-armv6 /tmp/reach-agent-armv7
+sudo install -m 0755 /tmp/reach-agent-darwin-amd64 "$AGENT_DOWNLOAD_DIR/reach-agent_darwin_amd64"
+sudo install -m 0755 /tmp/reach-agent-darwin-arm64 "$AGENT_DOWNLOAD_DIR/reach-agent_darwin_arm64"
+rm -f /tmp/reach-agent-amd64 /tmp/reach-agent-arm64 /tmp/reach-agent-386 /tmp/reach-agent-armv6 /tmp/reach-agent-armv7 /tmp/reach-agent-darwin-amd64 /tmp/reach-agent-darwin-arm64
 cd "$AGENT_DOWNLOAD_DIR"
-sudo sh -c 'sha256sum reach-agent_linux_* > checksums.txt'
+sudo sh -c 'sha256sum reach-agent_* > checksums.txt'
 cd - >/dev/null
 
 echo "[deploy] updating setup.sh..."
