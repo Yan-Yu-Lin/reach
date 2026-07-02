@@ -185,24 +185,69 @@ rm -f /tmp/reach-latest-version /tmp/reach-latest.json
 
 echo "[deploy] updating setup scripts..."
 CONFIG_API_URL="${REACH_API_URL:-}"
-if [ -z "$CONFIG_API_URL" ] && [ -r /etc/reach/config.yaml ]; then
-  CONFIG_API_URL="$(awk '
-    $1 == "default_hub:" { in_hub=1; next }
-    in_hub && $1 == "api_url:" { sub(/^[^:]*:[[:space:]]*/, ""); gsub(/^\"|\"$/, ""); print; exit }
-    in_hub && /^[^[:space:]]/ { in_hub=0 }
-  ' /etc/reach/config.yaml)"
+read_reach_api_url_awk='
+  $1 == "default_hub:" { in_hub=1; next }
+  in_hub && $1 == "api_url:" {
+    sub(/^[^:]*:[[:space:]]*/, "")
+    sub(/[[:space:]]+#.*$/, "")
+    gsub(/^[[:space:]]+|[[:space:]]+$/, "")
+    gsub(/^\"|\"$/, "")
+    print
+    exit
+  }
+  in_hub && /^[^[:space:]]/ { in_hub=0 }
+'
+if [ -z "$CONFIG_API_URL" ]; then
+  if [ -r /etc/reach/config.yaml ]; then
+    CONFIG_API_URL="$(awk "$read_reach_api_url_awk" /etc/reach/config.yaml)"
+  elif sudo -n test -r /etc/reach/config.yaml 2>/dev/null; then
+    CONFIG_API_URL="$(sudo awk "$read_reach_api_url_awk" /etc/reach/config.yaml)"
+  fi
 fi
-CONFIG_API_URL="${CONFIG_API_URL:-https://tunnels.your-domain.example}"
+if [ -z "$CONFIG_API_URL" ] || [ "$CONFIG_API_URL" = "https://tunnels.your-domain.example" ]; then
+  echo "[deploy] ERROR: could not determine real Reach API URL. Set REACH_API_URL or configure default_hub.api_url in /etc/reach/config.yaml." >&2
+  exit 1
+fi
+case "$CONFIG_API_URL" in
+  http://*|https://*) ;;
+  *) echo "[deploy] ERROR: invalid Reach API URL: $CONFIG_API_URL" >&2; exit 1 ;;
+esac
 CONFIG_API_URL_SED="$(printf '%s' "$CONFIG_API_URL" | sed 's/[&|\\]/\\&/g')"
+AGENT_VERSION_SED="$(printf '%s' "$AGENT_VERSION" | sed 's/[&|\\]/\\&/g')"
 sed \
-  -e "s|^REACH_AGENT_VERSION=.*|REACH_AGENT_VERSION=\"\${REACH_AGENT_VERSION:-${AGENT_VERSION}}\"|" \
+  -e "s|^REACH_AGENT_VERSION=.*|REACH_AGENT_VERSION=\"\${REACH_AGENT_VERSION:-${AGENT_VERSION_SED}}\"|" \
   -e "s|^API_URL=.*|API_URL=\"\${REACH_API_URL:-${CONFIG_API_URL_SED}}\"|" \
+  -e "s|https://tunnels.your-domain.example|${CONFIG_API_URL_SED}|g" \
   setup.sh > /tmp/reach-setup.sh
-sudo install -m 0644 /tmp/reach-setup.sh /var/lib/reach/setup.sh
 sed \
   -e "s|\"https://tunnels.your-domain.example\"|\"${CONFIG_API_URL_SED}\"|g" \
-  -e "s|\"0.1.0-alpha\"|\"${AGENT_VERSION}\"|g" \
+  -e "s|\"0.1.0-alpha\"|\"${AGENT_VERSION_SED}\"|g" \
   setup.ps1 > /tmp/reach-setup.ps1
+if grep -q 'tunnels.your-domain.example' /tmp/reach-setup.sh; then
+  echo "[deploy] ERROR: setup.sh still contains placeholder API URL after rendering" >&2
+  exit 1
+fi
+if grep -q 'tunnels.your-domain.example' /tmp/reach-setup.ps1; then
+  echo "[deploy] ERROR: setup.ps1 still contains placeholder API URL after rendering" >&2
+  exit 1
+fi
+if ! grep -Fq "$CONFIG_API_URL" /tmp/reach-setup.sh; then
+  echo "[deploy] ERROR: setup.sh does not contain rendered API URL $CONFIG_API_URL" >&2
+  exit 1
+fi
+if ! grep -Fq "$CONFIG_API_URL" /tmp/reach-setup.ps1; then
+  echo "[deploy] ERROR: setup.ps1 does not contain rendered API URL $CONFIG_API_URL" >&2
+  exit 1
+fi
+if ! grep -Fq "$AGENT_VERSION" /tmp/reach-setup.sh; then
+  echo "[deploy] ERROR: setup.sh does not contain rendered agent version $AGENT_VERSION" >&2
+  exit 1
+fi
+if ! grep -Fq "$AGENT_VERSION" /tmp/reach-setup.ps1; then
+  echo "[deploy] ERROR: setup.ps1 does not contain rendered agent version $AGENT_VERSION" >&2
+  exit 1
+fi
+sudo install -m 0644 /tmp/reach-setup.sh /var/lib/reach/setup.sh
 sudo install -m 0644 /tmp/reach-setup.ps1 /var/lib/reach/setup.ps1
 rm -f /tmp/reach-setup.sh /tmp/reach-setup.ps1
 
