@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -18,9 +19,31 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"aead.dev/minisign"
 )
 
 const defaultUpdateRollbackAfter = 5 * time.Minute
+
+const releaseManifestProject = "reach-agent"
+
+var releaseManifestPublicKeys = []string{
+	"RWQ+MT09E8yd1V1tf3J3NI3Eb7L9DgMgNrN4SiqdrTs1Y2C61++bpyYY",
+}
+
+type releaseManifest struct {
+	Schema    int                     `json:"schema"`
+	Project   string                  `json:"project"`
+	Version   string                  `json:"version"`
+	GitCommit string                  `json:"git_commit,omitempty"`
+	CreatedAt string                  `json:"created_at"`
+	Assets    map[string]releaseAsset `json:"assets"`
+}
+
+type releaseAsset struct {
+	SHA256 string `json:"sha256"`
+	Size   int64  `json:"size"`
+}
 
 type updateBinaryOptions struct {
 	Version       string
@@ -243,7 +266,7 @@ func performBinaryUpdate(ctx context.Context, st reachInstallState, opt updateBi
 		}
 		candidatePath, cleanup = path, done
 	} else {
-		if err := verifyCandidateChecksum(ctx, apiURL, opt.Version, asset, candidatePath); err != nil {
+		if err := verifyCandidateManifest(ctx, apiURL, opt.Version, asset, candidatePath); err != nil {
 			return err
 		}
 	}
@@ -253,7 +276,11 @@ func performBinaryUpdate(ctx context.Context, st reachInstallState, opt updateBi
 	if err != nil {
 		return err
 	}
-	fmt.Printf("[reach] candidate binary preflight OK: version=%s\n", strings.TrimSpace(candidateVersion))
+	candidateVersion = strings.TrimSpace(candidateVersion)
+	if candidateVersion != opt.Version {
+		return fmt.Errorf("candidate version mismatch: binary reports %q but requested %q", candidateVersion, opt.Version)
+	}
+	fmt.Printf("[reach] candidate binary preflight OK: version=%s\n", candidateVersion)
 
 	id := time.Now().UTC().Format("20060102T150405Z")
 	if err := os.MkdirAll(filepath.Join(st.DataDir, "update-backups"), 0o700); err != nil {
@@ -266,7 +293,7 @@ func performBinaryUpdate(ctx context.Context, st reachInstallState, opt updateBi
 	fmt.Printf("[reach] backed up current binary to %s\n", backupPath)
 
 	confirmFlag := filepath.Join(st.DataDir, "update-confirm-required")
-	if err := os.WriteFile(confirmFlag, []byte(fmt.Sprintf("backup=%s\ninstalled_at=%s\ncandidate_version=%s\n", backupPath, time.Now().UTC().Format(time.RFC3339), strings.TrimSpace(candidateVersion))), 0o600); err != nil {
+	if err := os.WriteFile(confirmFlag, []byte(fmt.Sprintf("backup=%s\ninstalled_at=%s\ncandidate_version=%s\n", backupPath, time.Now().UTC().Format(time.RFC3339), candidateVersion)), 0o600); err != nil {
 		return fmt.Errorf("write confirmation flag: %w", err)
 	}
 
@@ -320,36 +347,21 @@ func agentAssetForArch(arch string) (string, error) {
 	}
 }
 
-func verifyCandidateChecksum(ctx context.Context, apiURL, version, asset, candidatePath string) error {
+func verifyCandidateManifest(ctx context.Context, apiURL, version, asset, candidatePath string) error {
 	if apiURL == "" {
 		return fmt.Errorf("--api-url is required to verify --candidate")
 	}
 	baseURL := strings.TrimRight(apiURL, "/") + "/downloads/reach-agent/v" + version
-	tmpDir, err := os.MkdirTemp("", "reach-agent-checksums-*")
+	manifest, releaseAsset, err := downloadAndVerifyReleaseManifest(ctx, baseURL, version, asset)
 	if err != nil {
 		return err
 	}
-	defer os.RemoveAll(tmpDir)
-	checksumsPath := filepath.Join(tmpDir, "checksums.txt")
-	if err := downloadFile(ctx, baseURL+"/checksums.txt", checksumsPath, 4<<20); err != nil {
-		return err
-	}
-	checksums, err := os.ReadFile(checksumsPath)
+	actual, err := verifyFileSHA256(candidatePath, releaseAsset)
 	if err != nil {
-		return err
+		return fmt.Errorf("candidate verification failed for %s: %w", asset, err)
 	}
-	expected, err := checksumForAsset(checksums, asset)
-	if err != nil {
-		return err
-	}
-	actual, err := fileSHA256Hex(candidatePath)
-	if err != nil {
-		return err
-	}
-	if !strings.EqualFold(actual, expected) {
-		return fmt.Errorf("checksum mismatch for %s: got %s expected %s", asset, actual, expected)
-	}
-	fmt.Printf("[reach] candidate checksum verified: %s\n", actual)
+	fmt.Printf("[reach] signed release manifest verified: version=%s created_at=%s\n", manifest.Version, manifest.CreatedAt)
+	fmt.Printf("[reach] candidate checksum verified from signed manifest: %s\n", actual)
 	return nil
 }
 
@@ -360,44 +372,145 @@ func downloadAgentCandidate(ctx context.Context, apiURL, version, asset string) 
 	}
 	cleanup := func() { _ = os.RemoveAll(tmpDir) }
 	baseURL := strings.TrimRight(apiURL, "/") + "/downloads/reach-agent/v" + version
+	manifest, releaseAsset, err := downloadAndVerifyReleaseManifest(ctx, baseURL, version, asset)
+	if err != nil {
+		cleanup()
+		return "", nil, err
+	}
 	binURL := baseURL + "/" + asset
-	checksumsURL := baseURL + "/checksums.txt"
 	binPath := filepath.Join(tmpDir, "reach-agent")
-	checksumsPath := filepath.Join(tmpDir, "checksums.txt")
+	fmt.Printf("[reach] signed release manifest verified: version=%s created_at=%s\n", manifest.Version, manifest.CreatedAt)
 	fmt.Printf("[reach] downloading %s\n", binURL)
-	if err := downloadFile(ctx, binURL, binPath, 128<<20); err != nil {
+	if err := downloadFile(ctx, binURL, binPath, maxDownloadBytes(releaseAsset.Size)); err != nil {
 		cleanup()
 		return "", nil, err
 	}
-	if err := downloadFile(ctx, checksumsURL, checksumsPath, 4<<20); err != nil {
-		cleanup()
-		return "", nil, err
-	}
-	checksums, err := os.ReadFile(checksumsPath)
+	actual, err := verifyFileSHA256(binPath, releaseAsset)
 	if err != nil {
 		cleanup()
-		return "", nil, err
-	}
-	expected, err := checksumForAsset(checksums, asset)
-	if err != nil {
-		cleanup()
-		return "", nil, err
-	}
-	actual, err := fileSHA256Hex(binPath)
-	if err != nil {
-		cleanup()
-		return "", nil, err
-	}
-	if !strings.EqualFold(actual, expected) {
-		cleanup()
-		return "", nil, fmt.Errorf("checksum mismatch for %s: got %s expected %s", asset, actual, expected)
+		return "", nil, fmt.Errorf("download verification failed for %s: %w", asset, err)
 	}
 	if err := os.Chmod(binPath, 0o755); err != nil {
 		cleanup()
 		return "", nil, err
 	}
-	fmt.Printf("[reach] checksum verified: %s\n", actual)
+	fmt.Printf("[reach] checksum verified from signed manifest: %s\n", actual)
 	return binPath, cleanup, nil
+}
+
+func downloadAndVerifyReleaseManifest(ctx context.Context, baseURL, version, asset string) (releaseManifest, releaseAsset, error) {
+	tmpDir, err := os.MkdirTemp("", "reach-agent-manifest-*")
+	if err != nil {
+		return releaseManifest{}, releaseAsset{}, err
+	}
+	defer os.RemoveAll(tmpDir)
+	manifestPath := filepath.Join(tmpDir, "manifest.json")
+	sigPath := filepath.Join(tmpDir, "manifest.json.minisig")
+	if err := downloadFile(ctx, baseURL+"/manifest.json", manifestPath, 1<<20); err != nil {
+		return releaseManifest{}, releaseAsset{}, err
+	}
+	if err := downloadFile(ctx, baseURL+"/manifest.json.minisig", sigPath, 16<<10); err != nil {
+		return releaseManifest{}, releaseAsset{}, err
+	}
+	manifestBytes, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return releaseManifest{}, releaseAsset{}, err
+	}
+	sigBytes, err := os.ReadFile(sigPath)
+	if err != nil {
+		return releaseManifest{}, releaseAsset{}, err
+	}
+	if err := verifyReleaseManifestSignature(manifestBytes, sigBytes); err != nil {
+		return releaseManifest{}, releaseAsset{}, err
+	}
+	manifest, assetInfo, err := parseReleaseManifest(manifestBytes, version, asset)
+	if err != nil {
+		return releaseManifest{}, releaseAsset{}, err
+	}
+	return manifest, assetInfo, nil
+}
+
+func verifyReleaseManifestSignature(manifestBytes, sigBytes []byte) error {
+	var parseErrs []string
+	for _, keyText := range releaseManifestPublicKeys {
+		keyText = strings.TrimSpace(keyText)
+		if keyText == "" {
+			continue
+		}
+		var publicKey minisign.PublicKey
+		if err := publicKey.UnmarshalText([]byte(keyText)); err != nil {
+			parseErrs = append(parseErrs, err.Error())
+			continue
+		}
+		if minisign.Verify(publicKey, manifestBytes, sigBytes) {
+			return nil
+		}
+	}
+	if len(parseErrs) > 0 {
+		return fmt.Errorf("release manifest signature verification failed (public key parse errors: %s)", strings.Join(parseErrs, "; "))
+	}
+	return fmt.Errorf("release manifest signature verification failed")
+}
+
+func parseReleaseManifest(manifestBytes []byte, version, asset string) (releaseManifest, releaseAsset, error) {
+	var manifest releaseManifest
+	if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
+		return releaseManifest{}, releaseAsset{}, fmt.Errorf("parse release manifest: %w", err)
+	}
+	if manifest.Schema != 1 {
+		return releaseManifest{}, releaseAsset{}, fmt.Errorf("unsupported release manifest schema %d", manifest.Schema)
+	}
+	if manifest.Project != releaseManifestProject {
+		return releaseManifest{}, releaseAsset{}, fmt.Errorf("release manifest project %q does not match %q", manifest.Project, releaseManifestProject)
+	}
+	if manifest.Version != version {
+		return releaseManifest{}, releaseAsset{}, fmt.Errorf("release manifest version %q does not match requested %q", manifest.Version, version)
+	}
+	assetInfo, ok := manifest.Assets[asset]
+	if !ok {
+		return releaseManifest{}, releaseAsset{}, fmt.Errorf("release manifest has no asset %s", asset)
+	}
+	if err := validateReleaseAsset(asset, assetInfo); err != nil {
+		return releaseManifest{}, releaseAsset{}, err
+	}
+	return manifest, assetInfo, nil
+}
+
+func validateReleaseAsset(asset string, releaseAsset releaseAsset) error {
+	if len(releaseAsset.SHA256) != sha256.Size*2 {
+		return fmt.Errorf("invalid sha256 length for %s", asset)
+	}
+	if _, err := hex.DecodeString(releaseAsset.SHA256); err != nil {
+		return fmt.Errorf("invalid sha256 for %s: %w", asset, err)
+	}
+	if releaseAsset.Size <= 0 {
+		return fmt.Errorf("invalid size for %s: %d", asset, releaseAsset.Size)
+	}
+	return nil
+}
+
+func verifyFileSHA256(path string, releaseAsset releaseAsset) (string, error) {
+	if st, err := os.Stat(path); err != nil {
+		return "", err
+	} else if st.Size() != releaseAsset.Size {
+		return "", fmt.Errorf("size mismatch: got %d expected %d", st.Size(), releaseAsset.Size)
+	}
+	actual, err := fileSHA256Hex(path)
+	if err != nil {
+		return "", err
+	}
+	if !strings.EqualFold(actual, releaseAsset.SHA256) {
+		return "", fmt.Errorf("checksum mismatch: got %s expected %s", actual, releaseAsset.SHA256)
+	}
+	return actual, nil
+}
+
+func maxDownloadBytes(size int64) int64 {
+	const defaultMax = 128 << 20
+	if size <= 0 || size > defaultMax {
+		return defaultMax
+	}
+	return size
 }
 
 func downloadFile(ctx context.Context, url, path string, maxBytes int64) error {

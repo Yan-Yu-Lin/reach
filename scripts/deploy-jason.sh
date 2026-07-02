@@ -4,13 +4,34 @@ set -Eeuo pipefail
 # Deploy Reach to a hub server from the repo checked out on that hub.
 # Example: ssh <hub-alias> 'cd ~/reach && bash scripts/deploy-jason.sh'
 # Or locally on the hub: cd ~/reach && bash scripts/deploy-jason.sh
+#
+# Agent release versioning:
+# - REACH_AGENT_VERSION overrides everything.
+# - Exact git tag vX.Y.Z[...suffix] publishes version X.Y.Z[...suffix].
+# - Untagged deploys publish REACH_VERSION_BASE-dev.YYYYmmddTHHMMSSZ.g<sha>.
+#
+# Signed agent artifacts:
+# - Preferred: pass REACH_AGENT_ARTIFACT_DIR containing pre-built binaries,
+#   manifest.json, manifest.json.minisig, and checksums.txt. This keeps the
+#   release signing private key off the hub.
+# - Fallback: if building on the hub, set REACH_RELEASE_KEY plus optional
+#   REACH_RELEASE_KEY_PASSWORD_FILE/REACH_RELEASE_KEY_PASSWORD to sign there.
 
 cd "$(dirname "$0")/.."
 
 export CGO_ENABLED=0
-AGENT_VERSION="${REACH_AGENT_VERSION:-0.1.0-alpha}"
-AGENT_LDFLAGS="-X main.version=${AGENT_VERSION}"
-AGENT_DOWNLOAD_DIR="/var/lib/reach/downloads/reach-agent/v${AGENT_VERSION}"
+
+version_from_git() {
+  local tag sha ts base
+  if tag="$(git describe --tags --exact-match --match 'v[0-9]*' 2>/dev/null)"; then
+    printf '%s\n' "${tag#v}"
+    return 0
+  fi
+  sha="$(git rev-parse --short=12 HEAD)"
+  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  base="${REACH_VERSION_BASE:-0.1.0}"
+  printf '%s-dev.%s.g%s\n' "$base" "$ts" "$sha"
+}
 
 build_agent() {
   local out="$1"
@@ -24,8 +45,90 @@ build_agent() {
   fi
 }
 
+write_checksums() {
+  local dir="$1"
+  (
+    cd "$dir"
+    sha256sum reach-agent_linux_* > checksums.txt
+  )
+}
+
+create_manifest() {
+  local dir="$1"
+  go run ./cmd/reach-release manifest --dir "$dir" --version "$AGENT_VERSION" --commit "$(git rev-parse HEAD)"
+}
+
+sign_manifest_if_configured() {
+  local dir="$1"
+  local key_args=()
+  if [ -z "${REACH_RELEASE_KEY:-}" ]; then
+    return 1
+  fi
+  key_args+=(--key "$REACH_RELEASE_KEY")
+  if [ -n "${REACH_RELEASE_KEY_PASSWORD_FILE:-}" ]; then
+    key_args+=(--password-file "$REACH_RELEASE_KEY_PASSWORD_FILE")
+  fi
+  go run ./cmd/reach-release sign "${key_args[@]}" --manifest "$dir/manifest.json" --out "$dir/manifest.json.minisig" --trusted-comment "reach-agent version=$AGENT_VERSION commit=$(git rev-parse HEAD)"
+}
+
+require_agent_artifacts() {
+  local dir="$1"
+  local f
+  for f in \
+    reach-agent_linux_amd64 \
+    reach-agent_linux_arm64 \
+    reach-agent_linux_386 \
+    reach-agent_linux_armv6 \
+    reach-agent_linux_armv7 \
+    checksums.txt \
+    manifest.json \
+    manifest.json.minisig; do
+    [ -f "$dir/$f" ] || { echo "[deploy] ERROR: missing artifact $dir/$f" >&2; exit 1; }
+  done
+}
+
 echo "[deploy] pulling latest..."
 git pull --ff-only
+
+AGENT_VERSION="${REACH_AGENT_VERSION:-$(version_from_git)}"
+AGENT_LDFLAGS="-X main.version=${AGENT_VERSION}"
+AGENT_DOWNLOAD_ROOT="/var/lib/reach/downloads/reach-agent"
+AGENT_DOWNLOAD_DIR="${AGENT_DOWNLOAD_ROOT}/v${AGENT_VERSION}"
+AGENT_STAGING_DIR="${AGENT_DOWNLOAD_ROOT}/.v${AGENT_VERSION}.tmp.$$"
+ARTIFACT_DIR="${REACH_AGENT_ARTIFACT_DIR:-}"
+BUILD_ARTIFACT_DIR=""
+
+echo "[deploy] agent version: ${AGENT_VERSION}"
+
+if [ -z "$ARTIFACT_DIR" ]; then
+  BUILD_ARTIFACT_DIR="$(mktemp -d)"
+  ARTIFACT_DIR="$BUILD_ARTIFACT_DIR"
+  trap 'rm -rf "$BUILD_ARTIFACT_DIR"' EXIT
+
+  build_agent "$ARTIFACT_DIR/reach-agent_linux_amd64" amd64
+  build_agent "$ARTIFACT_DIR/reach-agent_linux_arm64" arm64
+  build_agent "$ARTIFACT_DIR/reach-agent_linux_386" 386
+  build_agent "$ARTIFACT_DIR/reach-agent_linux_armv6" arm 6
+  build_agent "$ARTIFACT_DIR/reach-agent_linux_armv7" arm 7
+  write_checksums "$ARTIFACT_DIR"
+  create_manifest "$ARTIFACT_DIR"
+  if sign_manifest_if_configured "$ARTIFACT_DIR"; then
+    echo "[deploy] signed release manifest"
+  elif [ "${REACH_REQUIRE_SIGNED_MANIFEST:-0}" = 1 ]; then
+    echo "[deploy] ERROR: REACH_REQUIRE_SIGNED_MANIFEST=1 but REACH_RELEASE_KEY is not set" >&2
+    exit 1
+  else
+    echo "[deploy] WARNING: manifest.json.minisig not created; update-binary will reject this release"
+  fi
+else
+  require_agent_artifacts "$ARTIFACT_DIR"
+fi
+
+if [ -e "$AGENT_DOWNLOAD_DIR" ] && [ "${REACH_OVERWRITE_VERSION:-0}" != 1 ]; then
+  echo "[deploy] ERROR: $AGENT_DOWNLOAD_DIR already exists; refusing to overwrite immutable release" >&2
+  echo "[deploy] Set REACH_OVERWRITE_VERSION=1 only for emergency rebuilds of the same version." >&2
+  exit 1
+fi
 
 echo "[deploy] building reachd (linux/amd64 static)..."
 GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o /tmp/reachd-build .
@@ -33,29 +136,35 @@ GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o /tmp/reachd-build .
 echo "[deploy] building reach-ws-carrier (linux/amd64 static)..."
 GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o /tmp/reach-ws-carrier ./cmd/reach-ws-carrier
 
-build_agent /tmp/reach-agent-amd64 amd64
-build_agent /tmp/reach-agent-arm64 arm64
-build_agent /tmp/reach-agent-386 386
-build_agent /tmp/reach-agent-armv6 arm 6
-build_agent /tmp/reach-agent-armv7 arm 7
-
 echo "[deploy] installing binaries..."
 sudo install -m 0755 /tmp/reachd-build /opt/reach/reachd
 sudo install -m 0755 /tmp/reach-ws-carrier /opt/reach/reach-ws-carrier
-sudo install -m 0755 /tmp/reach-agent-amd64 /opt/reach/reach-agent
+sudo install -m 0755 "$ARTIFACT_DIR/reach-agent_linux_amd64" /opt/reach/reach-agent
 rm -f /tmp/reachd-build /tmp/reach-ws-carrier
 
-echo "[deploy] updating hosted agent downloads..."
-sudo mkdir -p "$AGENT_DOWNLOAD_DIR"
-sudo install -m 0755 /tmp/reach-agent-amd64 "$AGENT_DOWNLOAD_DIR/reach-agent_linux_amd64"
-sudo install -m 0755 /tmp/reach-agent-arm64 "$AGENT_DOWNLOAD_DIR/reach-agent_linux_arm64"
-sudo install -m 0755 /tmp/reach-agent-386 "$AGENT_DOWNLOAD_DIR/reach-agent_linux_386"
-sudo install -m 0755 /tmp/reach-agent-armv6 "$AGENT_DOWNLOAD_DIR/reach-agent_linux_armv6"
-sudo install -m 0755 /tmp/reach-agent-armv7 "$AGENT_DOWNLOAD_DIR/reach-agent_linux_armv7"
-rm -f /tmp/reach-agent-amd64 /tmp/reach-agent-arm64 /tmp/reach-agent-386 /tmp/reach-agent-armv6 /tmp/reach-agent-armv7
-cd "$AGENT_DOWNLOAD_DIR"
-sudo sh -c 'sha256sum reach-agent_linux_* > checksums.txt'
-cd - >/dev/null
+echo "[deploy] publishing hosted agent downloads..."
+sudo mkdir -p "$AGENT_DOWNLOAD_ROOT"
+if [ -e "$AGENT_STAGING_DIR" ]; then
+  sudo mv "$AGENT_STAGING_DIR" "$AGENT_STAGING_DIR.abandoned.$(date -u +%Y%m%dT%H%M%SZ)"
+fi
+sudo mkdir -p "$AGENT_STAGING_DIR"
+sudo install -m 0755 "$ARTIFACT_DIR/reach-agent_linux_amd64" "$AGENT_STAGING_DIR/reach-agent_linux_amd64"
+sudo install -m 0755 "$ARTIFACT_DIR/reach-agent_linux_arm64" "$AGENT_STAGING_DIR/reach-agent_linux_arm64"
+sudo install -m 0755 "$ARTIFACT_DIR/reach-agent_linux_386" "$AGENT_STAGING_DIR/reach-agent_linux_386"
+sudo install -m 0755 "$ARTIFACT_DIR/reach-agent_linux_armv6" "$AGENT_STAGING_DIR/reach-agent_linux_armv6"
+sudo install -m 0755 "$ARTIFACT_DIR/reach-agent_linux_armv7" "$AGENT_STAGING_DIR/reach-agent_linux_armv7"
+sudo install -m 0644 "$ARTIFACT_DIR/checksums.txt" "$AGENT_STAGING_DIR/checksums.txt"
+sudo install -m 0644 "$ARTIFACT_DIR/manifest.json" "$AGENT_STAGING_DIR/manifest.json"
+if [ -f "$ARTIFACT_DIR/manifest.json.minisig" ]; then
+  sudo install -m 0644 "$ARTIFACT_DIR/manifest.json.minisig" "$AGENT_STAGING_DIR/manifest.json.minisig"
+fi
+if [ -e "$AGENT_DOWNLOAD_DIR" ]; then
+  sudo mv "$AGENT_DOWNLOAD_DIR" "$AGENT_DOWNLOAD_DIR.replaced.$(date -u +%Y%m%dT%H%M%SZ)"
+fi
+sudo mv "$AGENT_STAGING_DIR" "$AGENT_DOWNLOAD_DIR"
+printf '%s\n' "$AGENT_VERSION" > /tmp/reach-latest-version
+sudo install -m 0644 /tmp/reach-latest-version "$AGENT_DOWNLOAD_ROOT/latest.txt"
+rm -f /tmp/reach-latest-version
 
 echo "[deploy] updating setup.sh..."
 CONFIG_API_URL="${REACH_API_URL:-}"
@@ -130,4 +239,4 @@ sleep 2
 systemctl is-active reachd
 systemctl is-active reach-ws-carrier.service
 
-echo "[deploy] done."
+echo "[deploy] done. Published reach-agent v${AGENT_VERSION}."
