@@ -591,19 +591,22 @@ func postJSON(ctx context.Context, url string, payload any, out any, bearer stri
 func ensureTunnelKey(ctx context.Context, keyPath, name string, compat SSHCompatConfig) error {
 	keyType := compat.TunnelKeyType
 	if keyType == "" {
-		keyType = "ssh-rsa"
+		keyType = "ssh-ed25519"
 	}
-	if _, err := os.Stat(keyPath); err == nil {
-		pubType := publicKeyType(keyPath + ".pub")
-		if pubType == "" || keyTypeSupported(pubType, compat.SupportedAuthorizedKeyTypes) {
+	comment := "reach:" + normalizeSlug(name)
+	if st, err := os.Stat(keyPath); err == nil && !st.IsDir() {
+		if err := ensurePublicKeyForPrivateKey(keyPath, comment); err == nil {
 			return nil
+		} else {
+			backup := fmt.Sprintf("%s.invalid.%d", keyPath, time.Now().Unix())
+			_ = os.Rename(keyPath, backup)
+			_ = os.Rename(keyPath+".pub", backup+".pub")
+			fmt.Printf("[reach warning] existing tunnel key could not be parsed (%v); moved it to %s\n", err, backup)
 		}
-		backup := fmt.Sprintf("%s.unsupported.%d", keyPath, time.Now().Unix())
-		_ = os.Rename(keyPath, backup)
-		_ = os.Rename(keyPath+".pub", backup+".pub")
-		fmt.Printf("[reach warning] existing tunnel key type %s is not supported by this ssh; moved it to %s\n", pubType, backup)
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
 	}
-	return generateSSHKey(ctx, keyPath, keyType, "reach:"+normalizeSlug(name))
+	return generateSSHKey(ctx, keyPath, keyType, comment)
 }
 
 func keyTypeFileStem(keyType string) string {

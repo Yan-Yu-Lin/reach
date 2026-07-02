@@ -246,6 +246,8 @@ type Daemon struct {
 	tunnelCmd         *exec.Cmd
 	tunnelCancel      context.CancelFunc
 	tunnelDone        chan error
+	tunnelBackoff     time.Duration
+	tunnelStartedAt   time.Time
 	desired           HeartbeatResponse
 	pendingResults    []CommandResult
 	appliedGeneration int64
@@ -512,13 +514,20 @@ func (d *Daemon) Run(ctx context.Context) error {
 			d.shutdown(ctx, "signal", false)
 			return ctx.Err()
 		case err := <-d.tunnelDoneChan():
-			if err != nil && !d.stopping {
+			wasStopping := d.isStopping()
+			startedAt := d.currentTunnelStartedAt()
+			if err != nil && !wasStopping {
 				d.setTunnel("failed", 0, "", err.Error())
 				d.setLastError(err.Error())
 			} else {
 				d.setTunnel("stopped", 0, "", "")
 			}
-			d.stopTunnelProcess()
+			d.clearTunnelState()
+			if err != nil && !wasStopping && ctx.Err() == nil {
+				delay := d.nextTunnelRestartDelay(time.Since(startedAt) >= 2*time.Minute)
+				d.logger.Printf("tunnel failed; retrying after %s", delay)
+				sleepContext(ctx, delay)
+			}
 			d.reconcile(ctx)
 		case <-probeTicker.C:
 			if err := d.checkLocalSSH(ctx); err != nil {
@@ -573,6 +582,7 @@ func (d *Daemon) reconcile(ctx context.Context) {
 		}
 	} else {
 		d.stopTunnelProcess()
+		d.resetTunnelRestartDelay()
 		d.setTunnel("stopped", 0, "", "")
 	}
 }
@@ -606,6 +616,7 @@ func (d *Daemon) applyCommand(ctx context.Context, cmd AgentCommand) {
 		}
 	case "stop_tunnel":
 		d.stopTunnelProcess()
+		d.resetTunnelRestartDelay()
 		d.setTunnel("stopped", 0, "", "")
 		if cmd.Generation > d.appliedGeneration {
 			d.appliedGeneration = cmd.Generation
@@ -658,6 +669,7 @@ func (d *Daemon) startTunnel(ctx context.Context, transport string) error {
 	d.mu.Lock()
 	d.tunnelCancel = cancel
 	d.tunnelDone = done
+	d.tunnelStartedAt = time.Now()
 	d.stopping = false
 	d.mu.Unlock()
 	return nil
@@ -666,6 +678,48 @@ func (d *Daemon) tunnelRunning() bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.tunnelDone != nil && d.tunnelCancel != nil
+}
+func (d *Daemon) isStopping() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.stopping
+}
+func (d *Daemon) currentTunnelStartedAt() time.Time {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.tunnelStartedAt
+}
+func (d *Daemon) clearTunnelState() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.tunnelCmd = nil
+	d.tunnelCancel = nil
+	d.tunnelDone = nil
+	d.tunnelStartedAt = time.Time{}
+	d.stopping = false
+}
+func (d *Daemon) nextTunnelRestartDelay(stable bool) time.Duration {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	minDelay := d.cfg.Tunnel.restartMinDur
+	if minDelay <= 0 {
+		minDelay = 5 * time.Second
+	}
+	maxDelay := d.cfg.Tunnel.restartMaxDur
+	if maxDelay < minDelay {
+		maxDelay = minDelay
+	}
+	if stable || d.tunnelBackoff <= 0 {
+		d.tunnelBackoff = minDelay
+	} else {
+		d.tunnelBackoff = nextBackoff(d.tunnelBackoff, maxDelay)
+	}
+	return d.tunnelBackoff
+}
+func (d *Daemon) resetTunnelRestartDelay() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.tunnelBackoff = 0
 }
 func (d *Daemon) stopTunnelProcess() {
 	d.mu.Lock()
@@ -679,12 +733,7 @@ func (d *Daemon) stopTunnelProcess() {
 		case <-time.After(5 * time.Second):
 		}
 	}
-	d.mu.Lock()
-	d.tunnelCmd = nil
-	d.tunnelCancel = nil
-	d.tunnelDone = nil
-	d.stopping = false
-	d.mu.Unlock()
+	d.clearTunnelState()
 }
 
 func (d *Daemon) shutdown(ctx context.Context, reason string, remove bool) {
