@@ -32,6 +32,7 @@ export type Machine = {
   desired_state: string
   observed_state: string
   desired_generation: number
+  update_policy: 'manual' | 'auto' | 'disabled'
   desired_changed_at?: string
   cleanup_state?: string
   mode?: string
@@ -81,7 +82,8 @@ export type AgentObservation = {
 }
 export type HubObservation = { probe_state: string; last_probe_at: string; last_success_at?: string; probe_error?: string }
 export type AgentCommand = { id: string; type: string; status: string; generation: number; created_at: string; last_error?: string }
-export type MachineWithTunnels = { machine: Machine; tunnels: Tunnel[]; agent_observation?: AgentObservation; hub_observation?: HubObservation; commands?: AgentCommand[] }
+export type AgentUpdateHint = { available: boolean; current?: string; latest?: string; url?: string; sha256?: string; required?: boolean }
+export type MachineWithTunnels = { machine: Machine; tunnels: Tunnel[]; agent_observation?: AgentObservation; hub_observation?: HubObservation; commands?: AgentCommand[]; update?: AgentUpdateHint }
 export type RequestRow = {
   id: string
   name: string
@@ -157,6 +159,11 @@ export function useReachApi() {
       method: 'POST',
       body: JSON.stringify({ process_title_config: config })
     }),
+    setUpdatePolicy: (id: string, policy: 'manual' | 'auto' | 'disabled') => request<{ machine: Machine }>(`/admin/machines/${encodeURIComponent(id)}/update-policy`, {
+      method: 'POST',
+      body: JSON.stringify({ update_policy: policy })
+    }),
+    updateAgent: (id: string) => request<{ ok: boolean }>(`/admin/machines/${encodeURIComponent(id)}/update-agent`, { method: 'POST' }),
     health: () => request<any[]>('/admin/health'),
     sshConfig: () => request<string>('/admin/ssh-config')
   }

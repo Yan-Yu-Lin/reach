@@ -345,6 +345,23 @@ func (p *Provisioner) SetDesiredState(ctx context.Context, idOrSlug, desired, ac
 	return p.GetMachine(ctx, m.ID)
 }
 
+func (p *Provisioner) SetUpdatePolicy(ctx context.Context, idOrSlug, policy, actor string) (Machine, error) {
+	policy, err := normalizeUpdatePolicy(policy)
+	if err != nil {
+		return Machine{}, err
+	}
+	m, err := p.GetMachine(ctx, idOrSlug)
+	if err != nil {
+		return Machine{}, err
+	}
+	now := nowUTC()
+	if _, err := p.store.db.ExecContext(ctx, `UPDATE machines SET update_policy=?, updated_at=? WHERE id=?`, policy, now, m.ID); err != nil {
+		return Machine{}, err
+	}
+	p.store.Audit(ctx, "machine.update_policy.update", actor, m.ID, "policy="+policy)
+	return p.GetMachine(ctx, m.ID)
+}
+
 func (p *Provisioner) SetProcessTitleConfig(ctx context.Context, idOrSlug string, cfg *ProcessTitleConfig, actor string) (Machine, error) {
 	m, err := p.GetMachine(ctx, idOrSlug)
 	if err != nil {
@@ -693,7 +710,11 @@ func (p *Provisioner) ListMachines(ctx context.Context) ([]MachineWithTunnels, e
 	}
 	out := make([]MachineWithTunnels, 0, len(machines))
 	for _, m := range machines {
-		item := MachineWithTunnels{Machine: m, Tunnels: byMachine[m.ID], Agent: agents[m.ID], HubObservation: hubs[m.ID], Commands: commands[m.ID]}
+		var update *AgentUpdateHint
+		if a := agents[m.ID]; a != nil {
+			update = agentUpdateHintFor(p.cfg, a.AgentVersion)
+		}
+		item := MachineWithTunnels{Machine: m, Tunnels: byMachine[m.ID], Agent: agents[m.ID], HubObservation: hubs[m.ID], Commands: commands[m.ID], Update: update}
 		out = append(out, item)
 	}
 	return out, nil

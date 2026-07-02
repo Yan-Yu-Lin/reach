@@ -62,7 +62,10 @@
         <dl>
           <div class="detail-row">
             <dt>Agent version</dt>
-            <dd>{{ obs?.agent_version || '—' }}</dd>
+            <dd>
+              {{ obs?.agent_version || '—' }}
+              <span v-if="item.update?.latest" class="muted" style="margin-left:4px">latest {{ item.update.latest }}</span>
+            </dd>
           </div>
           <div class="detail-row">
             <dt>OS / distro</dt>
@@ -120,6 +123,16 @@
           <div class="detail-row">
             <dt>Generation</dt>
             <dd>{{ item.machine.desired_generation }}</dd>
+          </div>
+          <div class="detail-row">
+            <dt>Update policy</dt>
+            <dd>
+              <select v-model="updatePolicy" class="process-title-input" style="max-width:150px" :disabled="updatePolicySaving" @change="saveUpdatePolicy">
+                <option value="manual">Manual</option>
+                <option value="auto">Auto-update</option>
+                <option value="disabled">Disabled</option>
+              </select>
+            </dd>
           </div>
           <div class="detail-row">
             <dt>Target user</dt>
@@ -227,6 +240,9 @@
         <div class="detail-card-title">Actions</div>
         <div style="display:flex;flex-direction:column;gap:8px">
           <button class="btn" @click="$emit('copy', `ssh ${item.machine.slug}`)">Copy SSH command</button>
+          <button class="btn btn-primary" :disabled="!canQueueUpdate || updateSaving" @click="queueUpdateAgent">
+            {{ updateSaving ? 'Queueing...' : updateButtonLabel }}
+          </button>
           <button class="btn" @click="$emit('copy', repairCommand)">Copy repair command</button>
           <button class="btn" @click="$emit('copy', uninstallCommand)">Copy uninstall command</button>
           <div style="border-top:1px solid var(--border);padding-top:8px;margin-top:4px">
@@ -278,11 +294,15 @@ const processTitleList = ref('')
 const processTitleInterval = ref('5s')
 const processTitleSaving = ref(false)
 const processTitleError = ref('')
+const updateSaving = ref(false)
+const updatePolicy = ref<'manual' | 'auto' | 'disabled'>('manual')
+const updatePolicySaving = ref(false)
 
 const processTitleSource = computed(() => props.item?.machine.process_title_config ? 'Dashboard override active' : 'Using agent local config/default')
 
-watch(() => props.item?.machine.id, () => resetProcessTitleForm(), { immediate: true })
+watch(() => props.item?.machine.id, () => { resetProcessTitleForm(); resetUpdatePolicyForm() }, { immediate: true })
 watch(() => props.item?.machine.process_title_config, () => resetProcessTitleForm())
+watch(() => props.item?.machine.update_policy, () => resetUpdatePolicyForm())
 
 function resetProcessTitleForm() {
   const cfg = props.item?.machine.process_title_config
@@ -290,6 +310,10 @@ function resetProcessTitleForm() {
   processTitleList.value = (cfg?.process_titles || []).join('\n')
   processTitleInterval.value = cfg?.rotate_interval || '5s'
   processTitleError.value = ''
+}
+
+function resetUpdatePolicyForm() {
+  updatePolicy.value = props.item?.machine.update_policy || 'manual'
 }
 
 function buildProcessTitleConfig(): ProcessTitleConfig | null {
@@ -336,6 +360,45 @@ async function clearProcessTitle() {
     toast.error(processTitleError.value)
   } finally {
     processTitleSaving.value = false
+  }
+}
+
+async function saveUpdatePolicy() {
+  if (!props.item) return
+  updatePolicySaving.value = true
+  try {
+    await api.setUpdatePolicy(props.item.machine.id, updatePolicy.value)
+    toast.success('Update policy saved')
+    emit('refresh', props.item.machine.id)
+  } catch (e: any) {
+    toast.error(e.message || 'Failed to save update policy')
+    resetUpdatePolicyForm()
+  } finally {
+    updatePolicySaving.value = false
+  }
+}
+
+const updateCommandOpen = computed(() => (props.item?.commands || []).some(cmd => cmd.type === 'update_agent' && (cmd.status === 'pending' || cmd.status === 'sent')))
+const canQueueUpdate = computed(() => !!props.item && !!props.item.update?.latest && props.item.update.available && props.item.machine.update_policy !== 'disabled' && !updateCommandOpen.value && props.item.machine.desired_state !== 'retired' && props.item.machine.desired_state !== 'retiring')
+const updateButtonLabel = computed(() => {
+  if (updateCommandOpen.value) return 'Agent update queued'
+  if (!props.item?.update?.latest) return 'No update version configured'
+  if (props.item.machine.update_policy === 'disabled') return 'Updates disabled'
+  if (props.item.update.available === false) return 'Agent is latest'
+  return `Update Agent to ${props.item.update.latest}`
+})
+
+async function queueUpdateAgent() {
+  if (!props.item || !canQueueUpdate.value) return
+  updateSaving.value = true
+  try {
+    await api.updateAgent(props.item.machine.id)
+    toast.success('Agent update queued')
+    emit('refresh', props.item.machine.id)
+  } catch (e: any) {
+    toast.error(e.message || 'Failed to queue agent update')
+  } finally {
+    updateSaving.value = false
   }
 }
 

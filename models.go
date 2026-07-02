@@ -29,6 +29,7 @@ type Machine struct {
 	DesiredState       string              `json:"desired_state"`
 	ObservedState      string              `json:"observed_state"`
 	DesiredGeneration  int64               `json:"desired_generation"`
+	UpdatePolicy       string              `json:"update_policy"`
 	DesiredChangedAt   *string             `json:"desired_changed_at,omitempty"`
 	DesiredChangedBy   *string             `json:"desired_changed_by,omitempty"`
 	CleanupState       *string             `json:"cleanup_state,omitempty"`
@@ -95,6 +96,7 @@ type MachineWithTunnels struct {
 	Agent          *AgentObservation  `json:"agent_observation,omitempty"`
 	HubObservation *HubObservation    `json:"hub_observation,omitempty"`
 	Commands       []AgentCommandInfo `json:"commands,omitempty"`
+	Update         *AgentUpdateHint   `json:"update,omitempty"`
 }
 
 type AgentObservation struct {

@@ -55,6 +55,9 @@ sudo install -m 0755 /tmp/reach-agent-armv7 "$AGENT_DOWNLOAD_DIR/reach-agent_lin
 rm -f /tmp/reach-agent-amd64 /tmp/reach-agent-arm64 /tmp/reach-agent-386 /tmp/reach-agent-armv6 /tmp/reach-agent-armv7
 cd "$AGENT_DOWNLOAD_DIR"
 sudo sh -c 'sha256sum reach-agent_linux_* > checksums.txt'
+sudo tee /var/lib/reach/downloads/reach-agent/latest.json >/dev/null <<EOF
+{"version":"${AGENT_VERSION}","api_url":"${REACH_API_URL:-}","created_at":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
+EOF
 cd - >/dev/null
 
 echo "[deploy] updating setup.sh..."

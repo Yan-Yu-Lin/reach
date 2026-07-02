@@ -40,9 +40,9 @@ Legend: `🔴` blocking / broken — `🟡` important but not broken — `🟢` 
 
 | # | Item | Why | Status |
 |---|------|-----|--------|
-| 11 | **Dashboard update button** | `update-binary` exists as a CLI command but there's no way to trigger it from the dashboard. The server already tracks `agent_version` per machine. Add a button in MachineDetail to push an update command, and show current vs. latest version. | 🟡 Not started |
-| 12 | **Friend mode notifications** | When someone requests access (pending approval), the operator has no notification — they have to be watching the dashboard. Email or push notification on new requests would make the friend flow actually usable without the operator babysitting. | 🟡 Not started |
-| 13 | **Per-machine update policy** | Currently all updates are manual. Some machines (Arthur's own) could safely auto-update; friend machines should stay manual. The `CanSelfUpdate` field and `AgentUpdateHint` struct already exist as stubs. | 🟢 Not started |
+| 11 | **Dashboard update button** | `update-binary` exists as a CLI command but there's no way to trigger it from the dashboard. The server already tracks `agent_version` per machine. Add a button in MachineDetail to push an update command, and show current vs. latest version. | ✅ Implemented |
+| 12 | **Friend mode notifications** | When someone requests access (pending approval), the operator has no notification — they have to be watching the dashboard. Email or push notification on new requests would make the friend flow actually usable without the operator babysitting. | ✅ Implemented |
+| 13 | **Per-machine update policy** | Currently all updates are manual. Some machines (Arthur's own) could safely auto-update; friend machines should stay manual. The `CanSelfUpdate` field and `AgentUpdateHint` struct already exist as stubs. | ✅ Implemented |
 
 ## Future features
 

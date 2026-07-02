@@ -239,8 +239,10 @@ It provides:
 - fleet overview and machine status;
 - machine diagnostics from agent heartbeats;
 - enable/disable/remove actions;
+- dashboard-queued agent updates and per-machine update policy;
 - generated SSH config;
 - live updates over Server-Sent Events;
+- optional ntfy-style pending-request webhook notifications;
 - optional process-title messages for target agents.
 
 Open it at your configured public URL, for example:
