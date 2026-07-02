@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -299,7 +300,7 @@ func run(ctx context.Context, args []string) error {
 		return d.Run(ctx)
 	case "check":
 		fs := flag.NewFlagSet("check", flag.ContinueOnError)
-		configPath := fs.String("config", "/etc/reach/agent.yaml", "agent config path")
+		configPath := fs.String("config", defaultAgentConfigPath(), "agent config path")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
@@ -759,6 +760,9 @@ func (d *Daemon) checkLocalSSH(ctx context.Context) error {
 }
 
 func (d *Daemon) startLocalSSH(ctx context.Context) error {
+	if runtime.GOOS == "windows" {
+		return d.startWindowsLocalSSH(ctx)
+	}
 	if d.cfg.LocalSSH.InternalSSHD {
 		return d.startInternalSSHD(ctx)
 	}

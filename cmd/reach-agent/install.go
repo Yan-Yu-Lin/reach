@@ -126,11 +126,13 @@ func installCommand(ctx context.Context, args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if runtime.GOOS != "linux" {
-		return fmt.Errorf("reach-agent install currently supports Linux only")
+	if runtime.GOOS != "linux" && runtime.GOOS != "windows" {
+		return fmt.Errorf("reach-agent install currently supports Linux and Windows only")
 	}
 	if opt.InstallMode == "auto" {
-		if os.Geteuid() == 0 {
+		if runtime.GOOS == "windows" {
+			opt.InstallMode = "system"
+		} else if os.Geteuid() == 0 {
 			opt.InstallMode = "system"
 		} else {
 			opt.InstallMode = "user"
@@ -138,10 +140,17 @@ func installCommand(ctx context.Context, args []string) error {
 	}
 	switch opt.InstallMode {
 	case "system":
-		if os.Geteuid() != 0 {
+		if runtime.GOOS == "windows" {
+			if !windowsIsElevated() {
+				return fmt.Errorf("Windows system install needs an elevated Administrator PowerShell")
+			}
+		} else if os.Geteuid() != 0 {
 			return fmt.Errorf("system install needs root; use --mode user or rerun via sudo")
 		}
 	case "user":
+		if runtime.GOOS == "windows" {
+			return fmt.Errorf("Windows user-mode install is not supported yet; rerun setup.ps1 from an elevated Administrator PowerShell")
+		}
 	default:
 		return fmt.Errorf("--mode must be auto, system, or user")
 	}
@@ -189,6 +198,11 @@ func installCommand(ctx context.Context, args []string) error {
 	}
 	if err := os.MkdirAll(opt.DataDir, 0o700); err != nil {
 		return err
+	}
+	if runtime.GOOS == "windows" {
+		if err := ensureWindowsOpenSSHServer(ctx); err != nil {
+			return err
+		}
 	}
 	sshCompat := detectSSHCompatibility(ctx)
 	fmt.Printf("[reach] local SSH: %s; tunnel key=%s\n", firstNonEmpty(sshCompat.ClientVersion, "unknown"), sshCompat.TunnelKeyType)
@@ -269,6 +283,10 @@ func installCommand(ctx context.Context, args []string) error {
 }
 
 func applyModeDefaults(opt *installOptions) {
+	if runtime.GOOS == "windows" {
+		applyWindowsModeDefaults(opt)
+		return
+	}
 	if opt.InstallMode == "system" {
 		if opt.ConfigDir == "" {
 			opt.ConfigDir = "/etc/reach"
@@ -308,6 +326,9 @@ func hostnameDefault() string {
 }
 
 func defaultTargetUser() string {
+	if runtime.GOOS == "windows" {
+		return windowsCurrentUsername()
+	}
 	if os.Geteuid() == 0 {
 		if u := os.Getenv("SUDO_USER"); u != "" && u != "root" {
 			return u
@@ -320,6 +341,9 @@ func defaultTargetUser() string {
 }
 
 func currentUsername() string {
+	if runtime.GOOS == "windows" {
+		return windowsCurrentUsername()
+	}
 	if u := os.Getenv("USER"); u != "" {
 		return u
 	}
@@ -330,6 +354,9 @@ func currentUsername() string {
 }
 
 func promptDefault(label, def string, secret bool) (string, error) {
+	if runtime.GOOS == "windows" {
+		return promptDefaultWindows(label, def, secret)
+	}
 	f, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
 	if err != nil {
 		return "", fmt.Errorf("interactive input requires /dev/tty; pass flags or --yes")
@@ -367,6 +394,9 @@ func validateTargetUserLocal(s string) error {
 }
 
 func userHome(user string) (string, error) {
+	if runtime.GOOS == "windows" {
+		return windowsUserHome(user)
+	}
 	out, err := exec.Command("getent", "passwd", user).Output()
 	if err != nil {
 		if user == currentUsername() {
@@ -384,6 +414,9 @@ func userHome(user string) (string, error) {
 }
 
 func prepareLocalSSH(ctx context.Context, opt installOptions, targetHome string, compat SSHCompatConfig) (localSSHPlan, error) {
+	if runtime.GOOS == "windows" {
+		return prepareWindowsLocalSSH(ctx, opt, targetHome, compat)
+	}
 	if opt.InstallMode == "system" {
 		if err := ensureSystemSSHD(ctx); err != nil {
 			return localSSHPlan{}, err
@@ -747,10 +780,7 @@ func installAdminKeys(authFile, user string, prov provisionResponse, chownFiles 
 	if err := os.WriteFile(authFile, []byte(b.String()), 0o600); err != nil {
 		return err
 	}
-	if chownFiles {
-		_ = exec.Command("chown", "-R", user+":"+user, sshDir).Run()
-	}
-	return nil
+	return applyAuthorizedKeysPermissions(authFile, user, chownFiles)
 }
 
 func installWSTunnel(ctx context.Context, dest string, ws *websocketTunnelConfig) error {
@@ -820,6 +850,9 @@ func extractTarGzFile(data []byte, base string) ([]byte, error) {
 }
 
 func runtimeArchKey() string {
+	if runtime.GOOS == "windows" {
+		return "windows_" + runtime.GOARCH
+	}
 	switch runtime.GOARCH {
 	case "amd64":
 		return "linux_amd64"
@@ -895,6 +928,9 @@ func writeYAML0600(path string, v any) error {
 }
 
 func installPersistence(ctx context.Context, opt installOptions, cfgPath string) error {
+	if runtime.GOOS == "windows" {
+		return installWindowsScheduledTask(ctx, opt, cfgPath)
+	}
 	if opt.InstallMode == "system" {
 		if err := installSystemdService(ctx, opt.AgentPath, cfgPath); err == nil {
 			return nil
@@ -1046,7 +1082,7 @@ func startDetached(agentPath, cfgPath, logPath, pidPath string) error {
 	cmd.Stdin = devNull
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	cmd.SysProcAttr = detachedSysProcAttr()
 	if err := cmd.Start(); err != nil {
 		return err
 	}
@@ -1220,6 +1256,10 @@ func readInstallEnv(path string) map[string]string {
 }
 
 func stopPersistence(ctx context.Context, opt installOptions) {
+	if runtime.GOOS == "windows" {
+		stopWindowsPersistence(ctx)
+		return
+	}
 	if opt.InstallMode == "system" {
 		_ = exec.CommandContext(ctx, "systemctl", "disable", "--now", "reach-agent.service").Run()
 		_ = exec.CommandContext(ctx, "systemctl", "disable", "--now", "reach-tunnel.service").Run()
@@ -1295,6 +1335,9 @@ func removePID(path string) {
 }
 
 func distroString() string {
+	if runtime.GOOS == "windows" {
+		return windowsDistroString()
+	}
 	b, err := os.ReadFile("/etc/os-release")
 	if err != nil {
 		return runtime.GOOS

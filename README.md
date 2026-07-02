@@ -12,7 +12,7 @@ Reach is designed to be transparent. If someone asks “what did that setup comm
 
 ## What Reach is for
 
-Reach is useful when you want SSH access to Linux machines that live behind NAT, campus/company networks, home routers, mobile hotspots, or other restrictive networks.
+Reach is useful when you want SSH access to Linux or Windows machines that live behind NAT, campus/company networks, home routers, mobile hotspots, or other restrictive networks.
 
 Typical flows:
 
@@ -41,8 +41,8 @@ Hub server
   └─ optional WebSocket carrier
        │
        ▼
-Target Linux machine
-  ├─ reach-agent service
+Target machine
+  ├─ reach-agent service / scheduled task
   ├─ outbound SSH tunnel to the hub
   └─ local sshd / user sshd / internal Go SSH server
 ```
@@ -80,12 +80,14 @@ Host my-machine
 
 ## What gets installed on a target machine
 
-The setup script supports two install modes.
+The Linux setup script supports two install modes.
 
 | Mode | When used | Main paths |
 |---|---|---|
 | System mode | Run as root, or with accepted passwordless sudo | `/opt/reach`, `/etc/reach`, `/var/lib/reach`, `/etc/systemd/system/reach-agent.service` |
 | User mode | No root/sudo | `~/.local/bin/reach-agent`, `~/.config/reach`, `~/.local/share/reach`, `~/.config/systemd/user/reach-agent.service` |
+
+Windows targets are supported as an admin-first MVP. Run `setup.ps1` from an elevated PowerShell session. It installs to `C:\Program Files\Reach`, stores state in `C:\ProgramData\Reach`, enables Windows OpenSSH Server, and creates a `\Reach\reach-agent` Task Scheduler task running as `SYSTEM`.
 
 ### Files and directories
 
@@ -175,13 +177,19 @@ It also opens an outbound SSH connection to the hub SSH port. If configured, it 
 
 ## Installing a target
 
-For a normal friend/support flow:
+For a normal Linux friend/support flow:
 
 ```bash
 curl -fsSL https://tunnels.example.com/setup.sh | bash
 ```
 
-Non-interactive examples:
+For a Windows target, open PowerShell as Administrator:
+
+```powershell
+irm https://tunnels.example.com/setup.ps1 | iex
+```
+
+Non-interactive Linux examples:
 
 ```bash
 # Use a pre-authorized code and default prompts.
@@ -195,11 +203,23 @@ curl -fsSL https://tunnels.example.com/setup.sh | bash -s -- \
 curl -fsSL https://tunnels.example.com/setup.sh | bash -s -- --transport websocket --yes
 ```
 
-Repair or update an existing install:
+Non-interactive Windows example:
+
+```powershell
+iex "& { $(irm https://tunnels.example.com/setup.ps1) } -Name my-pc -TargetUser $env:USERNAME -Token '<one-time-or-god-code>' -Yes"
+```
+
+Repair or update an existing Linux install:
 
 ```bash
 curl -fsSL https://tunnels.example.com/setup.sh | bash -s -- --repair
 curl -fsSL https://tunnels.example.com/setup.sh | bash -s -- --repair --update-agent --version 0.1.0-alpha
+```
+
+Repair an existing Windows install from elevated PowerShell:
+
+```powershell
+iex "& { $(irm https://tunnels.example.com/setup.ps1) } -Repair"
 ```
 
 ---
@@ -215,11 +235,17 @@ curl -fsSL https://tunnels.example.com/setup.sh | bash -s -- --uninstall
 Direct commands:
 
 ```bash
-# System install
+# Linux system install
 sudo /opt/reach/reach-agent uninstall --mode system --yes
 
-# User install
+# Linux user install
 ~/.local/bin/reach-agent uninstall --mode user --yes
+```
+
+Windows uninstall from elevated PowerShell:
+
+```powershell
+iex "& { $(irm https://tunnels.example.com/setup.ps1) } -Uninstall"
 ```
 
 Uninstall stops Reach services/processes, removes Reach-managed authorized-key lines, removes local Reach config/data directories, removes the agent binary, and notifies the hub when possible so the hub can retire the machine and clean up tunnel credentials.
@@ -333,9 +359,11 @@ sudo mkdir -p "$OUT"
 
 GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-X main.version=${VERSION}" -o /tmp/reach-agent_linux_amd64 ./cmd/reach-agent
 GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags "-X main.version=${VERSION}" -o /tmp/reach-agent_linux_arm64 ./cmd/reach-agent
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-X main.version=${VERSION}" -o /tmp/reach-agent_windows_amd64.exe ./cmd/reach-agent
+GOOS=windows GOARCH=arm64 CGO_ENABLED=0 go build -ldflags "-X main.version=${VERSION}" -o /tmp/reach-agent_windows_arm64.exe ./cmd/reach-agent
 
-sudo install -m 0755 /tmp/reach-agent_linux_* "$OUT/"
-(cd "$OUT" && sudo sha256sum reach-agent_linux_* | sudo tee checksums.txt >/dev/null)
+sudo install -m 0755 /tmp/reach-agent_linux_* /tmp/reach-agent_windows_* "$OUT/"
+(cd "$OUT" && sudo sha256sum reach-agent_linux_* reach-agent_windows_* | sudo tee checksums.txt >/dev/null)
 ```
 
 ### 2. Install hub files
@@ -346,9 +374,10 @@ sudo install -m 0755 bin/reachd /opt/reach/reachd
 sudo install -m 0755 bin/reach-ws-carrier /opt/reach/reach-ws-carrier
 sudo install -m 0755 bin/reach-agent /opt/reach/reach-agent
 sudo install -m 0644 setup.sh /var/lib/reach/setup.sh
+sudo install -m 0644 setup.ps1 /var/lib/reach/setup.ps1
 ```
 
-Edit `/var/lib/reach/setup.sh` so the top-level `API_URL` and `REACH_AGENT_VERSION` match your deployment.
+Edit `/var/lib/reach/setup.sh` and `/var/lib/reach/setup.ps1` so the API URL and agent version match your deployment.
 
 ### 3. Configure Reach
 
@@ -432,6 +461,10 @@ server {
 
     location = /setup.sh {
         alias /var/lib/reach/setup.sh;
+    }
+
+    location = /setup.ps1 {
+        alias /var/lib/reach/setup.ps1;
     }
 
     location /downloads/reach-agent/ {

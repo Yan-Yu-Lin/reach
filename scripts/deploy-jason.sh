@@ -39,6 +39,11 @@ build_agent /tmp/reach-agent-386 386
 build_agent /tmp/reach-agent-armv6 arm 6
 build_agent /tmp/reach-agent-armv7 arm 7
 
+echo "[deploy] building reach-agent (windows/amd64)..."
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "$AGENT_LDFLAGS" -o /tmp/reach-agent-windows-amd64.exe ./cmd/reach-agent
+echo "[deploy] building reach-agent (windows/arm64)..."
+GOOS=windows GOARCH=arm64 CGO_ENABLED=0 go build -ldflags "$AGENT_LDFLAGS" -o /tmp/reach-agent-windows-arm64.exe ./cmd/reach-agent
+
 echo "[deploy] installing binaries..."
 sudo install -m 0755 /tmp/reachd-build /opt/reach/reachd
 sudo install -m 0755 /tmp/reach-ws-carrier /opt/reach/reach-ws-carrier
@@ -52,12 +57,14 @@ sudo install -m 0755 /tmp/reach-agent-arm64 "$AGENT_DOWNLOAD_DIR/reach-agent_lin
 sudo install -m 0755 /tmp/reach-agent-386 "$AGENT_DOWNLOAD_DIR/reach-agent_linux_386"
 sudo install -m 0755 /tmp/reach-agent-armv6 "$AGENT_DOWNLOAD_DIR/reach-agent_linux_armv6"
 sudo install -m 0755 /tmp/reach-agent-armv7 "$AGENT_DOWNLOAD_DIR/reach-agent_linux_armv7"
-rm -f /tmp/reach-agent-amd64 /tmp/reach-agent-arm64 /tmp/reach-agent-386 /tmp/reach-agent-armv6 /tmp/reach-agent-armv7
+sudo install -m 0755 /tmp/reach-agent-windows-amd64.exe "$AGENT_DOWNLOAD_DIR/reach-agent_windows_amd64.exe"
+sudo install -m 0755 /tmp/reach-agent-windows-arm64.exe "$AGENT_DOWNLOAD_DIR/reach-agent_windows_arm64.exe"
+rm -f /tmp/reach-agent-amd64 /tmp/reach-agent-arm64 /tmp/reach-agent-386 /tmp/reach-agent-armv6 /tmp/reach-agent-armv7 /tmp/reach-agent-windows-amd64.exe /tmp/reach-agent-windows-arm64.exe
 cd "$AGENT_DOWNLOAD_DIR"
-sudo sh -c 'sha256sum reach-agent_linux_* > checksums.txt'
+sudo sh -c 'sha256sum reach-agent_linux_* reach-agent_windows_* > checksums.txt'
 cd - >/dev/null
 
-echo "[deploy] updating setup.sh..."
+echo "[deploy] updating setup scripts..."
 CONFIG_API_URL="${REACH_API_URL:-}"
 if [ -z "$CONFIG_API_URL" ] && [ -r /etc/reach/config.yaml ]; then
   CONFIG_API_URL="$(awk '
@@ -73,7 +80,12 @@ sed \
   -e "s|^API_URL=.*|API_URL=\"\${REACH_API_URL:-${CONFIG_API_URL_SED}}\"|" \
   setup.sh > /tmp/reach-setup.sh
 sudo install -m 0644 /tmp/reach-setup.sh /var/lib/reach/setup.sh
-rm -f /tmp/reach-setup.sh
+sed \
+  -e "s|\"https://tunnels.your-domain.example\"|\"${CONFIG_API_URL_SED}\"|g" \
+  -e "s|\"0.1.0-alpha\"|\"${AGENT_VERSION}\"|g" \
+  setup.ps1 > /tmp/reach-setup.ps1
+sudo install -m 0644 /tmp/reach-setup.ps1 /var/lib/reach/setup.ps1
+rm -f /tmp/reach-setup.sh /tmp/reach-setup.ps1
 
 echo "[deploy] ensuring Go WebSocket carrier service..."
 if ! id reach-wstunnel >/dev/null 2>&1; then

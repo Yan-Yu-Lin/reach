@@ -49,7 +49,7 @@ Legend: `🔴` blocking / broken — `🟡` important but not broken — `🟢` 
 | # | Item | Why | Status |
 |---|------|-----|--------|
 | 14 | **Multi-hub support** | ARCHITECTURE.md designed for multiple hubs (DGX, Pi5lin as secondary bastions). DB schema supports it. Not wired up. | ⚪ Schema ready, not wired |
-| 15 | **Windows target** | PowerShell installer + Task Scheduler persistence. DESIGN.md mentions this. Would expand Reach beyond Linux-only. | ⚪ Not started |
+| 15 | **Windows target** | PowerShell installer + Task Scheduler persistence. DESIGN.md mentions this. Would expand Reach beyond Linux-only. | 🟡 Admin-first MVP implemented; needs real Windows smoke test |
 | 16 | **Mac target** | launchd persistence. DESIGN.md mentions this alongside Windows. | ⚪ Not started |
 | 17 | **Multiple operator access keys** | Support multiple SSH keys per operator across devices (Mac, phone, tablet). Schema supports it via `access_keys` table. | ⚪ Schema ready, not wired |
 | 18 | **SSH CA** | Replace direct key distribution with certificate-based auth. Long-term goal from ARCHITECTURE.md. | ⚪ Not started |

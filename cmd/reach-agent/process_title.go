@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +29,9 @@ type ProcessTitleController struct {
 func defaultAgentConfigPath() string {
 	if v := os.Getenv("REACH_AGENT_CONFIG"); v != "" {
 		return v
+	}
+	if runtime.GOOS == "windows" {
+		return defaultWindowsAgentConfigPath()
 	}
 	var candidates []string
 	if home, err := os.UserHomeDir(); err == nil && home != "" {
@@ -62,6 +66,9 @@ func defaultAgentConfigPath() string {
 func isDiscoverableAgentConfig(path string) bool {
 	if path == "" {
 		return true
+	}
+	if runtime.GOOS == "windows" {
+		return isDiscoverableWindowsAgentConfig(path)
 	}
 	abs, err := filepath.Abs(path)
 	if err != nil {
