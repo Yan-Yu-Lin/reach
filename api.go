@@ -266,6 +266,9 @@ func (s *Server) handleClientRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.publishEvent(r.Context(), "request.created", "", map[string]any{"request_id": requestID, "name": name, "status": status})
+	if status == "pending" {
+		s.notifyPendingRequest(requestID, name, meta)
+	}
 	resp := map[string]any{"request_id": requestID, "client_secret": clientSecret, "status": status, "expires_at": expires}
 	if setupToken != "" {
 		resp["setup_token"] = setupToken
@@ -580,8 +583,9 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	if previousSSHOptions != sshOptionsSignature(string(raw)) {
 		s.publishEvent(r.Context(), "ssh_config.changed", m.ID, map[string]any{"reason": "ssh_compat_changed", "machine_id": m.ID})
 	}
+	s.maybeQueueAutoAgentUpdate(r.Context(), m, hb)
 	cmds := s.pendingCommands(r.Context(), m.ID)
-	resp := HeartbeatResponse{OK: true, ServerTime: now, DesiredGeneration: m.DesiredGeneration, DesiredState: m.DesiredState, Heartbeat: HeartbeatPolicy{NextIntervalSeconds: int(s.cfg.HealthInterval.Seconds()), OfflineAfterSeconds: int(s.cfg.OfflineAfter.Seconds())}, DesiredConfig: s.desiredConfig(r.Context(), m, tunnels), Commands: cmds}
+	resp := HeartbeatResponse{OK: true, ServerTime: now, DesiredGeneration: m.DesiredGeneration, DesiredState: m.DesiredState, Heartbeat: HeartbeatPolicy{NextIntervalSeconds: int(s.cfg.HealthInterval.Seconds()), OfflineAfterSeconds: int(s.cfg.OfflineAfter.Seconds())}, DesiredConfig: s.desiredConfig(r.Context(), m, tunnels), Commands: cmds, Update: agentUpdateHintFor(s.cfg, hb.AgentVersion)}
 	writeJSON(w, 200, resp)
 }
 
@@ -967,6 +971,14 @@ func (s *Server) handleAdminMachineAction(w http.ResponseWriter, r *http.Request
 		s.handleAdminMachineProcessTitle(w, r, id, claims.Username)
 		return
 	}
+	if action == "update-policy" {
+		s.handleAdminMachineUpdatePolicy(w, r, id, claims.Username)
+		return
+	}
+	if action == "update-agent" {
+		s.handleAdminMachineUpdateAgent(w, r, id, claims.Username)
+		return
+	}
 	var desired, ev string
 	switch action {
 	case "disable":
@@ -994,6 +1006,49 @@ func (s *Server) handleAdminMachineAction(w http.ResponseWriter, r *http.Request
 	s.publishEvent(r.Context(), ev, m.ID, map[string]any{"machine_id": m.ID, "slug": m.Slug})
 	s.publishEvent(r.Context(), "ssh_config.changed", m.ID, map[string]any{"reason": action, "machine_id": m.ID})
 	writeJSON(w, 200, map[string]any{"status": m.Status, "desired_state": m.DesiredState})
+}
+
+func (s *Server) handleAdminMachineUpdateAgent(w http.ResponseWriter, r *http.Request, id, actor string) {
+	m, err := s.prov.GetMachine(r.Context(), id)
+	if err != nil {
+		writeErr(w, 404, "machine not found")
+		return
+	}
+	if err := s.queueAgentUpdate(r.Context(), m, actor, "manual"); err != nil {
+		if errors.Is(err, errNoAgentUpdateAvailable) {
+			writeErr(w, 400, "no latest agent version configured")
+			return
+		}
+		if errors.Is(err, errUpdateAlreadyQueued) {
+			writeErr(w, 409, "agent update already queued")
+			return
+		}
+		writeErr(w, 400, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true})
+}
+
+func (s *Server) handleAdminMachineUpdatePolicy(w http.ResponseWriter, r *http.Request, id, actor string) {
+	var req struct {
+		UpdatePolicy string `json:"update_policy"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeErr(w, 400, "invalid json")
+		return
+	}
+	policy, err := normalizeUpdatePolicy(req.UpdatePolicy)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	m, err := s.prov.SetUpdatePolicy(r.Context(), id, policy, actor)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	s.publishEvent(r.Context(), "machine.update_policy_changed", m.ID, map[string]any{"machine_id": m.ID, "slug": m.Slug, "update_policy": m.UpdatePolicy})
+	writeJSON(w, 200, map[string]any{"machine": m})
 }
 
 func (s *Server) handleAdminMachineProcessTitle(w http.ResponseWriter, r *http.Request, id, actor string) {

@@ -164,7 +164,11 @@ fi
 sudo mv "$AGENT_STAGING_DIR" "$AGENT_DOWNLOAD_DIR"
 printf '%s\n' "$AGENT_VERSION" > /tmp/reach-latest-version
 sudo install -m 0644 /tmp/reach-latest-version "$AGENT_DOWNLOAD_ROOT/latest.txt"
-rm -f /tmp/reach-latest-version
+cat > /tmp/reach-latest.json <<EOF
+{"version":"${AGENT_VERSION}","api_url":"${REACH_API_URL:-}","created_at":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
+EOF
+sudo install -m 0644 /tmp/reach-latest.json "$AGENT_DOWNLOAD_ROOT/latest.json"
+rm -f /tmp/reach-latest-version /tmp/reach-latest.json
 
 echo "[deploy] updating setup.sh..."
 CONFIG_API_URL="${REACH_API_URL:-}"

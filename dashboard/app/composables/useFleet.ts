@@ -116,7 +116,7 @@ export function useFleet() {
         if (data.machine_id) refreshMachine(data.machine_id)
       }
 
-      if (event === 'request.created') {
+      if (event === 'request.created' && data.status === 'pending') {
         notifyPending(data)
       }
     })

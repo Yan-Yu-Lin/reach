@@ -30,6 +30,8 @@ type Config struct {
 	HubHostKeys         []string              `yaml:"hub_host_keys"`
 	DeprecatedHostKeys  []string              `yaml:"jason_host_keys"`
 	WebSocketTunnel     WebSocketTunnelConfig `yaml:"websocket_tunnel"`
+	AgentUpdates        AgentUpdateConfig     `yaml:"agent_updates"`
+	Notifications       NotificationConfig    `yaml:"notifications"`
 	InitialAdmin        InitialAdmin          `yaml:"initial_admin"`
 	DefaultHub          HubConfig             `yaml:"default_hub"`
 	ProvisioningEnabled bool                  `yaml:"provisioning_enabled"`
@@ -71,6 +73,23 @@ type WebSocketBinary struct {
 	SHA256 string `yaml:"sha256" json:"sha256"`
 }
 
+type AgentUpdateConfig struct {
+	Enabled       bool   `yaml:"enabled"`
+	LatestVersion string `yaml:"latest_version"`
+	ManifestPath  string `yaml:"manifest_path"`
+	APIURL        string `yaml:"api_url"`
+}
+
+type NotificationConfig struct {
+	Enabled        bool                             `yaml:"enabled"`
+	PendingRequest PendingRequestNotificationConfig `yaml:"pending_request"`
+}
+
+type PendingRequestNotificationConfig struct {
+	WebhookURL     string            `yaml:"webhook_url"`
+	WebhookHeaders map[string]string `yaml:"webhook_headers"`
+}
+
 func envDefault(name, def string) string {
 	if v := os.Getenv(name); v != "" {
 		return v
@@ -96,6 +115,10 @@ func DefaultConfig() Config {
 		TunnelHomeBase:      "/var/lib",
 		SSHServiceName:      "ssh",
 		ProvisioningEnabled: true,
+		AgentUpdates: AgentUpdateConfig{
+			Enabled:      true,
+			ManifestPath: "/var/lib/reach/downloads/reach-agent/latest.json",
+		},
 		DefaultHub: HubConfig{
 			ID:             envDefault("REACH_HUB_ID", "primary"),
 			Name:           envDefault("REACH_HUB_NAME", "Primary Hub"),
@@ -162,6 +185,9 @@ func LoadConfig(path string) (Config, error) {
 		cfg.OfflineAfter = 5 * time.Minute
 	}
 	// DefaultExpiry 0 means never expire. Only set expiry if explicitly configured.
+	if cfg.AgentUpdates.ManifestPath == "" {
+		cfg.AgentUpdates.ManifestPath = "/var/lib/reach/downloads/reach-agent/latest.json"
+	}
 	if cfg.DefaultHub.ID == "" {
 		cfg.DefaultHub = DefaultConfig().DefaultHub
 	}

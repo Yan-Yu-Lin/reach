@@ -51,6 +51,7 @@ func (s *Store) Migrate(ctx context.Context, cfg Config) error {
 			desired_changed_at TEXT,
 			desired_changed_by TEXT,
 			observed_state TEXT DEFAULT 'unknown',
+			update_policy TEXT DEFAULT 'manual',
 			cleanup_state TEXT,
 			mode TEXT,
 			local_port INTEGER DEFAULT 22,
@@ -253,6 +254,7 @@ func (s *Store) Migrate(ctx context.Context, cfg Config) error {
 		{"machines", "desired_changed_at", "TEXT"},
 		{"machines", "desired_changed_by", "TEXT"},
 		{"machines", "observed_state", "TEXT DEFAULT 'unknown'"},
+		{"machines", "update_policy", "TEXT DEFAULT 'manual'"},
 		{"machines", "cleanup_state", "TEXT"},
 		{"machines", "process_title_config_json", "TEXT"},
 		{"tunnels", "original_unix_user", "TEXT"},
@@ -270,6 +272,9 @@ func (s *Store) Migrate(ctx context.Context, cfg Config) error {
 		return err
 	}
 	if _, err := s.db.ExecContext(ctx, `UPDATE machines SET observed_state=CASE WHEN status='active' THEN 'online' WHEN status='offline' THEN 'offline' ELSE COALESCE(NULLIF(observed_state,''),'unknown') END WHERE observed_state IS NULL OR observed_state=''`); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE machines SET update_policy='manual' WHERE update_policy IS NULL OR update_policy=''`); err != nil {
 		return err
 	}
 	if err := s.releaseRetiredSlugs(ctx); err != nil {
@@ -483,10 +488,10 @@ func (s *Store) Audit(ctx context.Context, action, actor, machineID, details str
 func scanMachine(rows interface{ Scan(dest ...any) error }) (Machine, error) {
 	var m Machine
 	var originalSlug, displayName, targetUser, ownerUserID, mode, persistence, distro, arch, provisionError, updatedAt, expiresAt, disabledAt, retiredAt, processTitleConfig sql.NullString
-	var desiredChangedAt, desiredChangedBy, cleanupState sql.NullString
+	var desiredChangedAt, desiredChangedBy, cleanupState, updatePolicy sql.NullString
 	var desiredState, observedState sql.NullString
 	var desiredGeneration sql.NullInt64
-	err := rows.Scan(&m.ID, &m.Slug, &originalSlug, &displayName, &targetUser, &ownerUserID, &m.Status, &desiredState, &observedState, &desiredGeneration, &desiredChangedAt, &desiredChangedBy, &cleanupState, &mode, &m.LocalPort, &persistence, &distro, &arch, &provisionError, &m.CreatedAt, &updatedAt, &expiresAt, &disabledAt, &retiredAt, &processTitleConfig)
+	err := rows.Scan(&m.ID, &m.Slug, &originalSlug, &displayName, &targetUser, &ownerUserID, &m.Status, &desiredState, &observedState, &desiredGeneration, &updatePolicy, &desiredChangedAt, &desiredChangedBy, &cleanupState, &mode, &m.LocalPort, &persistence, &distro, &arch, &provisionError, &m.CreatedAt, &updatedAt, &expiresAt, &disabledAt, &retiredAt, &processTitleConfig)
 	m.OriginalSlug = stringPtrFromNull(originalSlug)
 	m.DisplayName = stringPtrFromNull(displayName)
 	m.TargetUser = stringPtrFromNull(targetUser)
@@ -502,6 +507,10 @@ func scanMachine(rows interface{ Scan(dest ...any) error }) (Machine, error) {
 	m.DesiredGeneration = desiredGeneration.Int64
 	if m.DesiredGeneration == 0 {
 		m.DesiredGeneration = 1
+	}
+	m.UpdatePolicy = updatePolicy.String
+	if m.UpdatePolicy == "" {
+		m.UpdatePolicy = "manual"
 	}
 	m.DesiredChangedAt = stringPtrFromNull(desiredChangedAt)
 	m.DesiredChangedBy = stringPtrFromNull(desiredChangedBy)
@@ -524,7 +533,7 @@ func scanMachine(rows interface{ Scan(dest ...any) error }) (Machine, error) {
 	return m, err
 }
 
-const machineCols = `id,slug,original_slug,display_name,target_user,owner_user_id,status,desired_state,observed_state,desired_generation,desired_changed_at,desired_changed_by,cleanup_state,mode,local_port,persistence,distro,arch,provision_error,created_at,updated_at,expires_at,disabled_at,retired_at,process_title_config_json`
+const machineCols = `id,slug,original_slug,display_name,target_user,owner_user_id,status,desired_state,observed_state,desired_generation,update_policy,desired_changed_at,desired_changed_by,cleanup_state,mode,local_port,persistence,distro,arch,provision_error,created_at,updated_at,expires_at,disabled_at,retired_at,process_title_config_json`
 
 func scanTunnel(rows interface{ Scan(dest ...any) error }) (Tunnel, error) {
 	var t Tunnel

@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -38,6 +39,7 @@ type Config struct {
 	Transport      TransportConfig `yaml:"transport" json:"transport"`
 	Heartbeat      HeartbeatConfig `yaml:"heartbeat" json:"heartbeat"`
 	Install        InstallConfig   `yaml:"install" json:"install"`
+	Updates        UpdatesConfig   `yaml:"updates" json:"updates"`
 	ProcessTitle   string          `yaml:"process_title,omitempty" json:"process_title,omitempty"`
 	ProcessTitles  []string        `yaml:"process_titles,omitempty" json:"process_titles,omitempty"`
 	RotateInterval string          `yaml:"rotate_interval,omitempty" json:"rotate_interval,omitempty"`
@@ -107,6 +109,10 @@ type InstallConfig struct {
 	PersistenceBackend    string `yaml:"persistence_backend" json:"persistence_backend"`
 	PersistenceQuality    string `yaml:"persistence_quality" json:"persistence_quality"`
 	PersistenceRebootSafe bool   `yaml:"persistence_reboot_safe" json:"persistence_reboot_safe"`
+}
+
+type UpdatesConfig struct {
+	AllowSelfUpdate bool `yaml:"allow_self_update" json:"allow_self_update"`
 }
 
 type RuntimeStatus struct {
@@ -253,6 +259,7 @@ type Daemon struct {
 	appliedGeneration int64
 	stopping          bool
 	titleController   *ProcessTitleController
+	updateConfirmed   bool
 }
 
 func main() {
@@ -560,6 +567,7 @@ func (d *Daemon) reconcile(ctx context.Context) {
 	if resp.Heartbeat.NextIntervalSeconds > 0 {
 		d.cfg.Heartbeat.interval = time.Duration(resp.Heartbeat.NextIntervalSeconds) * time.Second
 	}
+	d.confirmPendingUpdateAfterHeartbeat()
 	for _, cmd := range resp.Commands {
 		d.applyCommand(ctx, cmd)
 	}
@@ -638,13 +646,76 @@ func (d *Daemon) applyCommand(ctx context.Context, cmd AgentCommand) {
 		}()
 		return
 	case "update_agent":
-		res.Message = "update command noted; self-update not enabled in this build"
+		if !d.canSelfUpdate() {
+			res.Status = "failed"
+			res.Message = "self-update is not enabled on this agent"
+			break
+		}
+		var payload struct {
+			Version string `json:"version"`
+			APIURL  string `json:"api_url"`
+		}
+		if len(cmd.Payload) > 0 {
+			if err := json.Unmarshal(cmd.Payload, &payload); err != nil {
+				res.Status = "failed"
+				res.Message = "invalid update payload: " + err.Error()
+				break
+			}
+		}
+		payload.Version = strings.TrimSpace(payload.Version)
+		payload.APIURL = strings.TrimSpace(payload.APIURL)
+		if payload.Version == "" {
+			res.Status = "failed"
+			res.Message = "update payload missing version"
+			break
+		}
+		args := []string{"--version", payload.Version}
+		if payload.APIURL != "" {
+			args = append(args, "--api-url", payload.APIURL)
+		}
+		if err := updateBinaryCommand(context.Background(), args); err != nil {
+			res.Status = "failed"
+			res.Message = err.Error()
+		} else {
+			res.Message = "started detached agent update to " + payload.Version
+		}
 	default:
 		res.Status = "failed"
 		res.Message = "unknown command"
 	}
 	d.queueResult(res)
 	_, _ = d.sendHeartbeat(ctx, nil)
+}
+
+func (d *Daemon) canSelfUpdate() bool {
+	if !d.cfg.Updates.AllowSelfUpdate || runtime.GOOS != "linux" {
+		return false
+	}
+	if d.cfg.Install.AgentPath == "" || d.cfg.Install.DataDir == "" {
+		return false
+	}
+	if d.cfg.Install.Mode == "system" && os.Geteuid() != 0 {
+		return false
+	}
+	return true
+}
+
+func (d *Daemon) confirmPendingUpdateAfterHeartbeat() {
+	if d.updateConfirmed || !d.canSelfUpdate() {
+		return
+	}
+	d.updateConfirmed = true
+	st, err := loadReachInstallState("")
+	if err != nil {
+		d.logger.Printf("update confirm skipped: %v", err)
+		return
+	}
+	if _, err := os.Stat(filepath.Join(st.DataDir, "update-confirm-required")); err != nil {
+		return
+	}
+	if err := confirmUpdate(st); err != nil {
+		d.logger.Printf("update confirm failed: %v", err)
+	}
 }
 
 func (d *Daemon) queueResult(res CommandResult) {
@@ -752,7 +823,7 @@ func (d *Daemon) sendHeartbeat(ctx context.Context, shutdown *ShutdownNotice) (H
 	d.mu.Unlock()
 	sshCaps := d.cfg.Tunnel.SSHCompat
 	sshCaps.ClientOptions = d.cfg.LocalSSH.ClientOptions
-	reqBody := HeartbeatRequest{MachineID: d.cfg.MachineID, Slug: d.cfg.Slug, AgentVersion: version, Capabilities: AgentCapabilities{Commands: []string{"start_tunnel", "stop_tunnel", "sync_keys", "uninstall", "update_agent"}, Transports: []string{"direct", "websocket"}, CanManageLocalSSHD: d.cfg.LocalSSH.Manage, CanSelfUpdate: false, SSH: sshCaps}, AppliedGeneration: d.appliedGeneration, Observed: ObservedState{AgentState: "running", LocalSSH: st.LocalSSH, Tunnel: st.Tunnel, Persistence: st.Persistence, Keys: KeysState{InstalledAdminKeyFingerprints: d.installedKeyFingerprints(), Generation: 0}}, CommandResults: results, Shutdown: shutdown, LastError: st.LastError}
+	reqBody := HeartbeatRequest{MachineID: d.cfg.MachineID, Slug: d.cfg.Slug, AgentVersion: version, Capabilities: AgentCapabilities{Commands: []string{"start_tunnel", "stop_tunnel", "sync_keys", "uninstall", "update_agent"}, Transports: []string{"direct", "websocket"}, CanManageLocalSSHD: d.cfg.LocalSSH.Manage, CanSelfUpdate: d.canSelfUpdate(), SSH: sshCaps}, AppliedGeneration: d.appliedGeneration, Observed: ObservedState{AgentState: "running", LocalSSH: st.LocalSSH, Tunnel: st.Tunnel, Persistence: st.Persistence, Keys: KeysState{InstalledAdminKeyFingerprints: d.installedKeyFingerprints(), Generation: 0}}, CommandResults: results, Shutdown: shutdown, LastError: st.LastError}
 	body, _ := json.Marshal(reqBody)
 	reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()

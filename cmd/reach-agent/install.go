@@ -870,6 +870,7 @@ func buildAgentConfig(opt installOptions, prov provisionResponse, keyPath, known
 	cfg.Install.PersistenceBackend = "reach-agent-" + opt.InstallMode
 	cfg.Install.PersistenceQuality = "unknown"
 	cfg.Install.PersistenceRebootSafe = opt.InstallMode == "system"
+	cfg.Updates.AllowSelfUpdate = true
 	cfg.Transport.Mode = opt.Transport
 	cfg.Transport.ProbeHost = prov.Hub.PublicHost
 	cfg.Transport.ProbePort = prov.Hub.SSHPort

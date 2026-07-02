@@ -54,6 +54,25 @@ tunnel_home_base: /var/lib
 ssh_service_name: ssh
 provisioning_enabled: true
 
+# Agent update discovery. deploy-jason.sh writes this manifest when publishing agent binaries.
+agent_updates:
+  enabled: true
+  manifest_path: /var/lib/reach/downloads/reach-agent/latest.json
+  # Optional override if downloads are served from a different public URL.
+  # api_url: https://tunnels.your-domain.example
+  # Optional static fallback/override.
+  # latest_version: 0.1.0-alpha
+
+# Optional ntfy-style pending request notifications. The server POSTs a short
+# plaintext message and ntfy-compatible headers when a new request needs approval.
+notifications:
+  enabled: false
+  pending_request:
+    # webhook_url: https://ntfy.sh/replace-with-private-topic
+    webhook_headers:
+      Priority: high
+      Tags: computer,warning
+
 default_hub:
   id: primary
   name: Primary Hub
