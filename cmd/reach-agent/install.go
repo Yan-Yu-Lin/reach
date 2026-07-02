@@ -130,21 +130,14 @@ func installCommand(ctx context.Context, args []string) error {
 		return fmt.Errorf("reach-agent install currently supports Linux and Windows only")
 	}
 	if opt.InstallMode == "auto" {
-		if runtime.GOOS == "windows" {
-			opt.InstallMode = "system"
-		} else if os.Geteuid() == 0 {
-			opt.InstallMode = "system"
-		} else {
-			opt.InstallMode = "user"
-		}
+		opt.InstallMode = defaultInstallMode()
 	}
 	switch opt.InstallMode {
 	case "system":
-		if runtime.GOOS == "windows" {
-			if !windowsIsElevated() {
+		if !canManageSystemInstall() {
+			if runtime.GOOS == "windows" {
 				return fmt.Errorf("Windows system install needs an elevated Administrator PowerShell")
 			}
-		} else if os.Geteuid() != 0 {
 			return fmt.Errorf("system install needs root; use --mode user or rerun via sudo")
 		}
 	case "user":
@@ -280,6 +273,23 @@ func installCommand(ctx context.Context, args []string) error {
 	}
 	fmt.Printf("\n✅ Reach agent installed.\n\n  Machine ID: %s\n  SSH alias:  %s\n  Hub port:   %d\n  Transport:  %s\n  Local SSH:  %s\n\nThe operator can now run: ssh %s\n", prov.Machine.ID, prov.Machine.Slug, prov.Tunnel.RemotePort, opt.Transport, localSummary, prov.Machine.Slug)
 	return nil
+}
+
+func defaultInstallMode() string {
+	if runtime.GOOS == "windows" {
+		return "system"
+	}
+	if os.Geteuid() == 0 {
+		return "system"
+	}
+	return "user"
+}
+
+func canManageSystemInstall() bool {
+	if runtime.GOOS == "windows" {
+		return windowsIsElevated()
+	}
+	return os.Geteuid() == 0
 }
 
 func applyModeDefaults(opt *installOptions) {
@@ -1173,11 +1183,7 @@ func uninstallCommand(ctx context.Context, args []string) error {
 	}
 	opt := installOptions{InstallMode: *mode, ConfigDir: *configDir, DataDir: *dataDir, AgentPath: *agentPath}
 	if opt.InstallMode == "auto" {
-		if os.Geteuid() == 0 {
-			opt.InstallMode = "system"
-		} else {
-			opt.InstallMode = "user"
-		}
+		opt.InstallMode = defaultInstallMode()
 	}
 	applyModeDefaults(&opt)
 	env := readInstallEnv(filepath.Join(opt.ConfigDir, "install.env"))
@@ -1191,7 +1197,10 @@ func uninstallCommand(ctx context.Context, args []string) error {
 			opt.AgentPath = v
 		}
 	}
-	if opt.InstallMode == "system" && os.Geteuid() != 0 {
+	if opt.InstallMode == "system" && !canManageSystemInstall() {
+		if runtime.GOOS == "windows" {
+			return fmt.Errorf("Windows system uninstall needs an elevated Administrator PowerShell")
+		}
 		return fmt.Errorf("system uninstall needs root")
 	}
 	if !*yes {
@@ -1215,11 +1224,15 @@ func uninstallCommand(ctx context.Context, args []string) error {
 	if opt.ConfigDir != "" {
 		_ = os.RemoveAll(opt.ConfigDir)
 	}
-	if opt.AgentPath != "" && strings.HasSuffix(filepath.Base(opt.AgentPath), "reach-agent") {
+	if opt.AgentPath != "" && isReachAgentBinaryName(filepath.Base(opt.AgentPath)) {
 		_ = os.Remove(opt.AgentPath)
 	}
 	fmt.Println("[reach] uninstall complete")
 	return nil
+}
+
+func isReachAgentBinaryName(name string) bool {
+	return name == "reach-agent" || strings.EqualFold(name, "reach-agent.exe")
 }
 
 func sendUninstallIntent(ctx context.Context, opt installOptions, env map[string]string, reason string, complete bool) {

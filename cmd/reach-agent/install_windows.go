@@ -23,7 +23,10 @@ func applyWindowsModeDefaults(opt *installOptions) {
 	if programData == "" {
 		programData = `C:\ProgramData`
 	}
-	programFiles := os.Getenv("ProgramFiles")
+	programFiles := os.Getenv("ProgramW6432")
+	if programFiles == "" {
+		programFiles = os.Getenv("ProgramFiles")
+	}
 	if programFiles == "" {
 		programFiles = `C:\Program Files`
 	}
@@ -159,27 +162,43 @@ func ensureWindowsOpenSSHPath() {
 	if windir == "" {
 		windir = `C:\Windows`
 	}
-	dir := filepath.Join(windir, "System32", "OpenSSH")
-	if st, err := os.Stat(dir); err != nil || !st.IsDir() {
-		return
+	candidates := []string{
+		filepath.Join(windir, "System32", "OpenSSH"),
+		filepath.Join(windir, "Sysnative", "OpenSSH"),
 	}
 	path := os.Getenv("PATH")
-	for _, p := range filepath.SplitList(path) {
-		if strings.EqualFold(p, dir) {
-			return
+	for _, dir := range candidates {
+		if st, err := os.Stat(dir); err != nil || !st.IsDir() {
+			continue
+		}
+		found := false
+		for _, p := range filepath.SplitList(path) {
+			if strings.EqualFold(p, dir) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			path += string(os.PathListSeparator) + dir
 		}
 	}
-	_ = os.Setenv("PATH", path+string(os.PathListSeparator)+dir)
+	_ = os.Setenv("PATH", path)
 }
 
 func installWindowsCapability(ctx context.Context, capability, label string) error {
-	script := `$Name = $args[0]; $cap = Get-WindowsCapability -Online -Name $Name -ErrorAction SilentlyContinue; if ($cap) { $cap.State }`
-	state, _ := powershellOutput(ctx, script, capability)
+	state, _ := powershellOutput(ctx, `
+param([string]$Name)
+$cap = Get-WindowsCapability -Online -Name $Name -ErrorAction SilentlyContinue
+if ($cap) { $cap.State }
+`, capability)
 	if strings.EqualFold(strings.TrimSpace(state), "Installed") {
 		return nil
 	}
 	fmt.Printf("[reach] installing %s optional feature\n", label)
-	if out, err := powershellOutput(ctx, `$Name = $args[0]; Add-WindowsCapability -Online -Name $Name | Out-String`, capability); err != nil {
+	if out, err := powershellOutput(ctx, `
+param([string]$Name)
+Add-WindowsCapability -Online -Name $Name | Out-String
+`, capability); err != nil {
 		return fmt.Errorf("install %s optional feature failed: %w: %s", label, err, strings.TrimSpace(out))
 	}
 	return nil

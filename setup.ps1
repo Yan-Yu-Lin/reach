@@ -30,8 +30,9 @@ function Get-ReachAgentAsset {
   try {
     $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
   } catch {
-    $arch = $env:PROCESSOR_ARCHITECTURE
+    $arch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
   }
+  if ($env:PROCESSOR_ARCHITEW6432 -and $arch -match '^(X86|x86)$') { $arch = $env:PROCESSOR_ARCHITEW6432 }
   switch -Regex ($arch) {
     '^(X64|AMD64)$' { return 'reach-agent_windows_amd64.exe' }
     '^(Arm64|ARM64)$' { return 'reach-agent_windows_arm64.exe' }
@@ -51,9 +52,14 @@ function Ensure-ReachWindowsCapability([string]$Name, [string]$Label) {
 }
 
 function Add-ReachOpenSSHPath {
-  $openSshDir = Join-Path $env:WINDIR 'System32\OpenSSH'
-  if ((Test-Path -LiteralPath $openSshDir) -and (($env:Path -split ';') -notcontains $openSshDir)) {
-    $env:Path = $env:Path + ';' + $openSshDir
+  $candidates = @(
+    (Join-Path $env:WINDIR 'System32\OpenSSH'),
+    (Join-Path $env:WINDIR 'Sysnative\OpenSSH')
+  )
+  foreach ($openSshDir in $candidates) {
+    if ((Test-Path -LiteralPath $openSshDir) -and (($env:Path -split ';') -notcontains $openSshDir)) {
+      $env:Path = $env:Path + ';' + $openSshDir
+    }
   }
 }
 
@@ -100,6 +106,20 @@ function Invoke-ReachDownload([string]$Url, [string]$OutFile) {
   Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing
 }
 
+function Save-ReachAgentCandidate([string]$Destination) {
+  $asset = Get-ReachAgentAsset
+  $baseUrl = ($ApiUrl.TrimEnd('/')) + "/downloads/reach-agent/v$Version"
+  $dir = Split-Path -Parent $Destination
+  if (-not $dir) { $dir = '.' }
+  New-Item -ItemType Directory -Force -Path $dir | Out-Null
+  $checksums = Join-Path $dir 'checksums.txt'
+  Invoke-ReachDownload "$baseUrl/$asset" $Destination
+  Invoke-ReachDownload "$baseUrl/checksums.txt" $checksums
+  $expected = Get-ReachChecksum $checksums $asset
+  $actual = (Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash.ToLowerInvariant()
+  if ($actual -ne $expected) { Die "reach-agent checksum mismatch: got $actual expected $expected" }
+}
+
 if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
   Die "setup.ps1 supports Windows only"
 }
@@ -120,14 +140,41 @@ if (-not $Token -and $TokenFile -and (Test-Path -LiteralPath $TokenFile)) {
 }
 if ($Token) { Warn "auth codes passed to setup.ps1 may be visible in process history; prefer -TokenFile for shared machines." }
 
-$InstallDir = Join-Path $env:ProgramFiles 'Reach'
-$ProgramDataDir = Join-Path $env:ProgramData 'Reach'
+$ProgramFilesRoot = if ($env:ProgramW6432) { $env:ProgramW6432 } elseif ($env:ProgramFiles) { $env:ProgramFiles } else { 'C:\Program Files' }
+$ProgramDataRoot = if ($env:ProgramData) { $env:ProgramData } else { 'C:\ProgramData' }
+$InstallDir = Join-Path $ProgramFilesRoot 'Reach'
+$ProgramDataDir = Join-Path $ProgramDataRoot 'Reach'
 $AgentPath = Join-Path $InstallDir 'reach-agent.exe'
 
 if ($Uninstall -or $Reinstall) {
   Log "Uninstalling existing Reach Windows agent"
+  $agentUninstallFailed = $false
+  $needsFallbackUninstall = $false
+  $installEnvPath = Join-Path $ProgramDataDir 'install.env'
   if (Test-Path -LiteralPath $AgentPath) {
-    try { & $AgentPath uninstall --mode system --yes } catch { Warn "reach-agent uninstall returned: $_" }
+    try {
+      & $AgentPath uninstall --mode system --yes
+      if ($LASTEXITCODE -ne 0) { $needsFallbackUninstall = $true }
+    } catch {
+      $needsFallbackUninstall = $true
+      Warn "reach-agent uninstall returned: $_"
+    }
+  } elseif (Test-Path -LiteralPath $installEnvPath) {
+    $needsFallbackUninstall = $true
+    Warn "installed reach-agent binary is missing but install metadata exists; using cleanup fallback"
+  }
+  if ($needsFallbackUninstall) {
+    Warn "installed reach-agent could not uninstall itself; downloading current agent for cleanup fallback"
+    $fallbackTmp = Join-Path ([IO.Path]::GetTempPath()) ("reach-uninstall-" + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $fallbackTmp | Out-Null
+    try {
+      $fallbackAgent = Join-Path $fallbackTmp 'reach-agent.exe'
+      Save-ReachAgentCandidate $fallbackAgent
+      & $fallbackAgent uninstall --mode system --yes --config-dir $ProgramDataDir --data-dir $ProgramDataDir --agent-path $AgentPath
+      if ($LASTEXITCODE -ne 0) { $agentUninstallFailed = $true }
+    } finally {
+      Remove-Item -LiteralPath $fallbackTmp -Recurse -Force -ErrorAction SilentlyContinue
+    }
   }
   try {
     $task = Get-ScheduledTask -TaskPath '\Reach\' -TaskName 'reach-agent' -ErrorAction SilentlyContinue
@@ -136,6 +183,9 @@ if ($Uninstall -or $Reinstall) {
       Unregister-ScheduledTask -TaskPath '\Reach\' -TaskName 'reach-agent' -Confirm:$false
     }
   } catch { Warn "Task Scheduler cleanup returned: $_" }
+  if ($agentUninstallFailed) {
+    Die "reach-agent uninstall failed; preserving $ProgramDataDir so authorized_keys cleanup can be retried"
+  }
   Remove-Item -LiteralPath $ProgramDataDir -Recurse -Force -ErrorAction SilentlyContinue
   Remove-Item -LiteralPath $AgentPath -Force -ErrorAction SilentlyContinue
   if ($Uninstall) { Log "Reach uninstall complete"; exit 0 }
@@ -152,18 +202,11 @@ if ($Repair -and $UpdateAgent) {
   Die "Windows self-update is not supported yet; use -Reinstall to replace the agent binary."
 }
 
-$asset = Get-ReachAgentAsset
-$baseUrl = ($ApiUrl.TrimEnd('/')) + "/downloads/reach-agent/v$Version"
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ("reach-setup-" + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 try {
   $candidate = Join-Path $tmp 'reach-agent.exe'
-  $checksums = Join-Path $tmp 'checksums.txt'
-  Invoke-ReachDownload "$baseUrl/$asset" $candidate
-  Invoke-ReachDownload "$baseUrl/checksums.txt" $checksums
-  $expected = Get-ReachChecksum $checksums $asset
-  $actual = (Get-FileHash -LiteralPath $candidate -Algorithm SHA256).Hash.ToLowerInvariant()
-  if ($actual -ne $expected) { Die "reach-agent checksum mismatch: got $actual expected $expected" }
+  Save-ReachAgentCandidate $candidate
 
   Ensure-ReachOpenSSHServer
 
