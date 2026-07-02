@@ -1,10 +1,14 @@
 package main
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"strings"
 	"testing"
+
+	"aead.dev/minisign"
 )
 
 func TestAgentAssetForArch(t *testing.T) {
@@ -58,6 +62,62 @@ func TestChecksumForAssetStarName(t *testing.T) {
 func TestChecksumForAssetRejectsInvalidHash(t *testing.T) {
 	if _, err := checksumForAsset([]byte("nothex  reach-agent_linux_amd64\n"), "reach-agent_linux_amd64"); err == nil {
 		t.Fatalf("expected invalid hash error")
+	}
+}
+
+func TestParseReleaseManifest(t *testing.T) {
+	sum := sha256.Sum256([]byte("agent"))
+	manifest := releaseManifest{
+		Schema:    1,
+		Project:   releaseManifestProject,
+		Version:   "1.2.3",
+		CreatedAt: "2026-07-03T00:00:00Z",
+		Assets: map[string]releaseAsset{
+			"reach-agent_linux_amd64": {SHA256: hex.EncodeToString(sum[:]), Size: 5},
+		},
+	}
+	raw, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotManifest, gotAsset, err := parseReleaseManifest(raw, "1.2.3", "reach-agent_linux_amd64")
+	if err != nil {
+		t.Fatalf("parseReleaseManifest returned error: %v", err)
+	}
+	if gotManifest.Version != "1.2.3" || gotAsset.Size != 5 {
+		t.Fatalf("unexpected manifest=%+v asset=%+v", gotManifest, gotAsset)
+	}
+}
+
+func TestParseReleaseManifestRejectsWrongVersion(t *testing.T) {
+	sum := sha256.Sum256([]byte("agent"))
+	manifest := releaseManifest{Schema: 1, Project: releaseManifestProject, Version: "1.2.3", Assets: map[string]releaseAsset{"reach-agent_linux_amd64": {SHA256: hex.EncodeToString(sum[:]), Size: 5}}}
+	raw, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := parseReleaseManifest(raw, "1.2.4", "reach-agent_linux_amd64"); err == nil {
+		t.Fatalf("expected version mismatch error")
+	}
+}
+
+func TestVerifyReleaseManifestSignature(t *testing.T) {
+	publicKey, privateKey, err := minisign.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicKeyText := publicKey.String()
+	oldKeys := releaseManifestPublicKeys
+	releaseManifestPublicKeys = []string{publicKeyText}
+	t.Cleanup(func() { releaseManifestPublicKeys = oldKeys })
+
+	manifest := []byte(`{"schema":1,"project":"reach-agent","version":"1.2.3","assets":{}}`)
+	sig := minisign.SignWithComments(privateKey, manifest, "reach-agent test manifest", "untrusted comment: test")
+	if err := verifyReleaseManifestSignature(manifest, sig); err != nil {
+		t.Fatalf("verifyReleaseManifestSignature returned error: %v", err)
+	}
+	if err := verifyReleaseManifestSignature([]byte(`{"schema":1}`), sig); err == nil {
+		t.Fatalf("expected signature failure for tampered manifest")
 	}
 }
 

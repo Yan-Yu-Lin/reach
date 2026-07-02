@@ -3,6 +3,7 @@ module reach
 go 1.22
 
 require (
+	aead.dev/minisign v0.3.0
 	github.com/creack/pty v1.1.24
 	github.com/gliderlabs/ssh v0.3.8
 	github.com/golang-jwt/jwt/v5 v5.3.1
