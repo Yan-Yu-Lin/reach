@@ -28,6 +28,8 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+const publicRepoURL = "https://github.com/Yan-Yu-Lin/reach"
+
 type installOptions struct {
 	APIURL      string
 	Name        string
@@ -256,15 +258,19 @@ func installCommand(ctx context.Context, args []string) error {
 	if err := writeYAML0600(cfgPath, cfg); err != nil {
 		return err
 	}
-	if err := installPersistence(ctx, opt, cfgPath); err != nil {
+	persistenceBackend, err := installPersistence(ctx, opt, cfgPath)
+	if err != nil {
 		return err
 	}
 	writeInstallEnv(opt, prov, cfgPath, plan)
+	if err := writeReachInfo(opt, prov, cfgPath, plan, wsPath, persistenceBackend); err != nil {
+		fmt.Printf("[reach warning] could not write transparency info file: %v\n", err)
+	}
 	localSummary := plan.Mode
 	if plan.InternalSSHD {
 		localSummary += " (shell only; no sftp; loopback-only)"
 	}
-	fmt.Printf("\n✅ Reach agent installed.\n\n  Machine ID: %s\n  SSH alias:  %s\n  Hub port:   %d\n  Transport:  %s\n  Local SSH:  %s\n\nThe operator can now run: ssh %s\n", prov.Machine.ID, prov.Machine.Slug, prov.Tunnel.RemotePort, opt.Transport, localSummary, prov.Machine.Slug)
+	fmt.Printf("\n✅ Reach agent installed.\n\n  Machine ID: %s\n  SSH alias:  %s\n  Hub port:   %d\n  Transport:  %s\n  Local SSH:  %s\n  Source code: %s\n\nThe operator can now run: ssh %s\n", prov.Machine.ID, prov.Machine.Slug, prov.Tunnel.RemotePort, opt.Transport, localSummary, publicRepoURL, prov.Machine.Slug)
 	return nil
 }
 
@@ -894,33 +900,40 @@ func writeYAML0600(path string, v any) error {
 	return nil
 }
 
-func installPersistence(ctx context.Context, opt installOptions, cfgPath string) error {
+func installPersistence(ctx context.Context, opt installOptions, cfgPath string) (string, error) {
 	if opt.InstallMode == "system" {
 		if err := installSystemdService(ctx, opt.AgentPath, cfgPath); err == nil {
-			return nil
+			return "/etc/systemd/system/reach-agent.service", nil
 		} else {
 			fmt.Printf("[reach warning] systemd service unavailable: %v\n", err)
 		}
 		if err := installCron(ctx, opt.AgentPath, cfgPath, opt.DataDir); err == nil {
-			return nil
+			return "root crontab @reboot", nil
 		} else {
 			fmt.Printf("[reach warning] root crontab persistence unavailable: %v\n", err)
 		}
 		fmt.Printf("[reach warning] no reboot-safe system persistence available; starting a detached agent for this boot only.\n")
-		return startDetached(opt.AgentPath, cfgPath, filepath.Join(opt.DataDir, "agent.log"), filepath.Join(opt.DataDir, "reach-agent.pid"))
+		if err := startDetached(opt.AgentPath, cfgPath, filepath.Join(opt.DataDir, "agent.log"), filepath.Join(opt.DataDir, "reach-agent.pid")); err != nil {
+			return "", err
+		}
+		return "detached process for this boot only", nil
 	}
 	if err := installUserSystemd(ctx, opt.AgentPath, cfgPath); err == nil {
-		return nil
+		home, _ := os.UserHomeDir()
+		return filepath.Join(home, ".config", "systemd", "user", "reach-agent.service"), nil
 	} else {
 		fmt.Printf("[reach warning] systemd --user unavailable: %v\n", err)
 	}
 	if err := installCron(ctx, opt.AgentPath, cfgPath, opt.DataDir); err == nil {
-		return nil
+		return "user crontab @reboot", nil
 	} else {
 		fmt.Printf("[reach warning] crontab persistence unavailable: %v\n", err)
 	}
 	fmt.Printf("[reach warning] no reboot-safe user persistence available; starting a detached agent for this login only.\n")
-	return startDetached(opt.AgentPath, cfgPath, filepath.Join(opt.DataDir, "agent.log"), filepath.Join(opt.DataDir, "reach-agent.pid"))
+	if err := startDetached(opt.AgentPath, cfgPath, filepath.Join(opt.DataDir, "agent.log"), filepath.Join(opt.DataDir, "reach-agent.pid")); err != nil {
+		return "", err
+	}
+	return "detached process for this login only", nil
 }
 
 func installSystemdService(ctx context.Context, agentPath, cfgPath string) error {
@@ -1109,6 +1122,109 @@ func firstField(s string) string {
 		return ""
 	}
 	return fields[0]
+}
+
+func writeReachInfo(opt installOptions, prov provisionResponse, cfgPath string, plan localSSHPlan, wsPath, persistenceBackend string) error {
+	infoPath := filepath.Join(opt.DataDir, "REACH_INFO.txt")
+	configInfoPath := filepath.Join(opt.ConfigDir, "REACH_INFO.txt")
+	pidPath := filepath.Join(opt.DataDir, "reach-agent.pid")
+	knownHostsPath := filepath.Join(opt.ConfigDir, "known_hosts")
+	installEnvPath := filepath.Join(opt.ConfigDir, "install.env")
+	marker := "reach:" + prov.Machine.ID
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "Reach target agent\n")
+	fmt.Fprintf(&b, "==================\n\n")
+	fmt.Fprintf(&b, "What this is:\n")
+	fmt.Fprintf(&b, "Reach is a self-hosted reverse SSH tunnel manager. This machine runs reach-agent,\n")
+	fmt.Fprintf(&b, "which opens an outbound tunnel to a Reach hub so an approved operator can SSH back\n")
+	fmt.Fprintf(&b, "to this machine through the hub.\n\n")
+	fmt.Fprintf(&b, "Who set it up:\n")
+	fmt.Fprintf(&b, "Installed by: %s\n", installActor())
+	fmt.Fprintf(&b, "Installed at: %s\n\n", time.Now().Format(time.RFC3339))
+	fmt.Fprintf(&b, "Source code:\n%s\n\n", publicRepoURL)
+	fmt.Fprintf(&b, "Hub/API:\n")
+	fmt.Fprintf(&b, "API URL: %s\n", opt.APIURL)
+	fmt.Fprintf(&b, "Hub SSH host: %s\n", prov.Hub.PublicHost)
+	fmt.Fprintf(&b, "Hub SSH port: %d\n\n", prov.Hub.SSHPort)
+	fmt.Fprintf(&b, "Machine:\n")
+	fmt.Fprintf(&b, "Machine ID: %s\n", prov.Machine.ID)
+	fmt.Fprintf(&b, "SSH alias: %s\n", prov.Machine.Slug)
+	fmt.Fprintf(&b, "Target SSH user: %s\n", opt.TargetUser)
+	fmt.Fprintf(&b, "Install mode: %s\n", opt.InstallMode)
+	fmt.Fprintf(&b, "Transport: %s\n", opt.Transport)
+	fmt.Fprintf(&b, "Local SSH mode: %s\n", plan.Mode)
+	fmt.Fprintf(&b, "Local SSH loopback port: %d\n", plan.LocalPort)
+	fmt.Fprintf(&b, "Assigned hub tunnel port: %d\n\n", prov.Tunnel.RemotePort)
+	fmt.Fprintf(&b, "Created/touched files and directories:\n")
+	fmt.Fprintf(&b, "Agent binary: %s\n", opt.AgentPath)
+	fmt.Fprintf(&b, "Config directory: %s\n", opt.ConfigDir)
+	fmt.Fprintf(&b, "Data directory: %s\n", opt.DataDir)
+	fmt.Fprintf(&b, "Agent config: %s\n", cfgPath)
+	fmt.Fprintf(&b, "Install metadata: %s\n", installEnvPath)
+	fmt.Fprintf(&b, "Transparency info: %s\n", infoPath)
+	if configInfoPath != infoPath {
+		fmt.Fprintf(&b, "Transparency info copy: %s\n", configInfoPath)
+	}
+	fmt.Fprintf(&b, "Pinned hub host keys: %s\n", knownHostsPath)
+	fmt.Fprintf(&b, "Tunnel private key: %s\n", filepath.Join(opt.DataDir, "tunnel_key"))
+	fmt.Fprintf(&b, "Tunnel public key: %s\n", filepath.Join(opt.DataDir, "tunnel_key.pub"))
+	fmt.Fprintf(&b, "Agent log: %s\n", filepath.Join(opt.DataDir, "agent.log"))
+	fmt.Fprintf(&b, "Tunnel log: %s\n", filepath.Join(opt.DataDir, "tunnel.log"))
+	fmt.Fprintf(&b, "PID file/fallback PID: %s\n", pidPath)
+	fmt.Fprintf(&b, "Authorized keys touched: %s\n", plan.AuthFile)
+	fmt.Fprintf(&b, "Authorized keys marker: %s\n", marker)
+	if plan.UserSSHD {
+		fmt.Fprintf(&b, "User sshd config: %s\n", plan.SSHDConfig)
+		fmt.Fprintf(&b, "User sshd log: %s\n", plan.SSHDLog)
+	}
+	if plan.InternalSSHD {
+		fmt.Fprintf(&b, "Internal SSH server host key: %s\n", plan.HostKeyPath)
+		fmt.Fprintf(&b, "Internal SSH server log: %s\n", plan.SSHDLog)
+	}
+	if wsPath != "" && wsPath != opt.AgentPath {
+		fmt.Fprintf(&b, "WebSocket carrier binary: %s\n", wsPath)
+	}
+	fmt.Fprintf(&b, "\nPersistence:\n")
+	fmt.Fprintf(&b, "Active persistence backend: %s\n", persistenceBackend)
+	fmt.Fprintf(&b, "Service name: reach-agent.service\n")
+	if opt.InstallMode == "system" {
+		fmt.Fprintf(&b, "Systemd service path: /etc/systemd/system/reach-agent.service\n")
+		fmt.Fprintf(&b, "Fallback persistence may use root crontab or a detached process.\n")
+	} else {
+		home, _ := os.UserHomeDir()
+		fmt.Fprintf(&b, "User systemd service path: %s\n", filepath.Join(home, ".config", "systemd", "user", "reach-agent.service"))
+		fmt.Fprintf(&b, "Fallback persistence may use user crontab or a detached process.\n")
+	}
+	fmt.Fprintf(&b, "Older reach-tunnel.service units are disabled/removed during install/uninstall.\n\n")
+	fmt.Fprintf(&b, "Uninstall:\n")
+	if opt.InstallMode == "system" {
+		fmt.Fprintf(&b, "sudo %s uninstall --mode system\n", opt.AgentPath)
+	} else {
+		fmt.Fprintf(&b, "%s uninstall --mode user\n", opt.AgentPath)
+	}
+	fmt.Fprintf(&b, "\nUninstall stops Reach services/processes, removes Reach-managed authorized_keys\n")
+	fmt.Fprintf(&b, "lines marked with %s, removes local Reach config/data directories, removes the\n", marker)
+	fmt.Fprintf(&b, "agent binary, and notifies the hub when possible.\n")
+
+	content := []byte(b.String())
+	var errs []error
+	for _, path := range []string{infoPath, configInfoPath} {
+		if err := os.WriteFile(path, content, 0o644); err != nil {
+			errs = append(errs, fmt.Errorf("write %s: %w", path, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func installActor() string {
+	if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" && sudoUser != "root" {
+		return sudoUser + " via sudo"
+	}
+	if u := currentUsername(); u != "" {
+		return u
+	}
+	return "unknown"
 }
 
 func writeInstallEnv(opt installOptions, prov provisionResponse, cfgPath string, plan localSSHPlan) {

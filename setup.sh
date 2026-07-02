@@ -4,6 +4,7 @@ set -Eeuo pipefail
 REACH_AGENT_VERSION="${REACH_AGENT_VERSION:-0.1.0-alpha}"
 API_URL="${REACH_API_URL:-https://tunnels.your-domain.example}"
 TRANSPORT="${REACH_TRANSPORT:-auto}"
+SOURCE_URL="${REACH_SOURCE_URL:-https://github.com/Yan-Yu-Lin/reach}"
 
 NAME=""
 TOKEN=""
@@ -179,6 +180,7 @@ base_url="${API_URL%/}/downloads/reach-agent/v${REACH_AGENT_VERSION}"
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 
+log "Source code: $SOURCE_URL"
 log "Downloading reach-agent $REACH_AGENT_VERSION for $arch."
 curl -fsSL "$base_url/$asset" -o "$tmpdir/reach-agent"
 curl -fsSL "$base_url/checksums.txt" -o "$tmpdir/checksums.txt"
