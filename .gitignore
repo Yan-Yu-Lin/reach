@@ -1,0 +1,25 @@
+# Go build artifacts
+/reach
+/reachd
+/reachctl
+
+# Node/Nuxt
+node_modules/
+.output/
+.nuxt/
+dashboard/node_modules/
+dashboard/.output/
+dashboard/.nuxt/
+dashboard/dist/
+dashboard/dist
+
+# Local/dev state
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Secrets/config overrides
+config.local.yaml
+.env

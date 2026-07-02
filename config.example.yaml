@@ -1,0 +1,65 @@
+# Example Reach config. Copy to /etc/reach/config.yaml on your hub server.
+listen_addr: 127.0.0.1:9300
+db_path: /var/lib/reach/reach.db
+log_level: info
+
+# Extra CORS origins for admin/API calls. The default_hub.api_url origin is allowed automatically.
+allowed_origins: []
+
+# Generate with: printf '<secret>' | reachd hash-secret
+god_code_hash: "$argon2id$..."
+initial_admin:
+  username: admin
+  password_hash: "$argon2id$..."
+  public_keys:
+    - label: Admin laptop
+      public_key: "ssh-ed25519 AAAA... admin@example"
+    # Add an RSA admin key too if you need to SSH into OpenSSH 5.x targets.
+    # Those sshd versions cannot parse ed25519 authorized_keys entries.
+    # - label: Admin laptop legacy RSA
+    #   public_key: "ssh-rsa AAAA... admin@example"
+
+# Generate a long random string before deployment.
+jwt_secret: "replace-with-32+-bytes-random"
+# Long-lived because this is commonly used as a single-admin personal dashboard.
+# Logout blacklists the current token; rotate jwt_secret to revoke all sessions.
+admin_jwt_ttl: 8760h
+
+# Optional: returned to clients for StrictHostKeyChecking pinning.
+# Include an ssh-rsa host key when supporting OpenSSH 5.x target clients.
+hub_host_keys:
+  # - "[your-server-ip]:443 ssh-ed25519 AAAA..."
+  # - "[your-server-ip]:443 ssh-rsa AAAA..."
+
+# Optional: WebSocket-over-HTTPS carrier for networks that DPI-block SSH on 443.
+# Serve these binaries from your hub and set path_prefix to the nginx-enforced secret path.
+websocket_tunnel:
+  enabled: false
+  # reach = built-in Go carrier (runs anywhere reach-agent runs, including CentOS 6).
+  # wstunnel is still understood for old configs but is not recommended for old kernels.
+  carrier: reach
+  url: wss://tunnels.your-domain.example
+  path_prefix: ws/tunnel/replace-with-random-secret
+
+request_ttl: 30m
+setup_token_ttl: 15m
+health_interval: 45s
+maintenance_interval: 10m
+offline_after: 5m
+# 0 means machines do not expire unless an explicit expiry is requested.
+default_expiry: 0
+
+sshd_config_dir: /etc/ssh/sshd_config.d
+tunnel_home_base: /var/lib
+ssh_service_name: ssh
+provisioning_enabled: true
+
+default_hub:
+  id: primary
+  name: Primary Hub
+  public_host: your-server-ip
+  ssh_port: 443
+  proxyjump_alias: reach-hub
+  api_url: https://tunnels.your-domain.example
+  port_range_start: 9200
+  port_range_end: 9499

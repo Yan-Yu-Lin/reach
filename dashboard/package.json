@@ -1,0 +1,17 @@
+{
+  "name": "reach-dashboard",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "nuxt dev --host 127.0.0.1 --port 3009",
+    "build": "nuxt build",
+    "preview": "nuxt preview --host 127.0.0.1 --port 3009"
+  },
+  "dependencies": {
+    "nuxt": "^4.1.0",
+    "vue": "^3.5.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.0"
+  }
+}
