@@ -3,6 +3,13 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"net"
 	"os"
@@ -12,6 +19,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/crypto/ssh"
 )
 
 type SSHCompatConfig struct {
@@ -36,21 +45,22 @@ type sshVersionInfo struct {
 
 func detectSSHCompatibility(ctx context.Context) SSHCompatConfig {
 	v := localSSHVersion(ctx)
-	keyTypes := supportedKeygenTypes(ctx)
-	if len(keyTypes) == 0 {
-		// RSA is the only safe assumption for ancient OpenSSH. If ssh-keygen is
-		// present but probing failed because of unsupported flags, the real key
-		// generation step will still return a useful error.
-		keyTypes = []string{"ssh-rsa"}
+	userKeyTypes := supportedKeygenTypes(ctx)
+	if len(userKeyTypes) == 0 {
+		// RSA is the only safe assumption for ancient OpenSSH authorized_keys and
+		// host keys when no local ssh-keygen is available to probe support. Tunnel
+		// keys are independent: reach-agent's embedded Go SSH client can always use
+		// Ed25519, and the hub validates keys with x/crypto/ssh.
+		userKeyTypes = []string{"ssh-rsa"}
 	}
-	keyType := chooseKeyType(keyTypes)
+	userKeyType := chooseKeyType(userKeyTypes)
 	compat := SSHCompatConfig{
 		ClientVersion:               v.Raw,
-		TunnelKeyType:               keyType,
-		UserSSHDHostKeyType:         keyType,
-		SupportedAuthorizedKeyTypes: keyTypes,
+		TunnelKeyType:               "ssh-ed25519",
+		UserSSHDHostKeyType:         userKeyType,
+		SupportedAuthorizedKeyTypes: userKeyTypes,
 	}
-	if needsLegacyClientOptions(v, keyType) {
+	if needsLegacyClientOptions(v, userKeyType) {
 		compat.TunnelOptions = []string{
 			"KexAlgorithms=diffie-hellman-group-exchange-sha256,diffie-hellman-group14-sha1",
 			"HostKeyAlgorithms=ssh-rsa",
@@ -166,27 +176,93 @@ func clientOptionsForServerBanner(banner string, hostKeyType string) []string {
 }
 
 func generateSSHKey(ctx context.Context, keyPath, keyType, comment string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(keyPath), 0o700); err != nil {
 		return err
 	}
-	args := []string{"-q"}
+
+	privatePEM, publicKey, err := generateSSHKeyMaterial(keyType, comment)
+	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := writeFileAtomic(keyPath, privatePEM, 0o600); err != nil {
+		return err
+	}
+	if err := writeFileAtomic(keyPath+".pub", publicKey, 0o644); err != nil {
+		return err
+	}
+	return nil
+}
+
+func generateSSHKeyMaterial(keyType, comment string) (privatePEM, publicKey []byte, err error) {
+	var signer ssh.Signer
 	switch keyType {
 	case "ssh-ed25519":
-		args = append(args, "-t", "ed25519")
+		_, priv, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			return nil, nil, err
+		}
+		block, err := ssh.MarshalPrivateKey(priv, comment)
+		if err != nil {
+			return nil, nil, err
+		}
+		privatePEM = pem.EncodeToMemory(block)
+		signer, err = ssh.NewSignerFromKey(priv)
+		if err != nil {
+			return nil, nil, err
+		}
 	case "ecdsa-sha2-nistp256":
-		args = append(args, "-t", "ecdsa", "-b", "256")
+		priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			return nil, nil, err
+		}
+		der, err := x509.MarshalECPrivateKey(priv)
+		if err != nil {
+			return nil, nil, err
+		}
+		privatePEM = pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: der})
+		signer, err = ssh.NewSignerFromKey(priv)
+		if err != nil {
+			return nil, nil, err
+		}
 	case "ssh-rsa", "rsa":
-		args = append(args, "-t", "rsa", "-b", "4096")
+		priv, err := rsa.GenerateKey(rand.Reader, 4096)
+		if err != nil {
+			return nil, nil, err
+		}
+		privatePEM = pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)})
+		signer, err = ssh.NewSignerFromKey(priv)
+		if err != nil {
+			return nil, nil, err
+		}
 	default:
-		return fmt.Errorf("unsupported ssh key type %q", keyType)
+		return nil, nil, fmt.Errorf("unsupported ssh key type %q", keyType)
 	}
-	args = append(args, "-N", "", "-f", keyPath, "-C", comment)
-	if out, err := exec.CommandContext(ctx, "ssh-keygen", args...).CombinedOutput(); err != nil {
-		return fmt.Errorf("ssh-keygen %s failed: %w: %s", keyType, err, strings.TrimSpace(string(out)))
+	if len(privatePEM) == 0 {
+		return nil, nil, fmt.Errorf("encode %s private key failed", keyType)
 	}
-	_ = os.Chmod(keyPath, 0o600)
-	_ = os.Chmod(keyPath+".pub", 0o644)
-	return nil
+	pub := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey())))
+	if comment != "" {
+		pub += " " + comment
+	}
+	return privatePEM, []byte(pub + "\n"), nil
+}
+
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	tmp := path + ".tmp-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	if err := os.WriteFile(tmp, data, perm); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return os.Chmod(path, perm)
 }
 
 func publicKeyType(path string) string {
@@ -199,6 +275,22 @@ func publicKeyType(path string) string {
 		return ""
 	}
 	return fields[0]
+}
+
+func ensurePublicKeyForPrivateKey(privatePath, comment string) error {
+	b, err := os.ReadFile(privatePath)
+	if err != nil {
+		return err
+	}
+	signer, err := parseTunnelPrivateKey(b)
+	if err != nil {
+		return err
+	}
+	pub := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey())))
+	if comment != "" {
+		pub += " " + comment
+	}
+	return writeFileAtomic(privatePath+".pub", []byte(pub+"\n"), 0o644)
 }
 
 func keyTypeSupported(keyType string, supported []string) bool {

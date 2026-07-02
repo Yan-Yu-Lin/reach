@@ -21,6 +21,7 @@ import (
 type dialTransport func(context.Context) (net.Conn, string, error)
 
 type embeddedTunnel struct {
+	conn      net.Conn
 	client    *ssh.Client
 	listener  net.Listener
 	localAddr string
@@ -58,7 +59,7 @@ func (d *Daemon) openEmbeddedTunnel(ctx context.Context, transport string) (*emb
 	logFile := d.tunnelLogWriter()
 	logger := log.New(io.MultiWriter(d.logger.Writer(), logFile), "reach-tunnel ", log.LstdFlags|log.Lmicroseconds)
 	logger.Printf("embedded ssh tunnel connected transport=%s remote=%s local=%s", transport, listenAddr, localAddr)
-	return &embeddedTunnel{client: client, listener: ln, localAddr: localAddr, logger: logger, logFile: logFile}, nil
+	return &embeddedTunnel{conn: conn, client: client, listener: ln, localAddr: localAddr, logger: logger, logFile: logFile}, nil
 }
 
 func (d *Daemon) transportDialer(transport string) (dialTransport, error) {
@@ -175,6 +176,7 @@ func parseSSHOption(raw string) (string, []string, bool) {
 func (t *embeddedTunnel) serve(ctx context.Context) error {
 	done := make(chan struct{})
 	go func() {
+		defer recoverLog("embedded tunnel shutdown goroutine")
 		select {
 		case <-ctx.Done():
 			_ = t.listener.Close()
@@ -186,12 +188,23 @@ func (t *embeddedTunnel) serve(ctx context.Context) error {
 		close(done)
 		_ = t.listener.Close()
 		_ = t.client.Close()
+		if t.conn != nil {
+			_ = t.conn.Close()
+		}
 		if t.logFile != nil {
 			_ = t.logFile.Close()
 		}
 	}()
 	keepaliveDone := make(chan error, 1)
-	go t.keepalive(ctx, keepaliveDone)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				_ = t.listener.Close()
+				keepaliveDone <- fmt.Errorf("ssh keepalive panic: %v", r)
+			}
+		}()
+		t.keepalive(ctx, keepaliveDone)
+	}()
 	for {
 		select {
 		case err := <-keepaliveDone:
@@ -215,7 +228,10 @@ func (t *embeddedTunnel) serve(ctx context.Context) error {
 			}
 			return err
 		}
-		go t.forward(ctx, remote)
+		go func() {
+			defer recoverLog("embedded tunnel forward goroutine")
+			t.forward(ctx, remote)
+		}()
 	}
 }
 
@@ -230,8 +246,15 @@ func (t *embeddedTunnel) keepalive(ctx context.Context, out chan<- error) {
 		case <-ticker.C:
 			// OpenSSH may answer REQUEST_FAILURE for this global request; either
 			// reply proves the encrypted transport is still alive. Only I/O errors
-			// are fatal.
+			// are fatal. Set a transport deadline so half-open TCP/WebSocket paths
+			// cannot leave SendRequest blocked forever.
+			if t.conn != nil {
+				_ = t.conn.SetDeadline(time.Now().Add(15 * time.Second))
+			}
 			_, _, err := t.client.SendRequest("keepalive@openssh.com", true, nil)
+			if t.conn != nil {
+				_ = t.conn.SetDeadline(time.Time{})
+			}
 			if err != nil {
 				_ = t.listener.Close()
 				out <- fmt.Errorf("ssh keepalive failed: %w", err)
