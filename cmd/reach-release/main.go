@@ -81,6 +81,8 @@ func manifestCommand(args []string) error {
 		"reach-agent_linux_armv7",
 		"reach-agent_darwin_amd64",
 		"reach-agent_darwin_arm64",
+		"reach-agent_windows_amd64.exe",
+		"reach-agent_windows_arm64.exe",
 	}
 	for _, name := range assetNames {
 		path := filepath.Join(*dir, name)

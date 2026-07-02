@@ -3,7 +3,7 @@
 ## Tech stack
 
 ```text
-Client setup script: bash/sh (Linux first)
+Client setup script: bash/sh (Linux), PowerShell (Windows admin-first)
 Target agent:        Go
 API + provisioner:   Go (single binary, privileged on the hub)
 Dashboard:           Nuxt 4 SPA
@@ -19,7 +19,8 @@ Example deployment paths:
 /opt/reach/reachd               # Go API + provisioner binary
 /etc/reach/config.yaml          # deployment-specific config and hashes
 /var/lib/reach/reach.db         # SQLite database
-/var/lib/reach/setup.sh         # setup script served by the web frontend
+/var/lib/reach/setup.sh         # Linux setup script served by the web frontend
+/var/lib/reach/setup.ps1        # Windows setup script served by the web frontend
 /var/log/reach/                 # logs
 
 /opt/reach-dashboard/           # static dashboard build output
@@ -37,7 +38,8 @@ Reverse proxy routes:
 ```text
 /api/client/*   -> Reach API
 /api/admin/*    -> Reach API
-/setup.sh       -> static setup script
+/setup.sh       -> static Linux setup script
+/setup.ps1      -> static Windows setup script
 everything else -> dashboard
 ```
 

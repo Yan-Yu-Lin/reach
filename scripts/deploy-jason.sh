@@ -83,6 +83,8 @@ require_agent_artifacts() {
     reach-agent_linux_armv7 \
     reach-agent_darwin_amd64 \
     reach-agent_darwin_arm64 \
+    reach-agent_windows_amd64.exe \
+    reach-agent_windows_arm64.exe \
     checksums.txt \
     manifest.json \
     manifest.json.minisig; do
@@ -115,6 +117,8 @@ if [ -z "$ARTIFACT_DIR" ]; then
   build_agent "$ARTIFACT_DIR/reach-agent_linux_armv7" linux arm 7
   build_agent "$ARTIFACT_DIR/reach-agent_darwin_amd64" darwin amd64
   build_agent "$ARTIFACT_DIR/reach-agent_darwin_arm64" darwin arm64
+  build_agent "$ARTIFACT_DIR/reach-agent_windows_amd64.exe" windows amd64
+  build_agent "$ARTIFACT_DIR/reach-agent_windows_arm64.exe" windows arm64
   write_checksums "$ARTIFACT_DIR"
   create_manifest "$ARTIFACT_DIR"
   if sign_manifest_if_configured "$ARTIFACT_DIR"; then
@@ -141,7 +145,6 @@ GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o /tmp/reachd-build .
 echo "[deploy] building reach-ws-carrier (linux/amd64 static)..."
 GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o /tmp/reach-ws-carrier ./cmd/reach-ws-carrier
 
-
 echo "[deploy] installing binaries..."
 sudo install -m 0755 /tmp/reachd-build /opt/reach/reachd
 sudo install -m 0755 /tmp/reach-ws-carrier /opt/reach/reach-ws-carrier
@@ -161,6 +164,8 @@ sudo install -m 0755 "$ARTIFACT_DIR/reach-agent_linux_armv6" "$AGENT_STAGING_DIR
 sudo install -m 0755 "$ARTIFACT_DIR/reach-agent_linux_armv7" "$AGENT_STAGING_DIR/reach-agent_linux_armv7"
 sudo install -m 0755 "$ARTIFACT_DIR/reach-agent_darwin_amd64" "$AGENT_STAGING_DIR/reach-agent_darwin_amd64"
 sudo install -m 0755 "$ARTIFACT_DIR/reach-agent_darwin_arm64" "$AGENT_STAGING_DIR/reach-agent_darwin_arm64"
+sudo install -m 0755 "$ARTIFACT_DIR/reach-agent_windows_amd64.exe" "$AGENT_STAGING_DIR/reach-agent_windows_amd64.exe"
+sudo install -m 0755 "$ARTIFACT_DIR/reach-agent_windows_arm64.exe" "$AGENT_STAGING_DIR/reach-agent_windows_arm64.exe"
 sudo install -m 0644 "$ARTIFACT_DIR/checksums.txt" "$AGENT_STAGING_DIR/checksums.txt"
 sudo install -m 0644 "$ARTIFACT_DIR/manifest.json" "$AGENT_STAGING_DIR/manifest.json"
 if [ -f "$ARTIFACT_DIR/manifest.json.minisig" ]; then
@@ -178,7 +183,7 @@ EOF
 sudo install -m 0644 /tmp/reach-latest.json "$AGENT_DOWNLOAD_ROOT/latest.json"
 rm -f /tmp/reach-latest-version /tmp/reach-latest.json
 
-echo "[deploy] updating setup.sh..."
+echo "[deploy] updating setup scripts..."
 CONFIG_API_URL="${REACH_API_URL:-}"
 if [ -z "$CONFIG_API_URL" ] && [ -r /etc/reach/config.yaml ]; then
   CONFIG_API_URL="$(awk '
@@ -194,7 +199,12 @@ sed \
   -e "s|^API_URL=.*|API_URL=\"\${REACH_API_URL:-${CONFIG_API_URL_SED}}\"|" \
   setup.sh > /tmp/reach-setup.sh
 sudo install -m 0644 /tmp/reach-setup.sh /var/lib/reach/setup.sh
-rm -f /tmp/reach-setup.sh
+sed \
+  -e "s|\"https://tunnels.your-domain.example\"|\"${CONFIG_API_URL_SED}\"|g" \
+  -e "s|\"0.1.0-alpha\"|\"${AGENT_VERSION}\"|g" \
+  setup.ps1 > /tmp/reach-setup.ps1
+sudo install -m 0644 /tmp/reach-setup.ps1 /var/lib/reach/setup.ps1
+rm -f /tmp/reach-setup.sh /tmp/reach-setup.ps1
 
 echo "[deploy] ensuring Go WebSocket carrier service..."
 if ! id reach-wstunnel >/dev/null 2>&1; then
