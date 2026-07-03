@@ -861,18 +861,25 @@ func (p *Provisioner) recomputeObserved(ctx context.Context, machineID string) {
 	_ = p.store.db.QueryRowContext(ctx, `SELECT heartbeat_at,tunnel_state,local_ssh_state FROM agent_observations WHERE machine_id=?`, machineID).Scan(&hbAt, &agentTunnel, &localSSH)
 	_ = p.store.db.QueryRowContext(ctx, `SELECT probe_state FROM hub_observations WHERE machine_id=? ORDER BY last_probe_at DESC LIMIT 1`, machineID).Scan(&probe)
 	observed := ObservedUnknown
+	probeReachable := probe.String == "reachable"
+	probeUnreachable := probe.String == "unreachable"
 	if hbAt.Valid {
 		last, err := time.Parse(time.RFC3339, hbAt.String)
-		if err != nil || time.Since(last) > p.cfg.OfflineAfter*2 {
+		staleHeartbeat := err != nil || time.Since(last) > p.cfg.OfflineAfter*2
+		if staleHeartbeat && probeReachable {
+			observed = ObservedDegraded
+		} else if staleHeartbeat && probeUnreachable {
 			observed = ObservedGone
-		} else if agentTunnel.String == "connected" && probe.String == "reachable" && localSSH.String == "healthy" {
+		} else if staleHeartbeat {
+			observed = ObservedOffline
+		} else if agentTunnel.String == "connected" && probeReachable && localSSH.String == "healthy" {
 			observed = ObservedOnline
-		} else if agentTunnel.String == "connected" || probe.String == "reachable" {
+		} else if agentTunnel.String == "connected" || probeReachable {
 			observed = ObservedDegraded
 		} else {
 			observed = ObservedOffline
 		}
-	} else if probe.String == "reachable" {
+	} else if probeReachable {
 		observed = ObservedDegraded
 	}
 	effective := observed

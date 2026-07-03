@@ -825,29 +825,47 @@ func (d *Daemon) sendHeartbeat(ctx context.Context, shutdown *ShutdownNotice) (H
 	sshCaps.ClientOptions = d.cfg.LocalSSH.ClientOptions
 	reqBody := HeartbeatRequest{MachineID: d.cfg.MachineID, Slug: d.cfg.Slug, AgentVersion: version, Capabilities: AgentCapabilities{Commands: []string{"start_tunnel", "stop_tunnel", "sync_keys", "uninstall", "update_agent"}, Transports: []string{"direct", "websocket"}, CanManageLocalSSHD: d.cfg.LocalSSH.Manage, CanSelfUpdate: d.canSelfUpdate(), SSH: sshCaps}, AppliedGeneration: d.appliedGeneration, Observed: ObservedState{AgentState: "running", LocalSSH: st.LocalSSH, Tunnel: st.Tunnel, Persistence: st.Persistence, Keys: KeysState{InstalledAdminKeyFingerprints: d.installedKeyFingerprints(), Generation: 0}}, CommandResults: results, Shutdown: shutdown, LastError: st.LastError}
 	body, _ := json.Marshal(reqBody)
-	reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
 	url := strings.TrimRight(d.cfg.Heartbeat.APIURL, "/") + "/api/client/agent/heartbeat"
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		return HeartbeatResponse{}, err
+	const attempts = 3
+	backoffs := []time.Duration{500 * time.Millisecond, 1500 * time.Millisecond}
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, url, bytes.NewReader(body))
+		if err != nil {
+			cancel()
+			return HeartbeatResponse{}, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+d.cfg.Heartbeat.Token)
+		resp, err := http.DefaultClient.Do(req)
+		if err == nil {
+			b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			_ = resp.Body.Close()
+			cancel()
+			if resp.StatusCode/100 == 2 {
+				var out HeartbeatResponse
+				if err := json.Unmarshal(b, &out); err != nil {
+					return out, err
+				}
+				return out, nil
+			}
+			err = fmt.Errorf("heartbeat status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(b)))
+			if resp.StatusCode < 500 && resp.StatusCode != http.StatusTooManyRequests {
+				return HeartbeatResponse{}, err
+			}
+		} else {
+			cancel()
+		}
+		lastErr = err
+		if ctx.Err() != nil {
+			return HeartbeatResponse{}, ctx.Err()
+		}
+		if attempt < attempts {
+			sleepContext(ctx, backoffs[attempt-1])
+		}
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+d.cfg.Heartbeat.Token)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return HeartbeatResponse{}, err
-	}
-	defer resp.Body.Close()
-	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode/100 != 2 {
-		return HeartbeatResponse{}, fmt.Errorf("heartbeat status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(b)))
-	}
-	var out HeartbeatResponse
-	if err := json.Unmarshal(b, &out); err != nil {
-		return out, err
-	}
-	return out, nil
+	return HeartbeatResponse{}, fmt.Errorf("heartbeat failed after %d attempts: %w", attempts, lastErr)
 }
 
 func (d *Daemon) checkLocalSSH(ctx context.Context) error {

@@ -4,7 +4,60 @@ import (
 	"context"
 	"path/filepath"
 	"testing"
+	"time"
 )
+
+func TestRecomputeObservedKeepsReachableStaleHeartbeatDegraded(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenStore(filepath.Join(t.TempDir(), "reach.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := DefaultConfig()
+	cfg.InitialAdmin.PasswordHash, err = HashSecret("test-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.OfflineAfter = 5 * time.Minute
+	if err := store.Migrate(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	stale := time.Now().UTC().Add(-20 * time.Minute).Format(time.RFC3339)
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO machines (id,slug,status,desired_state,observed_state,created_at) VALUES ('m_stale','stale-box','online','active','online',?)`, nowUTC()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO tunnels (id,machine_id,hub_id,unix_user,remote_port,tunnel_pubkey,status,created_at) VALUES ('t_stale','m_stale','primary','rt-stalebox',9201,'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeFakeFakeFakeFakeFakeFakeFakeFakeFakeFakeFake test','online',?)`, nowUTC()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO agent_observations (machine_id,heartbeat_at,tunnel_state,local_ssh_state) VALUES ('m_stale',?,'connected','healthy')`, stale); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO hub_observations (tunnel_id,machine_id,probe_state,last_probe_at,last_success_at) VALUES ('t_stale','m_stale','reachable',?,?)`, nowUTC(), nowUTC()); err != nil {
+		t.Fatal(err)
+	}
+
+	p := &Provisioner{store: store, cfg: cfg}
+	p.recomputeObserved(ctx, "m_stale")
+	var observed, status string
+	if err := store.db.QueryRowContext(ctx, `SELECT observed_state,status FROM machines WHERE id='m_stale'`).Scan(&observed, &status); err != nil {
+		t.Fatal(err)
+	}
+	if observed != ObservedDegraded || status != ObservedDegraded {
+		t.Fatalf("reachable stale heartbeat should be degraded, got observed=%q status=%q", observed, status)
+	}
+
+	if _, err := store.db.ExecContext(ctx, `UPDATE hub_observations SET probe_state='unreachable', last_probe_at=? WHERE tunnel_id='t_stale'`, nowUTC()); err != nil {
+		t.Fatal(err)
+	}
+	p.recomputeObserved(ctx, "m_stale")
+	if err := store.db.QueryRowContext(ctx, `SELECT observed_state,status FROM machines WHERE id='m_stale'`).Scan(&observed, &status); err != nil {
+		t.Fatal(err)
+	}
+	if observed != ObservedGone || status != ObservedGone {
+		t.Fatalf("unreachable stale heartbeat should be gone, got observed=%q status=%q", observed, status)
+	}
+}
 
 func TestRetiredTunnelsReleaseUniqueFields(t *testing.T) {
 	ctx := context.Background()
