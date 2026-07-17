@@ -114,9 +114,12 @@ require_agent_artifacts() {
 
 if [ -n "${REACH_DEPLOY_COMMIT:-}" ]; then
   echo "[deploy] checking out explicit commit ${REACH_DEPLOY_COMMIT}..."
-  git fetch origin "$REACH_DEPLOY_COMMIT"
-  git checkout --detach "$REACH_DEPLOY_COMMIT"
-  test "$(git rev-parse HEAD)" = "$(git rev-parse "$REACH_DEPLOY_COMMIT^{commit}")"
+  if ! git rev-parse --verify --quiet "${REACH_DEPLOY_COMMIT}^{commit}" >/dev/null; then
+    git fetch origin "$REACH_DEPLOY_COMMIT"
+  fi
+  deploy_commit="$(git rev-parse "${REACH_DEPLOY_COMMIT}^{commit}")"
+  git checkout --detach "$deploy_commit"
+  test "$(git rev-parse HEAD)" = "$deploy_commit"
 else
   echo "[deploy] pulling latest..."
   git pull --ff-only
