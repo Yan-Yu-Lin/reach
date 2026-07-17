@@ -500,16 +500,16 @@ function onKeydown(e: KeyboardEvent) {
 
 let timeInterval: ReturnType<typeof setInterval> | undefined
 
-onMounted(async () => {
+onMounted(() => {
   fleet.setupSSE()
-  await fleet.refresh()
   document.addEventListener('keydown', onKeydown)
   checkMobile()
   window.addEventListener('resize', checkMobile)
   timeInterval = setInterval(() => timeTick.value++, 15_000)
+  void fleet.refresh()
 
   if ('Notification' in window && Notification.permission === 'default') {
-    Notification.requestPermission()
+    void Notification.requestPermission()
   }
 })
 

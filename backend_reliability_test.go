@@ -68,6 +68,81 @@ func TestDatabaseReadinessRequiresMigratedSchema(t *testing.T) {
 	}
 }
 
+func TestPublishEventSurvivesCanceledRequestContext(t *testing.T) {
+	server, store, _ := newReliabilityTestServer(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	server.publishEvent(ctx, "machine.changed", "m_one", map[string]any{"ok": true})
+	var typ string
+	if err := store.db.QueryRow(`SELECT type FROM events ORDER BY id DESC LIMIT 1`).Scan(&typ); err != nil {
+		t.Fatal(err)
+	}
+	if typ != "machine.changed" {
+		t.Fatalf("durable event type = %q", typ)
+	}
+}
+
+func TestHealthCheckPublishesOnlyOnActualHealthChange(t *testing.T) {
+	server, store, _ := newReliabilityTestServer(t)
+	insertTestMachine(t, store, "m_health", "health-box")
+	if _, err := store.db.Exec(`INSERT INTO tunnels (id,machine_id,hub_id,unix_user,remote_port,tunnel_pubkey,status,created_at) VALUES ('t_health','m_health','primary','rt-health1',9201,'ssh-ed25519 test','offline',?)`, nowUTC()); err != nil {
+		t.Fatal(err)
+	}
+	server.prov.probeTunnel = func(context.Context, int) (bool, string) { return false, "down" }
+	if _, err := server.prov.RunHealthCheck(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var first int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM events WHERE type='machine.health_changed' AND machine_id='m_health'`).Scan(&first); err != nil {
+		t.Fatal(err)
+	}
+	if first != 1 {
+		t.Fatalf("first health change emitted %d events", first)
+	}
+	if _, err := server.prov.RunHealthCheck(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var second int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM events WHERE type='machine.health_changed' AND machine_id='m_health'`).Scan(&second); err != nil {
+		t.Fatal(err)
+	}
+	if second != first {
+		t.Fatalf("unchanged health emitted another event: first=%d second=%d", first, second)
+	}
+}
+
+func TestStableHeartbeatAlwaysPublishesMachineScopedInvalidation(t *testing.T) {
+	server, store, _ := newReliabilityTestServer(t)
+	token := "agent-test-token"
+	hash, err := HashSecret(token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`INSERT INTO machines (id,slug,original_slug,status,desired_state,observed_state,desired_generation,agent_token_hash,created_at) VALUES ('m_heartbeat','heartbeat-box','heartbeat-box','degraded','active','degraded',1,?,?)`, hash, nowUTC()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`INSERT INTO tunnels (id,machine_id,hub_id,unix_user,remote_port,tunnel_pubkey,status,created_at) VALUES ('t_heartbeat','m_heartbeat','primary','rt-heartb1',9201,'ssh-ed25519 test','online',?)`, nowUTC()); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"machine_id":"m_heartbeat","agent_version":"test","applied_generation":1,"observed":{"agent_state":"running","local_ssh":{"state":"healthy"},"tunnel":{"state":"connected","transport":"direct"},"persistence":{"reboot_safe":true},"keys":{}}}`
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/api/client/agent/heartbeat", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+token)
+		recorder := httptest.NewRecorder()
+		server.ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("heartbeat %d returned %d: %s", i, recorder.Code, recorder.Body.String())
+		}
+	}
+	var count int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM events WHERE type='agent.heartbeat' AND machine_id='m_heartbeat'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("stable heartbeats emitted %d invalidations, want 2", count)
+	}
+}
+
 func TestPendingCommandsRetryLeaseAndConcurrentClaims(t *testing.T) {
 	server, store, _ := newReliabilityTestServer(t)
 	insertTestMachine(t, store, "m_claim", "claim-box")

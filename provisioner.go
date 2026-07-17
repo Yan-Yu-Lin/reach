@@ -28,6 +28,8 @@ type Provisioner struct {
 	store *Store
 	cfg   Config
 
+	publishEvent func(string, string, map[string]any)
+	probeTunnel  func(context.Context, int) (bool, string)
 	healthMu     sync.RWMutex
 	healthReport []map[string]any
 }
@@ -55,7 +57,7 @@ type CreateMachineResult struct {
 }
 
 func NewProvisioner(store *Store, cfg Config) *Provisioner {
-	return &Provisioner{store: store, cfg: cfg}
+	return &Provisioner{store: store, cfg: cfg, probeTunnel: checkTunnelPort}
 }
 
 func (p *Provisioner) CreateMachine(ctx context.Context, in CreateMachineInput) (CreateMachineResult, error) {
@@ -892,6 +894,12 @@ func scanAgentCommand(rows interface{ Scan(dest ...any) error }) (AgentCommandIn
 	return c, err
 }
 
+func (p *Provisioner) publish(typ, machineID string, data map[string]any) {
+	if p.publishEvent != nil {
+		p.publishEvent(typ, machineID, data)
+	}
+}
+
 func (p *Provisioner) RunHealthCheck(ctx context.Context) ([]map[string]any, error) {
 	rows, err := p.store.db.QueryContext(ctx, `SELECT `+tunnelCols+` FROM tunnels WHERE status NOT IN ('disabled','retired','failed')`)
 	if err != nil {
@@ -911,7 +919,11 @@ func (p *Provisioner) RunHealthCheck(ctx context.Context) ([]map[string]any, err
 	}
 	var report []map[string]any
 	for _, t := range tunnels {
-		ok, detail := checkTunnelPort(ctx, t.RemotePort)
+		probe := p.probeTunnel
+		if probe == nil {
+			probe = checkTunnelPort
+		}
+		ok, detail := probe(ctx, t.RemotePort)
 		now := nowUTC()
 		state := "unreachable"
 		lastSuccess := sql.NullString{}
@@ -920,12 +932,30 @@ func (p *Provisioner) RunHealthCheck(ctx context.Context) ([]map[string]any, err
 			state = "reachable"
 			lastSuccess = sql.NullString{String: now, Valid: true}
 			probeErr = ""
-			_, _ = p.store.db.ExecContext(ctx, `UPDATE tunnels SET status='online', last_seen_at=? WHERE id=? AND status NOT IN ('disabled','retired','failed')`, now, t.ID)
-		} else {
-			_, _ = p.store.db.ExecContext(ctx, `UPDATE tunnels SET status='offline' WHERE id=? AND status NOT IN ('disabled','retired','failed')`, t.ID)
 		}
-		_, _ = p.store.db.ExecContext(ctx, `INSERT INTO hub_observations (tunnel_id,machine_id,probe_state,last_probe_at,last_success_at,probe_error) VALUES (?,?,?,?,?,?) ON CONFLICT(tunnel_id) DO UPDATE SET probe_state=excluded.probe_state,last_probe_at=excluded.last_probe_at,last_success_at=COALESCE(excluded.last_success_at,hub_observations.last_success_at),probe_error=excluded.probe_error`, t.ID, t.MachineID, state, now, lastSuccess, nullable(probeErr))
-		p.recomputeObserved(ctx, t.MachineID)
+		var previousProbe, previousProbeError sql.NullString
+		err := p.store.db.QueryRowContext(ctx, `SELECT probe_state,probe_error FROM hub_observations WHERE tunnel_id=?`, t.ID).Scan(&previousProbe, &previousProbeError)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return nil, err
+		}
+		nextTunnelStatus := "offline"
+		if ok {
+			nextTunnelStatus = "online"
+		}
+		if _, err := p.store.db.ExecContext(ctx, `UPDATE tunnels SET status=?,last_seen_at=CASE WHEN ?='online' THEN ? ELSE last_seen_at END WHERE id=? AND status NOT IN ('disabled','retired','failed')`, nextTunnelStatus, nextTunnelStatus, now, t.ID); err != nil {
+			return nil, err
+		}
+		if _, err := p.store.db.ExecContext(ctx, `INSERT INTO hub_observations (tunnel_id,machine_id,probe_state,last_probe_at,last_success_at,probe_error) VALUES (?,?,?,?,?,?) ON CONFLICT(tunnel_id) DO UPDATE SET probe_state=excluded.probe_state,last_probe_at=excluded.last_probe_at,last_success_at=COALESCE(excluded.last_success_at,hub_observations.last_success_at),probe_error=excluded.probe_error`, t.ID, t.MachineID, state, now, lastSuccess, nullable(probeErr)); err != nil {
+			return nil, err
+		}
+		machineChanged, observed, status, err := p.recomputeObserved(ctx, t.MachineID)
+		if err != nil {
+			return nil, err
+		}
+		healthChanged := t.Status != nextTunnelStatus || !previousProbe.Valid || previousProbe.String != state || previousProbeError.String != probeErr
+		if machineChanged || healthChanged {
+			p.publish("machine.health_changed", t.MachineID, map[string]any{"machine_id": t.MachineID, "observed_state": observed, "status": status, "probe_state": state})
+		}
 		report = append(report, map[string]any{"tunnel_id": t.ID, "machine_id": t.MachineID, "port": t.RemotePort, "ok": ok, "probe_state": state, "detail": detail, "checked_at": now})
 	}
 	p.healthMu.Lock()
@@ -934,12 +964,18 @@ func (p *Provisioner) RunHealthCheck(ctx context.Context) ([]map[string]any, err
 	return report, nil
 }
 
-func (p *Provisioner) recomputeObserved(ctx context.Context, machineID string) {
-	var desired, old string
+func (p *Provisioner) recomputeObserved(ctx context.Context, machineID string) (bool, string, string, error) {
+	var desired, old, oldStatus string
 	var hbAt, agentTunnel, localSSH, probe sql.NullString
-	_ = p.store.db.QueryRowContext(ctx, `SELECT desired_state,observed_state FROM machines WHERE id=?`, machineID).Scan(&desired, &old)
-	_ = p.store.db.QueryRowContext(ctx, `SELECT heartbeat_at,tunnel_state,local_ssh_state FROM agent_observations WHERE machine_id=?`, machineID).Scan(&hbAt, &agentTunnel, &localSSH)
-	_ = p.store.db.QueryRowContext(ctx, `SELECT probe_state FROM hub_observations WHERE machine_id=? ORDER BY last_probe_at DESC LIMIT 1`, machineID).Scan(&probe)
+	if err := p.store.db.QueryRowContext(ctx, `SELECT desired_state,observed_state,status FROM machines WHERE id=?`, machineID).Scan(&desired, &old, &oldStatus); err != nil {
+		return false, "", "", err
+	}
+	if err := p.store.db.QueryRowContext(ctx, `SELECT heartbeat_at,tunnel_state,local_ssh_state FROM agent_observations WHERE machine_id=?`, machineID).Scan(&hbAt, &agentTunnel, &localSSH); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, "", "", err
+	}
+	if err := p.store.db.QueryRowContext(ctx, `SELECT probe_state FROM hub_observations WHERE machine_id=? ORDER BY last_probe_at DESC LIMIT 1`, machineID).Scan(&probe); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, "", "", err
+	}
 	observed := ObservedUnknown
 	probeReachable := probe.String == "reachable"
 	probeUnreachable := probe.String == "unreachable"
@@ -966,7 +1002,13 @@ func (p *Provisioner) recomputeObserved(ctx context.Context, machineID string) {
 	if desired == DesiredDisabled || desired == DesiredRetiring || desired == DesiredRetired {
 		effective = desired
 	}
-	_, _ = p.store.db.ExecContext(ctx, `UPDATE machines SET observed_state=?, status=?, updated_at=? WHERE id=?`, observed, effective, nowUTC(), machineID)
+	changed := observed != old || effective != oldStatus
+	if changed {
+		if _, err := p.store.db.ExecContext(ctx, `UPDATE machines SET observed_state=?,status=?,updated_at=? WHERE id=?`, observed, effective, nowUTC(), machineID); err != nil {
+			return false, "", "", err
+		}
+	}
+	return changed, observed, effective, nil
 }
 
 func (p *Provisioner) CachedHealth(ctx context.Context) ([]map[string]any, error) {

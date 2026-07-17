@@ -1,4 +1,4 @@
-import { mapSettledLimited } from '~/utils/concurrency'
+import { mapSettledLimited, summarizeSettled } from '~/utils/concurrency'
 import { createRefreshCoordinator, type RefreshBatch } from '~/utils/refreshCoordinator'
 
 const machineRefreshConcurrency = 4
@@ -85,7 +85,6 @@ export function useFleet() {
 
   async function executeRefresh(batch: RefreshBatch) {
     if (batch.full) {
-      error.value = ''
       loading.value = true
       try {
         const [machineResult, requestResult] = await Promise.allSettled([api.machines(), api.requests()])
@@ -97,6 +96,8 @@ export function useFleet() {
         if (failures.length > 0) {
           const failure = failures[0] as any
           error.value = failure?.message || 'Failed to load dashboard data'
+        } else {
+          error.value = ''
         }
       } finally {
         loading.value = false
@@ -114,12 +115,16 @@ export function useFleet() {
       machineRefreshConcurrency,
       id => api.machine(id),
     )
-    for (const result of updateResults) {
-      if (result.status !== 'fulfilled') continue
-      const updated = result.value
+    const { values: updates, failureCount, needsFullRefresh } = summarizeSettled(updateResults)
+    for (const updated of updates) {
       const index = machines.value.findIndex(item => item.machine.id === updated.machine.id)
       if (index >= 0) machines.value[index] = updated
       else machines.value.push(updated)
+    }
+
+    if (needsFullRefresh) {
+      error.value = `${failureCount} machine refresh${failureCount === 1 ? '' : 'es'} failed. Refreshing fleet...`
+      void refreshCoordinator.requestFull().catch(() => {})
     }
   }
 

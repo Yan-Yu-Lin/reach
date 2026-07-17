@@ -15,6 +15,7 @@ import (
 const (
 	eventSubscriberBuffer = 32
 	eventReplayLimit      = 500
+	eventPublishTimeout   = 3 * time.Second
 )
 
 type ReachEvent struct {

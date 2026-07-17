@@ -38,7 +38,9 @@ func TestRecomputeObservedKeepsReachableStaleHeartbeatDegraded(t *testing.T) {
 	}
 
 	p := &Provisioner{store: store, cfg: cfg}
-	p.recomputeObserved(ctx, "m_stale")
+	if _, _, _, err := p.recomputeObserved(ctx, "m_stale"); err != nil {
+		t.Fatal(err)
+	}
 	var observed, status string
 	if err := store.db.QueryRowContext(ctx, `SELECT observed_state,status FROM machines WHERE id='m_stale'`).Scan(&observed, &status); err != nil {
 		t.Fatal(err)
@@ -50,7 +52,9 @@ func TestRecomputeObservedKeepsReachableStaleHeartbeatDegraded(t *testing.T) {
 	if _, err := store.db.ExecContext(ctx, `UPDATE hub_observations SET probe_state='unreachable', last_probe_at=? WHERE tunnel_id='t_stale'`, nowUTC()); err != nil {
 		t.Fatal(err)
 	}
-	p.recomputeObserved(ctx, "m_stale")
+	if _, _, _, err := p.recomputeObserved(ctx, "m_stale"); err != nil {
+		t.Fatal(err)
+	}
 	if err := store.db.QueryRowContext(ctx, `SELECT observed_state,status FROM machines WHERE id='m_stale'`).Scan(&observed, &status); err != nil {
 		t.Fatal(err)
 	}

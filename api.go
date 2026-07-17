@@ -28,6 +28,11 @@ type Server struct {
 
 func NewServer(cfg Config, store *Store, prov *Provisioner) *Server {
 	s := &Server{cfg: cfg, store: store, prov: prov, mux: http.NewServeMux(), events: newEventBroker(store), registerL: newPersistentRateLimiter(store.db, "client_register", 3, time.Minute), loginL: newPersistentRateLimiter(store.db, "admin_login", 8, time.Minute)}
+	if prov != nil {
+		prov.publishEvent = func(typ, machineID string, data map[string]any) {
+			s.publishEvent(context.Background(), typ, machineID, data)
+		}
+	}
 	s.routes()
 	return s
 }
@@ -163,7 +168,13 @@ func decodeJSON(r *http.Request, v any) error {
 
 func (s *Server) publishEvent(ctx context.Context, typ, machineID string, data map[string]any) {
 	if s.events != nil {
-		s.events.Publish(ctx, typ, machineID, data)
+		base := context.Background()
+		if ctx != nil {
+			base = context.WithoutCancel(ctx)
+		}
+		publishCtx, cancel := context.WithTimeout(base, eventPublishTimeout)
+		defer cancel()
+		s.events.Publish(publishCtx, typ, machineID, data)
 	}
 }
 
@@ -615,8 +626,16 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		_, _ = s.store.db.ExecContext(r.Context(), `UPDATE tunnels SET status='online', last_seen_at=? WHERE machine_id=? AND status NOT IN ('disabled','retired','failed')`, now, hb.MachineID)
 	}
 	old := m.ObservedState
-	s.prov.recomputeObserved(r.Context(), hb.MachineID)
-	m, _ = s.prov.GetMachine(r.Context(), hb.MachineID)
+	_, _, _, err = s.prov.recomputeObserved(r.Context(), hb.MachineID)
+	if err != nil {
+		writeErr(w, 500, "could not recompute machine state")
+		return
+	}
+	m, err = s.prov.GetMachine(r.Context(), hb.MachineID)
+	if err != nil {
+		writeErr(w, 500, "could not load machine state")
+		return
+	}
 	if old != m.ObservedState {
 		s.publishEvent(r.Context(), "machine.observed_changed", m.ID, map[string]any{"machine_id": m.ID, "observed_state": m.ObservedState, "status": m.Status})
 		s.publishEvent(r.Context(), "machine."+m.ObservedState, m.ID, map[string]any{"machine_id": m.ID, "slug": m.Slug})
@@ -632,6 +651,7 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	resp := HeartbeatResponse{OK: true, ServerTime: now, DesiredGeneration: m.DesiredGeneration, DesiredState: m.DesiredState, Heartbeat: HeartbeatPolicy{NextIntervalSeconds: int(s.cfg.HealthInterval.Seconds()), OfflineAfterSeconds: int(s.cfg.OfflineAfter.Seconds())}, DesiredConfig: s.desiredConfig(r.Context(), m, tunnels), Commands: cmds, Update: agentUpdateHintFor(s.cfg, hb.AgentVersion)}
 	writeJSON(w, 200, resp)
+	s.publishEvent(r.Context(), "agent.heartbeat", m.ID, map[string]any{"machine_id": m.ID, "heartbeat_at": now})
 }
 
 func normalizeHeartbeat(hb AgentHeartbeat) AgentHeartbeat {

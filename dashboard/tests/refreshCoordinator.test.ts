@@ -57,6 +57,27 @@ describe('createRefreshCoordinator', () => {
     await Promise.all([trailingOne, trailingTwo])
   })
 
+  it('allows a targeted run to schedule one trailing full refresh', async () => {
+    const batches: RefreshBatch[] = []
+    let coordinator: ReturnType<typeof createRefreshCoordinator>
+    coordinator = createRefreshCoordinator(async batch => {
+      batches.push(batch)
+      if (!batch.full) void coordinator.requestFull()
+    }, 50)
+
+    const targeted = coordinator.requestMachine('m-1')
+    await vi.advanceTimersByTimeAsync(50)
+    await targeted
+    await vi.advanceTimersByTimeAsync(50)
+
+    expect(batches).toEqual([
+      { full: false, machineIds: ['m-1'] },
+      { full: true, machineIds: [] },
+    ])
+    await vi.advanceTimersByTimeAsync(200)
+    expect(batches).toHaveLength(2)
+  })
+
   it('cancels queued work when disposed', async () => {
     const refresh = vi.fn(async () => {})
     const coordinator = createRefreshCoordinator(refresh, 50)

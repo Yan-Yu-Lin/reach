@@ -1,3 +1,13 @@
+export function summarizeSettled<T>(results: readonly PromiseSettledResult<T>[]) {
+  const values: T[] = []
+  let failureCount = 0
+  for (const result of results) {
+    if (result.status === 'fulfilled') values.push(result.value)
+    else failureCount++
+  }
+  return { values, failureCount, needsFullRefresh: failureCount > 0 }
+}
+
 export async function mapSettledLimited<T, R>(
   values: readonly T[],
   limit: number,
