@@ -1,4 +1,5 @@
 import { mapSettledLimited, summarizeSettled } from '~/utils/concurrency'
+import { planFleetEvent } from '~/utils/fleetEvents'
 import { createRefreshCoordinator, type RefreshBatch } from '~/utils/refreshCoordinator'
 
 const machineRefreshConcurrency = 4
@@ -144,22 +145,15 @@ export function useFleet() {
 
     const config = useRuntimeConfig()
     const removeHandler = sse.onEvent((event, rawData) => {
-      const data = rawData && typeof rawData === 'object'
-        ? rawData as Record<string, any>
-        : {}
-
-      if (event.startsWith('request.') || event === 'ssh_config.changed') {
-        void refreshCoordinator.requestFull()
-      } else if (event.startsWith('machine.') || event.startsWith('agent.')) {
-        if (typeof data.machine_id === 'string' && data.machine_id) {
-          void refreshCoordinator.requestMachine(data.machine_id)
-        } else {
-          void refreshCoordinator.requestFull()
-        }
+      const plan = planFleetEvent(event, rawData)
+      if (plan.fullRefresh) {
+        void refreshCoordinator.requestFull().catch(() => {})
+      } else if (plan.machineId) {
+        void refreshCoordinator.requestMachine(plan.machineId).catch(() => {})
       }
 
-      if (event === 'request.created' && data.status === 'pending') {
-        notifyPending(data)
+      if (plan.notifyPending) {
+        notifyPending(rawData as Record<string, any>)
       }
     })
 

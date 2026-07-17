@@ -38,13 +38,36 @@ func newEventBroker(store *Store) *eventBroker {
 }
 
 func (b *eventBroker) Subscribe(ctx context.Context) (chan ReachEvent, int64, int64, func(), error) {
+	ch, oldest, boundary, _, _, cancel, err := b.SubscribeSince(ctx, 0, false, eventReplayLimit)
+	return ch, oldest, boundary, cancel, err
+}
+
+func (b *eventBroker) SubscribeSince(ctx context.Context, cursor int64, hasCursor bool, limit int) (chan ReachEvent, int64, int64, []ReachEvent, string, func(), error) {
 	ch := make(chan ReachEvent, eventSubscriberBuffer)
 	b.publishMu.Lock()
 	defer b.publishMu.Unlock()
 	var oldest, boundary int64
 	if b.store != nil {
 		if err := b.store.db.QueryRowContext(ctx, `SELECT COALESCE(MIN(id),0),COALESCE(MAX(id),0) FROM events`).Scan(&oldest, &boundary); err != nil {
-			return nil, 0, 0, nil, err
+			return nil, 0, 0, nil, "", nil, err
+		}
+	}
+	var replay []ReachEvent
+	var reason string
+	if hasCursor {
+		if cursor > boundary || (oldest > 0 && cursor < oldest-1) {
+			reason = "cursor_out_of_range"
+		} else {
+			var overflow bool
+			var err error
+			replay, overflow, err = b.replayRange(ctx, cursor, boundary, limit)
+			if err != nil {
+				return nil, 0, 0, nil, "", nil, err
+			}
+			if overflow {
+				replay = nil
+				reason = "replay_overflow"
+			}
 		}
 	}
 	b.subsMu.Lock()
@@ -58,7 +81,7 @@ func (b *eventBroker) Subscribe(ctx context.Context) (chan ReachEvent, int64, in
 		}
 		b.subsMu.Unlock()
 	}
-	return ch, oldest, boundary, cancel, nil
+	return ch, oldest, boundary, replay, reason, cancel, nil
 }
 
 func (b *eventBroker) Publish(ctx context.Context, typ, machineID string, data map[string]any) ReachEvent {
@@ -111,14 +134,25 @@ func (b *eventBroker) resyncSubscriberLocked(ch chan ReachEvent, reason string) 
 		return
 	}
 	delete(b.subs, ch)
-	for len(ch) > 0 {
-		<-ch
+	for {
+		select {
+		case <-ch:
+			continue
+		default:
+		}
+		break
 	}
 	ch <- ReachEvent{Type: "machine.resync_required", Data: map[string]any{"reason": reason}, CreatedAt: nowUTC()}
 	close(ch)
 }
 
 func (b *eventBroker) ReplayRange(ctx context.Context, lastID, throughID int64, limit int) ([]ReachEvent, bool, error) {
+	b.publishMu.Lock()
+	defer b.publishMu.Unlock()
+	return b.replayRange(ctx, lastID, throughID, limit)
+}
+
+func (b *eventBroker) replayRange(ctx context.Context, lastID, throughID int64, limit int) ([]ReachEvent, bool, error) {
 	if b.store == nil || throughID <= lastID {
 		return nil, false, nil
 	}
@@ -151,16 +185,32 @@ func (b *eventBroker) ReplayRange(ctx context.Context, lastID, throughID int64, 
 	return out, false, nil
 }
 
-func eventCursor(r *http.Request) (int64, bool) {
+func (b *eventBroker) PruneBefore(ctx context.Context, before string) error {
+	b.publishMu.Lock()
+	defer b.publishMu.Unlock()
+	if b.store == nil {
+		return nil
+	}
+	_, err := b.store.db.ExecContext(ctx, `DELETE FROM events WHERE created_at<?`, before)
+	return err
+}
+
+type eventCursorValue struct {
+	ID      int64
+	Present bool
+	Valid   bool
+}
+
+func eventCursor(r *http.Request) eventCursorValue {
 	v := r.Header.Get("Last-Event-ID")
 	if v == "" {
 		v = r.URL.Query().Get("last_event_id")
 	}
 	if v == "" {
-		return 0, false
+		return eventCursorValue{}
 	}
 	id, err := strconv.ParseInt(v, 10, 64)
-	return id, err == nil && id >= 0
+	return eventCursorValue{ID: id, Present: true, Valid: err == nil && id >= 0}
 }
 
 func writeSSE(w io.Writer, ev ReachEvent) error {

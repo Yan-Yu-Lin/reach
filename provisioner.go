@@ -29,6 +29,7 @@ type Provisioner struct {
 	cfg   Config
 
 	publishEvent func(string, string, map[string]any)
+	pruneEvents  func(context.Context, string) error
 	probeTunnel  func(context.Context, int) (bool, string)
 	healthMu     sync.RWMutex
 	healthReport []map[string]any
@@ -1099,7 +1100,12 @@ func (p *Provisioner) ExpireOnce(ctx context.Context) error {
 	if _, err := p.store.db.ExecContext(ctx, `DELETE FROM jwt_blacklist WHERE expires_at<=?`, now); err != nil {
 		return err
 	}
-	if _, err := p.store.db.ExecContext(ctx, `DELETE FROM events WHERE created_at<?`, nowTime.Add(-eventRetention).Format(time.RFC3339)); err != nil {
+	eventCutoff := nowTime.Add(-eventRetention).Format(time.RFC3339)
+	if p.pruneEvents != nil {
+		if err := p.pruneEvents(ctx, eventCutoff); err != nil {
+			return err
+		}
+	} else if _, err := p.store.db.ExecContext(ctx, `DELETE FROM events WHERE created_at<?`, eventCutoff); err != nil {
 		return err
 	}
 	if _, err := p.store.db.ExecContext(ctx, `DELETE FROM rate_limits WHERE reset_at<=?`, now); err != nil {

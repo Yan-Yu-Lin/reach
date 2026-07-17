@@ -32,6 +32,7 @@ func NewServer(cfg Config, store *Store, prov *Provisioner) *Server {
 		prov.publishEvent = func(typ, machineID string, data map[string]any) {
 			s.publishEvent(context.Background(), typ, machineID, data)
 		}
+		prov.pruneEvents = s.events.PruneBefore
 	}
 	s.routes()
 	return s
@@ -524,37 +525,31 @@ func (s *Server) handleAdminEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 	_, _ = fmt.Fprint(w, "retry: 2000\n\n")
-	ch, oldest, boundary, cancel, err := s.events.Subscribe(r.Context())
+	requested := eventCursor(r)
+	if requested.Present && !requested.Valid {
+		_ = writeSSE(w, ReachEvent{Type: "machine.resync_required", Data: map[string]any{"reason": "invalid_cursor"}, CreatedAt: nowUTC()})
+		flusher.Flush()
+		return
+	}
+	ch, _, _, replay, reason, cancel, err := s.events.SubscribeSince(r.Context(), requested.ID, requested.Present, eventReplayLimit)
 	if err != nil {
+		_ = writeSSE(w, ReachEvent{Type: "machine.resync_required", Data: map[string]any{"reason": "replay_failed"}, CreatedAt: nowUTC()})
+		flusher.Flush()
 		return
 	}
 	defer cancel()
-	var cursor int64
-	if requestedCursor, ok := eventCursor(r); ok {
-		cursor = requestedCursor
-		if cursor > boundary || (oldest > 0 && cursor < oldest-1) {
-			_ = writeSSE(w, ReachEvent{Type: "machine.resync_required", Data: map[string]any{"reason": "cursor_out_of_range"}, CreatedAt: nowUTC()})
-			flusher.Flush()
+	if reason != "" {
+		_ = writeSSE(w, ReachEvent{Type: "machine.resync_required", Data: map[string]any{"reason": reason}, CreatedAt: nowUTC()})
+		flusher.Flush()
+		return
+	}
+	cursor := requested.ID
+	for _, ev := range replay {
+		if err := writeSSE(w, ev); err != nil {
 			return
 		}
-		replay, overflow, err := s.events.ReplayRange(r.Context(), cursor, boundary, eventReplayLimit)
-		if err != nil {
-			_ = writeSSE(w, ReachEvent{Type: "machine.resync_required", Data: map[string]any{"reason": "replay_failed"}, CreatedAt: nowUTC()})
-			flusher.Flush()
-			return
-		}
-		if overflow {
-			_ = writeSSE(w, ReachEvent{Type: "machine.resync_required", Data: map[string]any{"reason": "replay_overflow"}, CreatedAt: nowUTC()})
-			flusher.Flush()
-			return
-		}
-		for _, ev := range replay {
-			if err := writeSSE(w, ev); err != nil {
-				return
-			}
-			if id, err := strconv.ParseInt(ev.ID, 10, 64); err == nil {
-				cursor = id
-			}
+		if id, err := strconv.ParseInt(ev.ID, 10, 64); err == nil {
+			cursor = id
 		}
 	}
 	_ = writeSSE(w, ReachEvent{Type: "hello", Data: map[string]any{"ok": true}, CreatedAt: nowUTC()})

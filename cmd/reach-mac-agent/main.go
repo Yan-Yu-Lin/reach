@@ -111,12 +111,12 @@ func (a Agent) Run(ctx context.Context) error {
 			a.log.Printf("reconnect sync failed: %v", err)
 		} else {
 			backoff = time.Second
+			err := a.stream(ctx, &lastID)
+			if ctx.Err() != nil {
+				break
+			}
+			a.log.Printf("event stream ended: %v", err)
 		}
-		err := a.stream(ctx, &lastID)
-		if ctx.Err() != nil {
-			break
-		}
-		a.log.Printf("event stream ended: %v", err)
 		t := time.NewTimer(backoff)
 		select {
 		case <-ctx.Done():
@@ -150,34 +150,40 @@ func (a Agent) stream(ctx context.Context, lastID *string) error {
 		return fmt.Errorf("events returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	a.log.Printf("connected to Reach event stream")
-	return parseSSE(ctx, resp.Body, func(ev Event) {
-		if ev.ID != "" && ev.ID != "0" && lastID != nil {
-			*lastID = ev.ID
-			a.writeLastEventID(ev.ID)
-		}
+	return parseSSE(ctx, resp.Body, func(ev Event) error {
+		syncRequired := false
+		resetCursor := false
 		switch ev.Type {
 		case "hello":
 		case "machine.resync_required":
 			a.log.Printf("server requested event resync; resetting cursor and syncing SSH config")
-			if lastID != nil {
-				*lastID = ""
-				a.writeLastEventID("")
-			}
-			if err := a.Sync(ctx); err != nil {
-				a.log.Printf("resync failed: %v", err)
-			}
+			syncRequired = true
+			resetCursor = true
 		case "ssh_config.changed", "machine.created", "machine.desired_changed", "machine.observed_changed", "machine.online", "machine.degraded", "machine.offline", "machine.gone", "machine.disabled", "machine.enabled", "machine.retiring", "machine.retired":
 			a.log.Printf("event %s id=%s; syncing SSH config", ev.Type, ev.ID)
-			if err := a.Sync(ctx); err != nil {
-				a.log.Printf("sync failed: %v", err)
-			}
+			syncRequired = true
 		default:
 			a.log.Printf("event %s id=%s", ev.Type, ev.ID)
 		}
+		if syncRequired {
+			if err := a.Sync(ctx); err != nil {
+				return fmt.Errorf("sync for event %s: %w", ev.Type, err)
+			}
+		}
+		if lastID != nil {
+			if resetCursor {
+				*lastID = ""
+				a.writeLastEventID("")
+			} else if ev.ID != "" && ev.ID != "0" {
+				*lastID = ev.ID
+				a.writeLastEventID(ev.ID)
+			}
+		}
+		return nil
 	})
 }
 
-func parseSSE(ctx context.Context, r io.Reader, fn func(Event)) error {
+func parseSSE(ctx context.Context, r io.Reader, fn func(Event) error) error {
 	sc := bufio.NewScanner(r)
 	var ev Event
 	var data []string
@@ -194,7 +200,9 @@ func parseSSE(ctx context.Context, r io.Reader, fn func(Event)) error {
 				if ev.Type == "" {
 					ev.Type = "message"
 				}
-				fn(ev)
+				if err := fn(ev); err != nil {
+					return err
+				}
 			}
 			ev = Event{}
 			data = nil

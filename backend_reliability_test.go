@@ -143,6 +143,34 @@ func TestStableHeartbeatAlwaysPublishesMachineScopedInvalidation(t *testing.T) {
 	}
 }
 
+func TestInvalidEventCursorRequiresResnapshot(t *testing.T) {
+	server, _, cfg := newReliabilityTestServer(t)
+	token, err := SignJWT(cfg.JWTSecret, "u_test", "tester", "owner", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(server)
+	defer ts.Close()
+	for _, cursor := range []string{"invalid", "-1"} {
+		req, err := http.NewRequest(http.MethodGet, ts.URL+"/api/admin/events", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Last-Event-ID", cursor)
+		resp, err := ts.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out bytes.Buffer
+		_, _ = out.ReadFrom(resp.Body)
+		_ = resp.Body.Close()
+		if !strings.Contains(out.String(), "id:\nevent: machine.resync_required") || !strings.Contains(out.String(), "invalid_cursor") {
+			t.Fatalf("cursor %q did not receive cursor-clearing reset:\n%s", cursor, out.String())
+		}
+	}
+}
+
 func TestPendingCommandsRetryLeaseAndConcurrentClaims(t *testing.T) {
 	server, store, _ := newReliabilityTestServer(t)
 	insertTestMachine(t, store, "m_claim", "claim-box")
