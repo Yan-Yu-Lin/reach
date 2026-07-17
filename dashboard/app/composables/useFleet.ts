@@ -1,11 +1,18 @@
+import { mapSettledLimited } from '~/utils/concurrency'
+import { createRefreshCoordinator, type RefreshBatch } from '~/utils/refreshCoordinator'
+
+const machineRefreshConcurrency = 4
+const fullRefreshThreshold = 12
+
 export function useFleet() {
   const api = useReachApi()
   const sse = useSSE()
   const machines = ref<MachineWithTunnels[]>([])
   const requests = ref<RequestRow[]>([])
-  const loading = ref(false)
+  const loading = ref(true)
   const error = ref('')
   const selectedId = ref<string | null>(null)
+  let disposeSSE: (() => void) | null = null
 
   const pendingRequests = computed(() =>
     requests.value.filter(r => r.status === 'pending')
@@ -76,66 +83,109 @@ export function useFleet() {
       .slice(0, 5)
   )
 
-  async function refresh() {
-    error.value = ''
-    loading.value = true
-    try {
-      const [ms, rs] = await Promise.all([api.machines(), api.requests()])
-      machines.value = ms || []
-      requests.value = rs || []
-    } catch (e: any) {
-      error.value = e.message || 'Failed to load'
-    } finally {
-      loading.value = false
+  async function executeRefresh(batch: RefreshBatch) {
+    if (batch.full) {
+      error.value = ''
+      loading.value = true
+      try {
+        const [machineResult, requestResult] = await Promise.allSettled([api.machines(), api.requests()])
+        const failures: unknown[] = []
+        if (machineResult.status === 'fulfilled') machines.value = machineResult.value || []
+        else failures.push(machineResult.reason)
+        if (requestResult.status === 'fulfilled') requests.value = requestResult.value || []
+        else failures.push(requestResult.reason)
+        if (failures.length > 0) {
+          const failure = failures[0] as any
+          error.value = failure?.message || 'Failed to load dashboard data'
+        }
+      } finally {
+        loading.value = false
+      }
+      return
+    }
+
+    if (batch.machineIds.length >= fullRefreshThreshold) {
+      await executeRefresh({ full: true, machineIds: [] })
+      return
+    }
+
+    const updateResults = await mapSettledLimited(
+      batch.machineIds,
+      machineRefreshConcurrency,
+      id => api.machine(id),
+    )
+    for (const result of updateResults) {
+      if (result.status !== 'fulfilled') continue
+      const updated = result.value
+      const index = machines.value.findIndex(item => item.machine.id === updated.machine.id)
+      if (index >= 0) machines.value[index] = updated
+      else machines.value.push(updated)
     }
   }
 
-  async function refreshMachine(id: string) {
-    try {
-      const updated = await api.machine(id)
-      const idx = machines.value.findIndex(m => m.machine.id === id)
-      if (idx >= 0) machines.value[idx] = updated
-    } catch {}
+  const refreshCoordinator = createRefreshCoordinator(executeRefresh)
+
+  function refresh() {
+    return refreshCoordinator.requestFull(true)
+  }
+
+  function refreshMachine(id: string) {
+    return refreshCoordinator.requestMachine(id)
   }
 
   function setupSSE() {
-    if (!api.token.value) return
-    const config = useRuntimeConfig()
-    sse.start(api.token.value, config.public.apiBase as string || '/api')
+    disposeSSE?.()
+    if (!api.token.value) return () => {}
 
-    sse.onEvent((event, data) => {
+    const config = useRuntimeConfig()
+    const removeHandler = sse.onEvent((event, rawData) => {
+      const data = rawData && typeof rawData === 'object'
+        ? rawData as Record<string, any>
+        : {}
+
       if (event.startsWith('request.') || event === 'ssh_config.changed') {
-        refresh()
-      } else if (event.startsWith('machine.')) {
-        if (data.machine_id) {
-          refreshMachine(data.machine_id)
+        void refreshCoordinator.requestFull()
+      } else if (event.startsWith('machine.') || event.startsWith('agent.')) {
+        if (typeof data.machine_id === 'string' && data.machine_id) {
+          void refreshCoordinator.requestMachine(data.machine_id)
         } else {
-          refresh()
+          void refreshCoordinator.requestFull()
         }
-      } else if (event.startsWith('agent.')) {
-        if (data.machine_id) refreshMachine(data.machine_id)
       }
 
       if (event === 'request.created' && data.status === 'pending') {
         notifyPending(data)
       }
     })
+
+    sse.start(api.token.value, config.public.apiBase as string || '/api')
+    disposeSSE = () => {
+      removeHandler()
+      sse.stop()
+      disposeSSE = null
+    }
+    return disposeSSE
   }
 
-  function notifyPending(data: any) {
-    if (!('Notification' in window)) return
+  function dispose() {
+    disposeSSE?.()
+    refreshCoordinator.dispose()
+  }
+
+  function notifyPending(data: Record<string, any>) {
+    if (!import.meta.client || !('Notification' in window)) return
     if (Notification.permission === 'granted') {
       new Notification('Reach: New request', {
         body: `${data.name || 'Unknown'} wants to connect`,
         tag: 'reach-pending',
       })
     } else if (Notification.permission !== 'denied') {
-      Notification.requestPermission()
+      void Notification.requestPermission()
     }
   }
 
-  watch(pendingCount, (n) => {
-    document.title = n > 0 ? `(${n}) Reach` : 'Reach'
+  watch(pendingCount, (count) => {
+    if (import.meta.client) document.title = count > 0 ? `(${count}) Reach` : 'Reach'
   })
 
   return {
@@ -155,5 +205,6 @@ export function useFleet() {
     refresh,
     refreshMachine,
     setupSSE,
+    dispose,
   }
 }

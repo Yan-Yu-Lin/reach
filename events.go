@@ -5,10 +5,16 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"sync"
 	"time"
+)
+
+const (
+	eventSubscriberBuffer = 32
+	eventReplayLimit      = 500
 )
 
 type ReachEvent struct {
@@ -20,66 +26,107 @@ type ReachEvent struct {
 }
 
 type eventBroker struct {
-	store *Store
-	mu    sync.Mutex
-	subs  map[chan ReachEvent]struct{}
+	store     *Store
+	publishMu sync.Mutex
+	subsMu    sync.Mutex
+	subs      map[chan ReachEvent]struct{}
 }
 
 func newEventBroker(store *Store) *eventBroker {
 	return &eventBroker{store: store, subs: map[chan ReachEvent]struct{}{}}
 }
 
-func (b *eventBroker) Subscribe() (chan ReachEvent, func()) {
-	ch := make(chan ReachEvent, 32)
-	b.mu.Lock()
+func (b *eventBroker) Subscribe(ctx context.Context) (chan ReachEvent, int64, int64, func(), error) {
+	ch := make(chan ReachEvent, eventSubscriberBuffer)
+	b.publishMu.Lock()
+	defer b.publishMu.Unlock()
+	var oldest, boundary int64
+	if b.store != nil {
+		if err := b.store.db.QueryRowContext(ctx, `SELECT COALESCE(MIN(id),0),COALESCE(MAX(id),0) FROM events`).Scan(&oldest, &boundary); err != nil {
+			return nil, 0, 0, nil, err
+		}
+	}
+	b.subsMu.Lock()
 	b.subs[ch] = struct{}{}
-	b.mu.Unlock()
+	b.subsMu.Unlock()
 	cancel := func() {
-		b.mu.Lock()
+		b.subsMu.Lock()
 		if _, ok := b.subs[ch]; ok {
 			delete(b.subs, ch)
 			close(ch)
 		}
-		b.mu.Unlock()
+		b.subsMu.Unlock()
 	}
-	return ch, cancel
+	return ch, oldest, boundary, cancel, nil
 }
 
 func (b *eventBroker) Publish(ctx context.Context, typ, machineID string, data map[string]any) ReachEvent {
+	b.publishMu.Lock()
+	defer b.publishMu.Unlock()
 	created := nowUTC()
-	payload, _ := json.Marshal(data)
+	payload, err := json.Marshal(data)
+	if err != nil {
+		return b.resyncSubscribers("event_encode_failed")
+	}
 	var id int64
 	if b.store != nil {
 		res, err := b.store.db.ExecContext(ctx, `INSERT INTO events (type,machine_id,payload_json,created_at) VALUES (?,?,?,?)`, typ, nullable(machineID), string(payload), created)
-		if err == nil {
-			id, _ = res.LastInsertId()
+		if err != nil {
+			return b.resyncSubscribers("event_persistence_failed")
+		}
+		id, err = res.LastInsertId()
+		if err != nil || id <= 0 {
+			return b.resyncSubscribers("event_persistence_failed")
 		}
 	}
-	if id == 0 {
-		id = time.Now().UnixNano()
+	ev := ReachEvent{Type: typ, MachineID: machineID, Data: data, CreatedAt: created}
+	if id > 0 {
+		ev.ID = strconv.FormatInt(id, 10)
 	}
-	ev := ReachEvent{ID: fmt.Sprintf("%d", id), Type: typ, MachineID: machineID, Data: data, CreatedAt: created}
-	b.mu.Lock()
+	b.subsMu.Lock()
 	for ch := range b.subs {
 		select {
 		case ch <- ev:
 		default:
+			b.resyncSubscriberLocked(ch, "subscriber_overflow")
 		}
 	}
-	b.mu.Unlock()
+	b.subsMu.Unlock()
 	return ev
 }
 
-func (b *eventBroker) ReplaySince(ctx context.Context, lastID int64, limit int) ([]ReachEvent, error) {
-	if b.store == nil {
-		return nil, nil
+func (b *eventBroker) resyncSubscribers(reason string) ReachEvent {
+	ev := ReachEvent{Type: "machine.resync_required", Data: map[string]any{"reason": reason}, CreatedAt: nowUTC()}
+	b.subsMu.Lock()
+	for ch := range b.subs {
+		b.resyncSubscriberLocked(ch, reason)
 	}
-	if limit <= 0 || limit > 1000 {
-		limit = 500
+	b.subsMu.Unlock()
+	return ev
+}
+
+func (b *eventBroker) resyncSubscriberLocked(ch chan ReachEvent, reason string) {
+	if _, ok := b.subs[ch]; !ok {
+		return
 	}
-	rows, err := b.store.db.QueryContext(ctx, `SELECT id,type,machine_id,payload_json,created_at FROM events WHERE id>? ORDER BY id LIMIT ?`, lastID, limit)
+	delete(b.subs, ch)
+	for len(ch) > 0 {
+		<-ch
+	}
+	ch <- ReachEvent{Type: "machine.resync_required", Data: map[string]any{"reason": reason}, CreatedAt: nowUTC()}
+	close(ch)
+}
+
+func (b *eventBroker) ReplayRange(ctx context.Context, lastID, throughID int64, limit int) ([]ReachEvent, bool, error) {
+	if b.store == nil || throughID <= lastID {
+		return nil, false, nil
+	}
+	if limit <= 0 || limit > eventReplayLimit {
+		limit = eventReplayLimit
+	}
+	rows, err := b.store.db.QueryContext(ctx, `SELECT id,type,machine_id,payload_json,created_at FROM events WHERE id>? AND id<=? ORDER BY id LIMIT ?`, lastID, throughID, limit+1)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer rows.Close()
 	var out []ReachEvent
@@ -88,34 +135,48 @@ func (b *eventBroker) ReplaySince(ctx context.Context, lastID int64, limit int) 
 		var typ, payload, created string
 		var machineID sql.NullString
 		if err := rows.Scan(&id, &typ, &machineID, &payload, &created); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		data := map[string]any{}
 		_ = json.Unmarshal([]byte(payload), &data)
-		out = append(out, ReachEvent{ID: fmt.Sprintf("%d", id), Type: typ, MachineID: machineID.String, Data: data, CreatedAt: created})
+		out = append(out, ReachEvent{ID: strconv.FormatInt(id, 10), Type: typ, MachineID: machineID.String, Data: data, CreatedAt: created})
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	if len(out) > limit {
+		return out[:limit], true, nil
+	}
+	return out, false, nil
 }
 
-func lastEventID(r *http.Request) int64 {
+func eventCursor(r *http.Request) (int64, bool) {
 	v := r.Header.Get("Last-Event-ID")
 	if v == "" {
 		v = r.URL.Query().Get("last_event_id")
 	}
-	id, _ := strconv.ParseInt(v, 10, 64)
-	return id
+	if v == "" {
+		return 0, false
+	}
+	id, err := strconv.ParseInt(v, 10, 64)
+	return id, err == nil && id >= 0
 }
 
-func writeSSE(w http.ResponseWriter, ev ReachEvent) error {
+func writeSSE(w io.Writer, ev ReachEvent) error {
 	b, err := json.Marshal(ev.Data)
 	if err != nil {
 		return err
 	}
-	if ev.MachineID != "" {
-		_, err = fmt.Fprintf(w, "id: %s\nevent: %s\ndata: %s\n\n", ev.ID, ev.Type, b)
-		return err
+	if ev.Type == "machine.resync_required" {
+		if _, err := fmt.Fprint(w, "id:\n"); err != nil {
+			return err
+		}
+	} else if ev.ID != "" {
+		if _, err := fmt.Fprintf(w, "id: %s\n", ev.ID); err != nil {
+			return err
+		}
 	}
-	_, err = fmt.Fprintf(w, "id: %s\nevent: %s\ndata: %s\n\n", ev.ID, ev.Type, b)
+	_, err = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", ev.Type, b)
 	return err
 }
 

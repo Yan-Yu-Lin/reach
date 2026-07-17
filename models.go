@@ -118,7 +118,6 @@ type AgentObservation struct {
 	PersistenceRebootSafe     bool            `json:"persistence_reboot_safe"`
 	AuthorizedKeyFingerprints json.RawMessage `json:"authorized_key_fingerprints,omitempty"`
 	LastError                 string          `json:"last_error,omitempty"`
-	RawJSON                   json.RawMessage `json:"raw_json,omitempty"`
 }
 
 type HubObservation struct {

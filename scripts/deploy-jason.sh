@@ -5,7 +5,8 @@ set -Eeuo pipefail
 # Example: ssh <hub-alias> 'cd ~/reach && bash scripts/deploy-jason.sh'
 # Or locally on the hub: cd ~/reach && bash scripts/deploy-jason.sh
 #
-# Agent release versioning:
+# - Existing deployments leave hosted reach-agent artifacts unchanged by default.
+#   Set REACH_PUBLISH_AGENT_RELEASE=1 to build/install/publish an agent release.
 # - REACH_AGENT_VERSION overrides everything.
 # - Exact git tag vX.Y.Z[...suffix] publishes version X.Y.Z[...suffix].
 # - Untagged deploys publish REACH_VERSION_BASE-dev.YYYYmmddTHHMMSSZ.g<sha>.
@@ -20,6 +21,25 @@ set -Eeuo pipefail
 cd "$(dirname "$0")/.."
 
 export CGO_ENABLED=0
+
+UV_BIN="$(command -v uv 2>/dev/null || true)"
+if [ -z "$UV_BIN" ] && [ -x "$HOME/.local/bin/uv" ]; then
+  UV_BIN="$HOME/.local/bin/uv"
+fi
+if [ -z "$UV_BIN" ] || [ ! -x "$UV_BIN" ]; then
+  echo "[deploy] ERROR: uv is required (checked PATH and $HOME/.local/bin/uv)" >&2
+  exit 1
+fi
+UV_BIN="$(cd "$(dirname "$UV_BIN")" && pwd)/$(basename "$UV_BIN")"
+
+command -v flock >/dev/null || { echo "[deploy] ERROR: flock is required" >&2; exit 1; }
+LOCK_DIR="${XDG_RUNTIME_DIR:-$HOME/.cache/reach}"
+mkdir -p "$LOCK_DIR"
+exec 9>"$LOCK_DIR/deploy.lock"
+if ! flock -n 9; then
+  echo "[deploy] ERROR: another Reach deployment is running" >&2
+  exit 1
+fi
 
 version_from_git() {
   local tag sha ts base
@@ -92,8 +112,15 @@ require_agent_artifacts() {
   done
 }
 
-echo "[deploy] pulling latest..."
-git pull --ff-only
+if [ -n "${REACH_DEPLOY_COMMIT:-}" ]; then
+  echo "[deploy] checking out explicit commit ${REACH_DEPLOY_COMMIT}..."
+  git fetch origin "$REACH_DEPLOY_COMMIT"
+  git checkout --detach "$REACH_DEPLOY_COMMIT"
+  test "$(git rev-parse HEAD)" = "$(git rev-parse "$REACH_DEPLOY_COMMIT^{commit}")"
+else
+  echo "[deploy] pulling latest..."
+  git pull --ff-only
+fi
 
 AGENT_VERSION="${REACH_AGENT_VERSION:-$(version_from_git)}"
 AGENT_LDFLAGS="-X main.version=${AGENT_VERSION}"
@@ -102,13 +129,124 @@ AGENT_DOWNLOAD_DIR="${AGENT_DOWNLOAD_ROOT}/v${AGENT_VERSION}"
 AGENT_STAGING_DIR="${AGENT_DOWNLOAD_ROOT}/.v${AGENT_VERSION}.tmp.$$"
 ARTIFACT_DIR="${REACH_AGENT_ARTIFACT_DIR:-}"
 BUILD_ARTIFACT_DIR=""
+ROLLBACK_ARMED=0
+SERVICE_STOPPED=0
+REACHD_ROLLBACK=""
+CARRIER_ROLLBACK=""
+CARRIER_ROLLBACK_ARMED=0
+DASHBOARD_SWAP_ARMED=0
+DASHBOARD_STAGE=""
+DASHBOARD_BACKUP=""
+PUBLISH_AGENT_RELEASE="${REACH_PUBLISH_AGENT_RELEASE:-0}"
+BACKUP_RETAIN="${REACH_BACKUP_RETAIN:-5}"
+PUBLICATION_ARMED=0
+AGENT_BIN_BACKUP=""
+SETUP_SH_BACKUP=""
+SETUP_PS1_BACKUP=""
+LATEST_TXT_BACKUP=""
+LATEST_JSON_BACKUP=""
+AGENT_VERSION_BACKUP=""
+AGENT_BIN_EXISTED=0
+SETUP_SH_EXISTED=0
+SETUP_PS1_EXISTED=0
+LATEST_TXT_EXISTED=0
+LATEST_JSON_EXISTED=0
+
+cleanup() {
+  if [ -n "$BUILD_ARTIFACT_DIR" ] && [ -d "$BUILD_ARTIFACT_DIR" ]; then
+    if command -v trash >/dev/null; then
+      trash "$BUILD_ARTIFACT_DIR"
+    else
+      rm -rf "$BUILD_ARTIFACT_DIR"
+    fi
+  fi
+  if [ -n "$DASHBOARD_STAGE" ] && sudo test -e "$DASHBOARD_STAGE"; then
+    sudo mv "$DASHBOARD_STAGE" "${DASHBOARD_STAGE}.abandoned" 2>/dev/null || true
+  fi
+}
+
+rollback_reachd() {
+  local exit_code=$?
+  trap - ERR
+  set +e
+  if [ "$PUBLICATION_ARMED" = 1 ]; then
+    echo "[deploy] restoring previous agent publication" >&2
+    for record in \
+      "$AGENT_BIN_EXISTED|$AGENT_BIN_BACKUP|/opt/reach/reach-agent" \
+      "$SETUP_SH_EXISTED|$SETUP_SH_BACKUP|/var/lib/reach/setup.sh" \
+      "$SETUP_PS1_EXISTED|$SETUP_PS1_BACKUP|/var/lib/reach/setup.ps1" \
+      "$LATEST_TXT_EXISTED|$LATEST_TXT_BACKUP|$AGENT_DOWNLOAD_ROOT/latest.txt" \
+      "$LATEST_JSON_EXISTED|$LATEST_JSON_BACKUP|$AGENT_DOWNLOAD_ROOT/latest.json"; do
+      existed="${record%%|*}"
+      remainder="${record#*|}"
+      backup="${remainder%%|*}"
+      destination="${remainder#*|}"
+      if [ "$existed" = 1 ]; then
+        if [ -n "$backup" ] && sudo test -f "$backup"; then
+          sudo cp -a "$backup" "$destination.rollback-candidate"
+          sudo mv -f "$destination.rollback-candidate" "$destination"
+        fi
+      elif sudo test -e "$destination"; then
+        sudo mv "$destination" "$destination.failed.$DEPLOY_TS"
+      fi
+    done
+    if sudo test -d "$AGENT_DOWNLOAD_DIR"; then
+      sudo mv "$AGENT_DOWNLOAD_DIR" "$AGENT_DOWNLOAD_DIR.failed.$DEPLOY_TS"
+    fi
+    if [ -n "$AGENT_VERSION_BACKUP" ] && sudo test -d "$AGENT_VERSION_BACKUP"; then
+      sudo mv "$AGENT_VERSION_BACKUP" "$AGENT_DOWNLOAD_DIR"
+    fi
+  fi
+  if [ "$DASHBOARD_SWAP_ARMED" = 1 ]; then
+    local dashboard_rollback_source=""
+    if [ -n "$DASHBOARD_BACKUP" ] && sudo test -d "$DASHBOARD_BACKUP"; then
+      dashboard_rollback_source="$DASHBOARD_BACKUP"
+    elif [ -n "$DASHBOARD_STAGE" ] && sudo test -d "$DASHBOARD_STAGE"; then
+      dashboard_rollback_source="$DASHBOARD_STAGE"
+    fi
+    if [ -n "$dashboard_rollback_source" ]; then
+      echo "[deploy] restoring previous dashboard" >&2
+      sudo "$UV_BIN" run --script scripts/atomic-directory-swap.py "$dashboard_rollback_source" /opt/reach-dashboard
+    fi
+  fi
+  if [ "$CARRIER_ROLLBACK_ARMED" = 1 ]; then
+    echo "[deploy] restoring previous WebSocket carrier" >&2
+    sudo systemctl stop reach-ws-carrier.service
+    sudo install -m 0755 "$CARRIER_ROLLBACK" /opt/reach/reach-ws-carrier.rollback-candidate
+    sudo mv -f /opt/reach/reach-ws-carrier.rollback-candidate /opt/reach/reach-ws-carrier
+    sudo systemctl start reach-ws-carrier.service
+    systemctl is-active reach-ws-carrier.service >&2
+  fi
+  if [ "$ROLLBACK_ARMED" = 1 ]; then
+    echo "[deploy] ERROR: deployment failed; restoring previous reachd" >&2
+    sudo systemctl stop reachd
+    sudo install -m 0755 "$REACHD_ROLLBACK" /opt/reach/reachd.rollback-candidate
+    sudo mv -f /opt/reach/reachd.rollback-candidate /opt/reach/reachd
+    sudo systemctl start reachd
+    systemctl is-active reachd >&2
+  elif [ "$SERVICE_STOPPED" = 1 ]; then
+    echo "[deploy] ERROR: deployment failed while reachd was stopped; restarting previous service" >&2
+    sudo systemctl start reachd
+  fi
+  exit "$exit_code"
+}
+
+trap cleanup EXIT
+trap rollback_reachd ERR
 
 echo "[deploy] agent version: ${AGENT_VERSION}"
 
-if [ -z "$ARTIFACT_DIR" ]; then
+case "$PUBLISH_AGENT_RELEASE" in
+  0|1) ;;
+  *) echo "[deploy] ERROR: REACH_PUBLISH_AGENT_RELEASE must be 0 or 1" >&2; exit 1 ;;
+esac
+case "$BACKUP_RETAIN" in
+  ''|*[!0-9]*|0) echo "[deploy] ERROR: REACH_BACKUP_RETAIN must be a positive integer" >&2; exit 1 ;;
+esac
+
+if [ "$PUBLISH_AGENT_RELEASE" = 1 ] && [ -z "$ARTIFACT_DIR" ]; then
   BUILD_ARTIFACT_DIR="$(mktemp -d)"
   ARTIFACT_DIR="$BUILD_ARTIFACT_DIR"
-  trap 'rm -rf "$BUILD_ARTIFACT_DIR"' EXIT
 
   build_agent "$ARTIFACT_DIR/reach-agent_linux_amd64" linux amd64
   build_agent "$ARTIFACT_DIR/reach-agent_linux_arm64" linux arm64
@@ -129,11 +267,11 @@ if [ -z "$ARTIFACT_DIR" ]; then
   else
     echo "[deploy] WARNING: manifest.json.minisig not created; update-binary will reject this release"
   fi
-else
+elif [ "$PUBLISH_AGENT_RELEASE" = 1 ]; then
   require_agent_artifacts "$ARTIFACT_DIR"
 fi
 
-if [ -e "$AGENT_DOWNLOAD_DIR" ] && [ "${REACH_OVERWRITE_VERSION:-0}" != 1 ]; then
+if [ "$PUBLISH_AGENT_RELEASE" = 1 ] && [ -e "$AGENT_DOWNLOAD_DIR" ] && [ "${REACH_OVERWRITE_VERSION:-0}" != 1 ]; then
   echo "[deploy] ERROR: $AGENT_DOWNLOAD_DIR already exists; refusing to overwrite immutable release" >&2
   echo "[deploy] Set REACH_OVERWRITE_VERSION=1 only for emergency rebuilds of the same version." >&2
   exit 1
@@ -145,111 +283,59 @@ GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o /tmp/reachd-build .
 echo "[deploy] building reach-ws-carrier (linux/amd64 static)..."
 GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o /tmp/reach-ws-carrier ./cmd/reach-ws-carrier
 
-echo "[deploy] installing binaries..."
-sudo install -m 0755 /tmp/reachd-build /opt/reach/reachd
-sudo install -m 0755 /tmp/reach-ws-carrier /opt/reach/reach-ws-carrier
-sudo install -m 0755 "$ARTIFACT_DIR/reach-agent_linux_amd64" /opt/reach/reach-agent
-rm -f /tmp/reachd-build /tmp/reach-ws-carrier
+DEPLOY_TS="$(date -u +%Y%m%dT%H%M%SZ)"
+DASHBOARD_STAGE="/opt/.reach-dashboard.staged.${DEPLOY_TS}.$$"
+DASHBOARD_BACKUP="/opt/reach-dashboard.backup.${DEPLOY_TS}"
 
-echo "[deploy] publishing hosted agent downloads..."
-sudo mkdir -p "$AGENT_DOWNLOAD_ROOT"
-if [ -e "$AGENT_STAGING_DIR" ]; then
-  sudo mv "$AGENT_STAGING_DIR" "$AGENT_STAGING_DIR.abandoned.$(date -u +%Y%m%dT%H%M%SZ)"
+command -v sqlite3 >/dev/null || { echo "[deploy] ERROR: sqlite3 is required for safe backups" >&2; exit 1; }
+if [ -r /etc/reach/config.yaml ]; then
+  DB_PATH="$("$UV_BIN" run --script scripts/read-reach-config.py --config /etc/reach/config.yaml db_path)"
+  LISTEN_ADDR="$("$UV_BIN" run --script scripts/read-reach-config.py --config /etc/reach/config.yaml listen_addr)"
+else
+  DB_PATH="$(sudo "$UV_BIN" run --script scripts/read-reach-config.py --config /etc/reach/config.yaml db_path)"
+  LISTEN_ADDR="$(sudo "$UV_BIN" run --script scripts/read-reach-config.py --config /etc/reach/config.yaml listen_addr)"
 fi
-sudo mkdir -p "$AGENT_STAGING_DIR"
-sudo install -m 0755 "$ARTIFACT_DIR/reach-agent_linux_amd64" "$AGENT_STAGING_DIR/reach-agent_linux_amd64"
-sudo install -m 0755 "$ARTIFACT_DIR/reach-agent_linux_arm64" "$AGENT_STAGING_DIR/reach-agent_linux_arm64"
-sudo install -m 0755 "$ARTIFACT_DIR/reach-agent_linux_386" "$AGENT_STAGING_DIR/reach-agent_linux_386"
-sudo install -m 0755 "$ARTIFACT_DIR/reach-agent_linux_armv6" "$AGENT_STAGING_DIR/reach-agent_linux_armv6"
-sudo install -m 0755 "$ARTIFACT_DIR/reach-agent_linux_armv7" "$AGENT_STAGING_DIR/reach-agent_linux_armv7"
-sudo install -m 0755 "$ARTIFACT_DIR/reach-agent_darwin_amd64" "$AGENT_STAGING_DIR/reach-agent_darwin_amd64"
-sudo install -m 0755 "$ARTIFACT_DIR/reach-agent_darwin_arm64" "$AGENT_STAGING_DIR/reach-agent_darwin_arm64"
-sudo install -m 0755 "$ARTIFACT_DIR/reach-agent_windows_amd64.exe" "$AGENT_STAGING_DIR/reach-agent_windows_amd64.exe"
-sudo install -m 0755 "$ARTIFACT_DIR/reach-agent_windows_arm64.exe" "$AGENT_STAGING_DIR/reach-agent_windows_arm64.exe"
-sudo install -m 0644 "$ARTIFACT_DIR/checksums.txt" "$AGENT_STAGING_DIR/checksums.txt"
-sudo install -m 0644 "$ARTIFACT_DIR/manifest.json" "$AGENT_STAGING_DIR/manifest.json"
-if [ -f "$ARTIFACT_DIR/manifest.json.minisig" ]; then
-  sudo install -m 0644 "$ARTIFACT_DIR/manifest.json.minisig" "$AGENT_STAGING_DIR/manifest.json.minisig"
-fi
-if [ -e "$AGENT_DOWNLOAD_DIR" ]; then
-  sudo mv "$AGENT_DOWNLOAD_DIR" "$AGENT_DOWNLOAD_DIR.replaced.$(date -u +%Y%m%dT%H%M%SZ)"
-fi
-sudo mv "$AGENT_STAGING_DIR" "$AGENT_DOWNLOAD_DIR"
-printf '%s\n' "$AGENT_VERSION" > /tmp/reach-latest-version
-sudo install -m 0644 /tmp/reach-latest-version "$AGENT_DOWNLOAD_ROOT/latest.txt"
-cat > /tmp/reach-latest.json <<EOF
-{"version":"${AGENT_VERSION}","api_url":"${REACH_API_URL:-}","created_at":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
-EOF
-sudo install -m 0644 /tmp/reach-latest.json "$AGENT_DOWNLOAD_ROOT/latest.json"
-rm -f /tmp/reach-latest-version /tmp/reach-latest.json
-
-echo "[deploy] updating setup scripts..."
-CONFIG_API_URL="${REACH_API_URL:-}"
-read_reach_api_url_awk='
-  $1 == "default_hub:" { in_hub=1; next }
-  in_hub && $1 == "api_url:" {
-    sub(/^[^:]*:[[:space:]]*/, "")
-    sub(/[[:space:]]+#.*$/, "")
-    gsub(/^[[:space:]]+|[[:space:]]+$/, "")
-    gsub(/^\"|\"$/, "")
-    print
-    exit
-  }
-  in_hub && /^[^[:space:]]/ { in_hub=0 }
-'
-if [ -z "$CONFIG_API_URL" ]; then
-  if [ -r /etc/reach/config.yaml ]; then
-    CONFIG_API_URL="$(awk "$read_reach_api_url_awk" /etc/reach/config.yaml)"
-  elif sudo -n test -r /etc/reach/config.yaml 2>/dev/null; then
-    CONFIG_API_URL="$(sudo awk "$read_reach_api_url_awk" /etc/reach/config.yaml)"
-  fi
-fi
-if [ -z "$CONFIG_API_URL" ] || [ "$CONFIG_API_URL" = "https://tunnels.your-domain.example" ]; then
-  echo "[deploy] ERROR: could not determine real Reach API URL. Set REACH_API_URL or configure default_hub.api_url in /etc/reach/config.yaml." >&2
-  exit 1
-fi
-case "$CONFIG_API_URL" in
-  http://*|https://*) ;;
-  *) echo "[deploy] ERROR: invalid Reach API URL: $CONFIG_API_URL" >&2; exit 1 ;;
+case "$LISTEN_ADDR" in
+  127.0.0.1:*|localhost:*) ;;
+  *) echo "[deploy] ERROR: refusing listen_addr not accepted by Reach: $LISTEN_ADDR" >&2; exit 1 ;;
 esac
-CONFIG_API_URL_SED="$(printf '%s' "$CONFIG_API_URL" | sed 's/[&|\\]/\\&/g')"
-AGENT_VERSION_SED="$(printf '%s' "$AGENT_VERSION" | sed 's/[&|\\]/\\&/g')"
-sed \
-  -e "s|^REACH_AGENT_VERSION=.*|REACH_AGENT_VERSION=\"\${REACH_AGENT_VERSION:-${AGENT_VERSION_SED}}\"|" \
-  -e "s|^API_URL=.*|API_URL=\"\${REACH_API_URL:-${CONFIG_API_URL_SED}}\"|" \
-  -e "s|https://tunnels.your-domain.example|${CONFIG_API_URL_SED}|g" \
-  setup.sh > /tmp/reach-setup.sh
-sed \
-  -e "s|\"https://tunnels.your-domain.example\"|\"${CONFIG_API_URL_SED}\"|g" \
-  -e "s|\"0.1.0-alpha\"|\"${AGENT_VERSION_SED}\"|g" \
-  setup.ps1 > /tmp/reach-setup.ps1
-if grep -q 'tunnels.your-domain.example' /tmp/reach-setup.sh; then
-  echo "[deploy] ERROR: setup.sh still contains placeholder API URL after rendering" >&2
+
+export FNM_PATH="$HOME/.local/share/fnm"
+if [ -d "$FNM_PATH" ]; then
+  export PATH="$FNM_PATH:$PATH"
+  eval "$(fnm env --shell bash)"
+  fnm use 22 --silent-if-unchanged
+fi
+if [ "$(node --version | cut -d. -f1)" != "v22" ]; then
+  echo "[deploy] ERROR: dashboard build requires Node.js 22" >&2
   exit 1
 fi
-if grep -q 'tunnels.your-domain.example' /tmp/reach-setup.ps1; then
-  echo "[deploy] ERROR: setup.ps1 still contains placeholder API URL after rendering" >&2
-  exit 1
+
+echo "[deploy] building and staging dashboard..."
+(
+  cd dashboard
+  npm ci
+  npm run typecheck
+  npm test
+  npm run generate
+  test -f .output/public/index.html
+)
+sudo install -d -m 0755 "$DASHBOARD_STAGE"
+sudo cp -a dashboard/.output/public/. "$DASHBOARD_STAGE/"
+
+echo "[deploy] staging auxiliary binary..."
+CARRIER_ROLLBACK="/opt/reach/reach-ws-carrier.rollback.${DEPLOY_TS}"
+if sudo test -f /opt/reach/reach-ws-carrier; then
+  sudo cp -a /opt/reach/reach-ws-carrier "$CARRIER_ROLLBACK"
+  CARRIER_ROLLBACK_ARMED=1
 fi
-if ! grep -Fq "$CONFIG_API_URL" /tmp/reach-setup.sh; then
-  echo "[deploy] ERROR: setup.sh does not contain rendered API URL $CONFIG_API_URL" >&2
-  exit 1
+sudo install -m 0755 /tmp/reach-ws-carrier /opt/reach/reach-ws-carrier.candidate
+sudo mv -f /opt/reach/reach-ws-carrier.candidate /opt/reach/reach-ws-carrier
+rm -f /tmp/reach-ws-carrier
+
+if [ "$PUBLISH_AGENT_RELEASE" != 1 ]; then
+  echo "[deploy] skipping reach-agent release (set REACH_PUBLISH_AGENT_RELEASE=1 to publish one)"
 fi
-if ! grep -Fq "$CONFIG_API_URL" /tmp/reach-setup.ps1; then
-  echo "[deploy] ERROR: setup.ps1 does not contain rendered API URL $CONFIG_API_URL" >&2
-  exit 1
-fi
-if ! grep -Fq "$AGENT_VERSION" /tmp/reach-setup.sh; then
-  echo "[deploy] ERROR: setup.sh does not contain rendered agent version $AGENT_VERSION" >&2
-  exit 1
-fi
-if ! grep -Fq "$AGENT_VERSION" /tmp/reach-setup.ps1; then
-  echo "[deploy] ERROR: setup.ps1 does not contain rendered agent version $AGENT_VERSION" >&2
-  exit 1
-fi
-sudo install -m 0644 /tmp/reach-setup.sh /var/lib/reach/setup.sh
-sudo install -m 0644 /tmp/reach-setup.ps1 /var/lib/reach/setup.ps1
-rm -f /tmp/reach-setup.sh /tmp/reach-setup.ps1
 
 echo "[deploy] ensuring Go WebSocket carrier service..."
 if ! id reach-wstunnel >/dev/null 2>&1; then
@@ -280,30 +366,175 @@ sudo systemctl daemon-reload
 sudo systemctl disable --now reach-wstunnel.service 2>/dev/null || true
 sudo systemctl enable --now reach-ws-carrier.service
 
-echo "[deploy] deploying dashboard..."
-export FNM_PATH="$HOME/.local/share/fnm"
-if [ -d "$FNM_PATH" ]; then
-  export PATH="$FNM_PATH:$PATH"
-  eval "$(fnm env --shell bash)"
-  fnm use 22 --silent-if-unchanged 2>/dev/null || true
-fi
-cd dashboard
-npm install --silent 2>/dev/null
-npx nuxt generate 2>&1 | tail -1
-if [ -f .output/public/index.html ]; then
-  sudo cp -r .output/public/* /opt/reach-dashboard/
-  echo "[deploy] dashboard built and deployed"
+echo "[deploy] swapping dashboard into place..."
+if sudo test -d /opt/reach-dashboard; then
+  DASHBOARD_SWAP_ARMED=1
+  sudo "$UV_BIN" run --script scripts/atomic-directory-swap.py "$DASHBOARD_STAGE" /opt/reach-dashboard
+  sudo mv "$DASHBOARD_STAGE" "$DASHBOARD_BACKUP"
+  DASHBOARD_STAGE=""
 else
-  echo "[deploy] ERROR: dashboard build failed, index.html missing!"
-  exit 1
+  sudo "$UV_BIN" run --script scripts/atomic-directory-swap.py "$DASHBOARD_STAGE" /opt/reach-dashboard
+  DASHBOARD_STAGE=""
 fi
-cd ..
 
-echo "[deploy] restarting services..."
-sudo systemctl restart reachd
+echo "[deploy] stopping reachd for a consistent database backup..."
+SERVICE_STOPPED=1
+sudo systemctl stop reachd
+if systemctl is-active --quiet reachd; then
+  echo "[deploy] ERROR: reachd did not stop cleanly" >&2
+  false
+fi
+DB_BACKUP_DIR="$(dirname "$DB_PATH")/backups"
+DB_BACKUP_PATH="${DB_BACKUP_DIR}/$(basename "$DB_PATH").${DEPLOY_TS}"
+sudo install -d -m 0700 "$DB_BACKUP_DIR"
+sudo sqlite3 "$DB_PATH" ".timeout 10000" ".backup '$DB_BACKUP_PATH'"
+if [ "$(sudo sqlite3 "$DB_BACKUP_PATH" 'PRAGMA quick_check;')" != "ok" ]; then
+  echo "[deploy] ERROR: backup database failed PRAGMA quick_check" >&2
+  false
+fi
+if [ "$(sudo sqlite3 "$DB_PATH" 'PRAGMA quick_check;')" != "ok" ]; then
+  echo "[deploy] ERROR: live database failed PRAGMA quick_check" >&2
+  false
+fi
+echo "[deploy] database backup: $DB_BACKUP_PATH"
+
+REACHD_ROLLBACK="/opt/reach/reachd.rollback.${DEPLOY_TS}"
+if sudo test -f /opt/reach/reachd; then
+  sudo cp -a /opt/reach/reachd "$REACHD_ROLLBACK"
+  ROLLBACK_ARMED=1
+fi
+sudo install -m 0755 /tmp/reachd-build /opt/reach/reachd.candidate
+sudo mv -f /opt/reach/reachd.candidate /opt/reach/reachd
+rm -f /tmp/reachd-build
+
+sudo systemctl start reachd
+SERVICE_STOPPED=0
+for attempt in $(seq 1 30); do
+  if systemctl is-active --quiet reachd && "$UV_BIN" run --script scripts/check-local-service.py "$LISTEN_ADDR"; then
+    break
+  fi
+  if [ "$attempt" -eq 30 ]; then
+    echo "[deploy] ERROR: reachd did not become healthy at $LISTEN_ADDR" >&2
+    sudo journalctl -u reachd -n 80 --no-pager >&2 || true
+    false
+  fi
+  sleep 1
+done
+echo "[deploy] running reachd database readiness check..."
+sudo /opt/reach/reachd db-check --config /etc/reach/config.yaml
+
+echo "[deploy] restarting WebSocket carrier..."
 sudo systemctl restart reach-ws-carrier.service
-sleep 2
-systemctl is-active reachd
 systemctl is-active reach-ws-carrier.service
 
-echo "[deploy] done. Published reach-agent v${AGENT_VERSION}."
+if [ "$PUBLISH_AGENT_RELEASE" = 1 ]; then
+  echo "[deploy] staging reach-agent v${AGENT_VERSION} publication..."
+  sudo install -d -m 0755 "$AGENT_DOWNLOAD_ROOT"
+  if sudo test -e "$AGENT_STAGING_DIR"; then
+    sudo mv "$AGENT_STAGING_DIR" "$AGENT_STAGING_DIR.abandoned.$DEPLOY_TS"
+  fi
+  sudo install -d -m 0755 "$AGENT_STAGING_DIR"
+  for artifact in \
+    reach-agent_linux_amd64 reach-agent_linux_arm64 reach-agent_linux_386 \
+    reach-agent_linux_armv6 reach-agent_linux_armv7 reach-agent_darwin_amd64 \
+    reach-agent_darwin_arm64 reach-agent_windows_amd64.exe reach-agent_windows_arm64.exe; do
+    sudo install -m 0755 "$ARTIFACT_DIR/$artifact" "$AGENT_STAGING_DIR/$artifact"
+  done
+  sudo install -m 0644 "$ARTIFACT_DIR/checksums.txt" "$AGENT_STAGING_DIR/checksums.txt"
+  sudo install -m 0644 "$ARTIFACT_DIR/manifest.json" "$AGENT_STAGING_DIR/manifest.json"
+  sudo install -m 0644 "$ARTIFACT_DIR/manifest.json.minisig" "$AGENT_STAGING_DIR/manifest.json.minisig"
+
+  CONFIG_API_URL="${REACH_API_URL:-}"
+  if [ -z "$CONFIG_API_URL" ]; then
+    if [ -r /etc/reach/config.yaml ]; then
+      CONFIG_API_URL="$("$UV_BIN" run --script scripts/read-reach-config.py --config /etc/reach/config.yaml default_hub.api_url)"
+    else
+      CONFIG_API_URL="$(sudo "$UV_BIN" run --script scripts/read-reach-config.py --config /etc/reach/config.yaml default_hub.api_url)"
+    fi
+  fi
+  if [ -z "$CONFIG_API_URL" ] || [ "$CONFIG_API_URL" = "https://tunnels.your-domain.example" ]; then
+    echo "[deploy] ERROR: could not determine real Reach API URL" >&2
+    false
+  fi
+  case "$CONFIG_API_URL" in
+    http://*|https://*) ;;
+    *) echo "[deploy] ERROR: invalid Reach API URL: $CONFIG_API_URL" >&2; false ;;
+  esac
+  CONFIG_API_URL_SED="$(printf '%s' "$CONFIG_API_URL" | sed 's/[&|\\]/\\&/g')"
+  AGENT_VERSION_SED="$(printf '%s' "$AGENT_VERSION" | sed 's/[&|\\]/\\&/g')"
+  sed \
+    -e "s|^REACH_AGENT_VERSION=.*|REACH_AGENT_VERSION=\"\${REACH_AGENT_VERSION:-${AGENT_VERSION_SED}}\"|" \
+    -e "s|^API_URL=.*|API_URL=\"\${REACH_API_URL:-${CONFIG_API_URL_SED}}\"|" \
+    -e "s|https://tunnels.your-domain.example|${CONFIG_API_URL_SED}|g" \
+    setup.sh > /tmp/reach-setup.sh
+  sed \
+    -e "s|\"https://tunnels.your-domain.example\"|\"${CONFIG_API_URL_SED}\"|g" \
+    -e "s|\"0.1.0-alpha\"|\"${AGENT_VERSION_SED}\"|g" \
+    setup.ps1 > /tmp/reach-setup.ps1
+  grep -Fq "$CONFIG_API_URL" /tmp/reach-setup.sh
+  grep -Fq "$CONFIG_API_URL" /tmp/reach-setup.ps1
+  grep -Fq "$AGENT_VERSION" /tmp/reach-setup.sh
+  grep -Fq "$AGENT_VERSION" /tmp/reach-setup.ps1
+  printf '%s\n' "$AGENT_VERSION" > /tmp/reach-latest-version
+  printf '{"version":"%s","api_url":"%s","created_at":"%s"}\n' \
+    "$AGENT_VERSION" "$CONFIG_API_URL" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /tmp/reach-latest.json
+
+  PUBLICATION_BACKUP_DIR="/var/lib/reach/deploy-backups/agent-publication.${DEPLOY_TS}"
+  sudo install -d -m 0700 "$PUBLICATION_BACKUP_DIR"
+  for source in \
+    /opt/reach/reach-agent /var/lib/reach/setup.sh /var/lib/reach/setup.ps1 \
+    "$AGENT_DOWNLOAD_ROOT/latest.txt" "$AGENT_DOWNLOAD_ROOT/latest.json"; do
+    if sudo test -f "$source"; then
+      case "$source" in
+        /opt/reach/reach-agent) AGENT_BIN_EXISTED=1 ;;
+        /var/lib/reach/setup.sh) SETUP_SH_EXISTED=1 ;;
+        /var/lib/reach/setup.ps1) SETUP_PS1_EXISTED=1 ;;
+        "$AGENT_DOWNLOAD_ROOT/latest.txt") LATEST_TXT_EXISTED=1 ;;
+        "$AGENT_DOWNLOAD_ROOT/latest.json") LATEST_JSON_EXISTED=1 ;;
+      esac
+      sudo cp -a "$source" "$PUBLICATION_BACKUP_DIR/$(basename "$source")"
+    fi
+  done
+  AGENT_BIN_BACKUP="$PUBLICATION_BACKUP_DIR/reach-agent"
+  SETUP_SH_BACKUP="$PUBLICATION_BACKUP_DIR/setup.sh"
+  SETUP_PS1_BACKUP="$PUBLICATION_BACKUP_DIR/setup.ps1"
+  LATEST_TXT_BACKUP="$PUBLICATION_BACKUP_DIR/latest.txt"
+  LATEST_JSON_BACKUP="$PUBLICATION_BACKUP_DIR/latest.json"
+
+  sudo install -m 0755 "$ARTIFACT_DIR/reach-agent_linux_amd64" /opt/reach/reach-agent.candidate
+  sudo install -m 0644 /tmp/reach-setup.sh /var/lib/reach/setup.sh.candidate
+  sudo install -m 0644 /tmp/reach-setup.ps1 /var/lib/reach/setup.ps1.candidate
+  sudo install -m 0644 /tmp/reach-latest-version "$AGENT_DOWNLOAD_ROOT/latest.txt.candidate"
+  sudo install -m 0644 /tmp/reach-latest.json "$AGENT_DOWNLOAD_ROOT/latest.json.candidate"
+
+  PUBLICATION_ARMED=1
+  if sudo test -e "$AGENT_DOWNLOAD_DIR"; then
+    AGENT_VERSION_BACKUP="$AGENT_DOWNLOAD_DIR.replaced.$DEPLOY_TS"
+    sudo mv "$AGENT_DOWNLOAD_DIR" "$AGENT_VERSION_BACKUP"
+  fi
+  sudo mv "$AGENT_STAGING_DIR" "$AGENT_DOWNLOAD_DIR"
+  sudo mv -f /opt/reach/reach-agent.candidate /opt/reach/reach-agent
+  sudo mv -f /var/lib/reach/setup.sh.candidate /var/lib/reach/setup.sh
+  sudo mv -f /var/lib/reach/setup.ps1.candidate /var/lib/reach/setup.ps1
+  sudo mv -f "$AGENT_DOWNLOAD_ROOT/latest.txt.candidate" "$AGENT_DOWNLOAD_ROOT/latest.txt"
+  sudo mv -f "$AGENT_DOWNLOAD_ROOT/latest.json.candidate" "$AGENT_DOWNLOAD_ROOT/latest.json"
+  PUBLICATION_ARMED=0
+  rm -f /tmp/reach-latest-version /tmp/reach-latest.json /tmp/reach-setup.sh /tmp/reach-setup.ps1
+fi
+
+ROLLBACK_ARMED=0
+CARRIER_ROLLBACK_ARMED=0
+DASHBOARD_SWAP_ARMED=0
+
+echo "[deploy] pruning deployment backups (retain $BACKUP_RETAIN)..."
+sudo "$UV_BIN" run --script scripts/prune-deploy-backups.py --retain "$BACKUP_RETAIN" \
+  '/opt/reach-dashboard.backup.*' \
+  '/opt/reach/reachd.rollback.*' \
+  '/opt/reach/reach-ws-carrier.rollback.*' \
+  "$DB_BACKUP_DIR/$(basename "$DB_PATH").*"
+
+if [ "$PUBLISH_AGENT_RELEASE" = 1 ]; then
+  echo "[deploy] done. Published reach-agent v${AGENT_VERSION}."
+else
+  echo "[deploy] done. reachd and dashboard updated; reach-agent release unchanged."
+fi

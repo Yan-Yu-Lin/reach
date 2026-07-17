@@ -27,3 +27,31 @@ jobs:
 
       - name: Build linux/amd64 static
         run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ./...
+
+  dashboard:
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: dashboard
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Generate static dashboard
+        run: npm run generate

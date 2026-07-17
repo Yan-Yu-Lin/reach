@@ -410,20 +410,20 @@ const dotClass = computed(() => {
 })
 
 const hubLabel = computed(() => {
-  if (!props.item?.tunnels.length) return 'hub'
-  return props.item.tunnels[0].hub_id
+  const tunnel = props.item?.tunnels[0]
+  return tunnel?.hub_id || 'hub'
 })
 
 const hubPort = computed(() => '443')
 
 const tunnelUser = computed(() => {
-  if (!props.item?.tunnels.length) return 'rt-???'
-  return props.item.tunnels[0].original_unix_user || props.item.tunnels[0].unix_user
+  const tunnel = props.item?.tunnels[0]
+  return tunnel?.original_unix_user || tunnel?.unix_user || 'rt-???'
 })
 
 const tunnelPort = computed(() => {
-  if (!props.item?.tunnels.length) return '?'
-  return props.item.tunnels[0].original_remote_port || props.item.tunnels[0].remote_port
+  const tunnel = props.item?.tunnels[0]
+  return tunnel?.original_remote_port || tunnel?.remote_port || '?'
 })
 
 const hubProbeOk = computed(() => {

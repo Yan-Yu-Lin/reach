@@ -26,15 +26,66 @@ func OpenStore(path string) (*Store, error) {
 		_ = f.Close()
 		_ = os.Chmod(path, 0o600)
 	}
-	db, err := sql.Open("sqlite", path+"?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)")
+	db, err := sql.Open("sqlite", path+"?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)")
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(1)
+	db.SetMaxOpenConns(4)
+	db.SetMaxIdleConns(4)
+	pingCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := db.PingContext(pingCtx); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("open sqlite database: %w", err)
+	}
 	return &Store{db: db}, nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }
+
+func (s *Store) CheckReady(ctx context.Context) error {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire database connection: %w", err)
+	}
+	defer conn.Close()
+
+	var quickCheck string
+	if err := conn.QueryRowContext(ctx, `PRAGMA quick_check(1)`).Scan(&quickCheck); err != nil {
+		return fmt.Errorf("sqlite quick_check: %w", err)
+	}
+	if quickCheck != "ok" {
+		return fmt.Errorf("sqlite quick_check: %s", quickCheck)
+	}
+	var foreignKeys, busyTimeout int
+	var journalMode string
+	if err := conn.QueryRowContext(ctx, `PRAGMA foreign_keys`).Scan(&foreignKeys); err != nil {
+		return fmt.Errorf("read foreign_keys pragma: %w", err)
+	}
+	if err := conn.QueryRowContext(ctx, `PRAGMA busy_timeout`).Scan(&busyTimeout); err != nil {
+		return fmt.Errorf("read busy_timeout pragma: %w", err)
+	}
+	if err := conn.QueryRowContext(ctx, `PRAGMA journal_mode`).Scan(&journalMode); err != nil {
+		return fmt.Errorf("read journal_mode pragma: %w", err)
+	}
+	if foreignKeys != 1 {
+		return errors.New("sqlite foreign_keys pragma is disabled")
+	}
+	if busyTimeout < 5000 {
+		return fmt.Errorf("sqlite busy_timeout is %dms, want at least 5000ms", busyTimeout)
+	}
+	if !strings.EqualFold(journalMode, "wal") {
+		return fmt.Errorf("sqlite journal_mode is %q, want WAL", journalMode)
+	}
+	var tables int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('machines','events','jwt_blacklist')`).Scan(&tables); err != nil {
+		return fmt.Errorf("check database schema: %w", err)
+	}
+	if tables != 3 {
+		return errors.New("database schema is incomplete; run reachd serve to migrate it")
+	}
+	return nil
+}
 
 func (s *Store) Migrate(ctx context.Context, cfg Config) error {
 	stmts := []string{
@@ -236,7 +287,9 @@ func (s *Store) Migrate(ctx context.Context, cfg Config) error {
 		`CREATE INDEX IF NOT EXISTS idx_tunnels_status ON tunnels(status);`,
 		`CREATE INDEX IF NOT EXISTS idx_requests_status ON requests(status);`,
 		`CREATE INDEX IF NOT EXISTS idx_agent_commands_machine_status ON agent_commands(machine_id,status);`,
+		`CREATE INDEX IF NOT EXISTS idx_agent_commands_delivery ON agent_commands(machine_id,status,sent_at,created_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at);`,
+		`CREATE INDEX IF NOT EXISTS idx_hub_observations_machine_probe ON hub_observations(machine_id,last_probe_at DESC);`,
 		`CREATE INDEX IF NOT EXISTS idx_jwt_blacklist_expires ON jwt_blacklist(expires_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_rate_limits_reset ON rate_limits(reset_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_service_tokens_hash ON service_tokens(token_hash);`,
@@ -291,7 +344,6 @@ func (s *Store) releaseRetiredSlugs(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
 	type retired struct{ id, slug, original string }
 	var retiredRows []retired
 	for rows.Next() {
@@ -300,6 +352,9 @@ func (s *Store) releaseRetiredSlugs(ctx context.Context) error {
 			return err
 		}
 		retiredRows = append(retiredRows, r)
+	}
+	if err := rows.Close(); err != nil {
+		return err
 	}
 	if err := rows.Err(); err != nil {
 		return err
@@ -357,7 +412,6 @@ func (s *Store) releaseRetiredTunnels(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
 	type retiredTunnel struct {
 		id       string
 		hubID    string
@@ -371,6 +425,9 @@ func (s *Store) releaseRetiredTunnels(ctx context.Context) error {
 			return err
 		}
 		retired = append(retired, t)
+	}
+	if err := rows.Close(); err != nil {
+		return err
 	}
 	if err := rows.Err(); err != nil {
 		return err
@@ -405,7 +462,7 @@ func (s *Store) ensureColumn(ctx context.Context, table, column, decl string) er
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	found := false
 	for rows.Next() {
 		var cid int
 		var name, typ string
@@ -413,14 +470,22 @@ func (s *Store) ensureColumn(ctx context.Context, table, column, decl string) er
 		var dflt any
 		var pk int
 		if err := rows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk); err != nil {
+			_ = rows.Close()
 			return err
 		}
 		if name == column {
-			return rows.Err()
+			found = true
+			break
 		}
+	}
+	if err := rows.Close(); err != nil {
+		return err
 	}
 	if err := rows.Err(); err != nil {
 		return err
+	}
+	if found {
+		return nil
 	}
 	_, err = s.db.ExecContext(ctx, fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, table, column, decl))
 	return err

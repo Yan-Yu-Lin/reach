@@ -157,6 +157,15 @@ func (a Agent) stream(ctx context.Context, lastID *string) error {
 		}
 		switch ev.Type {
 		case "hello":
+		case "machine.resync_required":
+			a.log.Printf("server requested event resync; resetting cursor and syncing SSH config")
+			if lastID != nil {
+				*lastID = ""
+				a.writeLastEventID("")
+			}
+			if err := a.Sync(ctx); err != nil {
+				a.log.Printf("resync failed: %v", err)
+			}
 		case "ssh_config.changed", "machine.created", "machine.desired_changed", "machine.observed_changed", "machine.online", "machine.degraded", "machine.offline", "machine.gone", "machine.disabled", "machine.enabled", "machine.retiring", "machine.retired":
 			a.log.Printf("event %s id=%s; syncing SSH config", ev.Type, ev.ID)
 			if err := a.Sync(ctx); err != nil {

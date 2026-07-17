@@ -67,6 +67,16 @@
 
     <!-- Stage -->
     <main class="stage" ref="stageRef">
+      <div v-if="loading && machines.length === 0" class="load-state" role="status">
+        Loading dashboard data...
+      </div>
+      <div v-if="fleetError" class="load-state error" role="alert">
+        <span>{{ fleetError }}</span>
+        <button class="btn btn-sm" :disabled="loading" @click="fleet.refresh">
+          {{ loading ? 'Retrying...' : 'Retry' }}
+        </button>
+      </div>
+
       <!-- Summary (no selection, not settings) -->
       <template v-if="!selectedId && !showSettings">
         <div class="summary-stats">
@@ -245,7 +255,6 @@
 </template>
 
 <script setup lang="ts">
-useRequireAuth()
 const api = useReachApi()
 const sse = useSSE()
 const fleet = useFleet()
@@ -324,6 +333,7 @@ function flatIndex(groupIdx: number, itemIdx: number): number {
   let idx = 0
   for (let g = 0; g < groupIdx; g++) {
     const group = filteredGroups.value[g]
+    if (!group) continue
     if (group.collapsed && !expandedGroups.has(group.label)) continue
     idx += group.machines.length
   }
@@ -411,7 +421,7 @@ function getWarnings(req: RequestRow): string[] {
 }
 
 async function logout() {
-  sse.stop()
+  fleet.dispose()
   try {
     await api.logout()
   } catch {
@@ -491,8 +501,8 @@ function onKeydown(e: KeyboardEvent) {
 let timeInterval: ReturnType<typeof setInterval> | undefined
 
 onMounted(async () => {
-  await fleet.refresh()
   fleet.setupSSE()
+  await fleet.refresh()
   document.addEventListener('keydown', onKeydown)
   checkMobile()
   window.addEventListener('resize', checkMobile)
@@ -504,7 +514,7 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
-  sse.stop()
+  fleet.dispose()
   document.removeEventListener('keydown', onKeydown)
   window.removeEventListener('resize', checkMobile)
   if (timeInterval) clearInterval(timeInterval)

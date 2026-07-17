@@ -19,7 +19,10 @@ import (
 	"unicode/utf8"
 )
 
-const maxProcessTitleConfigBytes = 4096
+const (
+	maxProcessTitleConfigBytes = 4096
+	eventRetention             = 7 * 24 * time.Hour
+)
 
 type Provisioner struct {
 	store *Store
@@ -658,6 +661,73 @@ func (p *Provisioner) getMachineAndTunnels(ctx context.Context, idOrSlug string)
 	return m, tunnels, rows.Err()
 }
 
+func (p *Provisioner) GetMachineDetail(ctx context.Context, idOrSlug string) (MachineWithTunnels, error) {
+	m, tunnels, err := p.getMachineAndTunnels(ctx, idOrSlug)
+	if err != nil {
+		return MachineWithTunnels{}, err
+	}
+	agent, err := p.loadAgentObservation(ctx, m.ID)
+	if err != nil {
+		return MachineWithTunnels{}, err
+	}
+	hub, err := p.loadHubObservation(ctx, m.ID)
+	if err != nil {
+		return MachineWithTunnels{}, err
+	}
+	commands, err := p.loadMachineOpenCommands(ctx, m.ID)
+	if err != nil {
+		return MachineWithTunnels{}, err
+	}
+	var update *AgentUpdateHint
+	if agent != nil {
+		update = agentUpdateHintFor(p.cfg, agent.AgentVersion)
+	}
+	return MachineWithTunnels{Machine: m, Tunnels: tunnels, Agent: agent, HubObservation: hub, Commands: commands, Update: update}, nil
+}
+
+func (p *Provisioner) loadAgentObservation(ctx context.Context, machineID string) (*AgentObservation, error) {
+	a, err := scanAgentObservation(p.store.db.QueryRowContext(ctx, `SELECT machine_id,agent_version,install_id,applied_generation,heartbeat_at,agent_state,transport,transport_state,local_ssh_state,local_ssh_error,tunnel_state,tunnel_pid,tunnel_error,persistence_backend,persistence_quality,persistence_reboot_safe,authorized_key_fingerprints,last_error FROM agent_observations WHERE machine_id=?`, machineID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &a, nil
+}
+
+func (p *Provisioner) loadHubObservation(ctx context.Context, machineID string) (*HubObservation, error) {
+	var h HubObservation
+	var ok, probeErr sql.NullString
+	err := p.store.db.QueryRowContext(ctx, `SELECT tunnel_id,machine_id,probe_state,last_probe_at,last_success_at,probe_error FROM hub_observations WHERE machine_id=? ORDER BY last_probe_at DESC LIMIT 1`, machineID).Scan(&h.TunnelID, &h.MachineID, &h.ProbeState, &h.LastProbeAt, &ok, &probeErr)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	h.LastSuccessAt = stringPtrFromNull(ok)
+	h.ProbeError = probeErr.String
+	return &h, nil
+}
+
+func (p *Provisioner) loadMachineOpenCommands(ctx context.Context, machineID string) ([]AgentCommandInfo, error) {
+	rows, err := p.store.db.QueryContext(ctx, `SELECT id,machine_id,generation,type,payload_json,status,created_at,sent_at,acked_at,expires_at,last_error FROM agent_commands WHERE machine_id=? AND status IN ('pending','sent','failed') ORDER BY created_at`, machineID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AgentCommandInfo
+	for rows.Next() {
+		c, err := scanAgentCommand(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
 func (p *Provisioner) ListMachines(ctx context.Context) ([]MachineWithTunnels, error) {
 	rows, err := p.store.db.QueryContext(ctx, `SELECT `+machineCols+` FROM machines ORDER BY created_at DESC`)
 	if err != nil {
@@ -721,48 +791,58 @@ func (p *Provisioner) ListMachines(ctx context.Context) ([]MachineWithTunnels, e
 }
 
 func (p *Provisioner) loadAgentObservations(ctx context.Context) (map[string]*AgentObservation, error) {
-	rows, err := p.store.db.QueryContext(ctx, `SELECT machine_id,agent_version,install_id,applied_generation,heartbeat_at,agent_state,transport,transport_state,local_ssh_state,local_ssh_error,tunnel_state,tunnel_pid,tunnel_error,persistence_backend,persistence_quality,persistence_reboot_safe,authorized_key_fingerprints,last_error,raw_json FROM agent_observations`)
+	rows, err := p.store.db.QueryContext(ctx, `SELECT machine_id,agent_version,install_id,applied_generation,heartbeat_at,agent_state,transport,transport_state,local_ssh_state,local_ssh_error,tunnel_state,tunnel_pid,tunnel_error,persistence_backend,persistence_quality,persistence_reboot_safe,authorized_key_fingerprints,last_error FROM agent_observations`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	out := map[string]*AgentObservation{}
 	for rows.Next() {
-		var a AgentObservation
-		var agentVersion, installID, agentState, transport, transportState, localSSHState, localSSHError, tunnelState, tunnelError, persistenceBackend, persistenceQuality, lastError sql.NullString
-		var pid sql.NullInt64
-		var keyFP, raw sql.NullString
-		var reboot int
-		if err := rows.Scan(&a.MachineID, &agentVersion, &installID, &a.AppliedGeneration, &a.HeartbeatAt, &agentState, &transport, &transportState, &localSSHState, &localSSHError, &tunnelState, &pid, &tunnelError, &persistenceBackend, &persistenceQuality, &reboot, &keyFP, &lastError, &raw); err != nil {
+		a, err := scanAgentObservation(rows)
+		if err != nil {
 			return nil, err
-		}
-		a.AgentVersion = agentVersion.String
-		a.InstallID = installID.String
-		a.AgentState = agentState.String
-		a.Transport = transport.String
-		a.TransportState = transportState.String
-		a.LocalSSHState = localSSHState.String
-		a.LocalSSHError = localSSHError.String
-		a.TunnelState = tunnelState.String
-		a.TunnelError = tunnelError.String
-		a.PersistenceBackend = persistenceBackend.String
-		a.PersistenceQuality = persistenceQuality.String
-		a.LastError = lastError.String
-		a.TunnelPID = intPtrFromNull(pid)
-		a.PersistenceRebootSafe = reboot != 0
-		if keyFP.Valid {
-			a.AuthorizedKeyFingerprints = json.RawMessage(keyFP.String)
-		}
-		if raw.Valid {
-			a.RawJSON = json.RawMessage(raw.String)
 		}
 		out[a.MachineID] = &a
 	}
 	return out, rows.Err()
 }
 
+func scanAgentObservation(rows interface{ Scan(dest ...any) error }) (AgentObservation, error) {
+	var a AgentObservation
+	var agentVersion, installID, agentState, transport, transportState, localSSHState, localSSHError, tunnelState, tunnelError, persistenceBackend, persistenceQuality, lastError sql.NullString
+	var pid sql.NullInt64
+	var keyFP sql.NullString
+	var reboot int
+	err := rows.Scan(&a.MachineID, &agentVersion, &installID, &a.AppliedGeneration, &a.HeartbeatAt, &agentState, &transport, &transportState, &localSSHState, &localSSHError, &tunnelState, &pid, &tunnelError, &persistenceBackend, &persistenceQuality, &reboot, &keyFP, &lastError)
+	if err != nil {
+		return a, err
+	}
+	a.AgentVersion = agentVersion.String
+	a.InstallID = installID.String
+	a.AgentState = agentState.String
+	a.Transport = transport.String
+	a.TransportState = transportState.String
+	a.LocalSSHState = localSSHState.String
+	a.LocalSSHError = localSSHError.String
+	a.TunnelState = tunnelState.String
+	a.TunnelError = tunnelError.String
+	a.PersistenceBackend = persistenceBackend.String
+	a.PersistenceQuality = persistenceQuality.String
+	a.LastError = lastError.String
+	a.TunnelPID = intPtrFromNull(pid)
+	a.PersistenceRebootSafe = reboot != 0
+	if keyFP.Valid {
+		a.AuthorizedKeyFingerprints = json.RawMessage(keyFP.String)
+	}
+	return a, nil
+}
+
 func (p *Provisioner) loadHubObservations(ctx context.Context) (map[string]*HubObservation, error) {
-	rows, err := p.store.db.QueryContext(ctx, `SELECT tunnel_id,machine_id,probe_state,last_probe_at,last_success_at,probe_error FROM hub_observations`)
+	rows, err := p.store.db.QueryContext(ctx, `SELECT tunnel_id,machine_id,probe_state,last_probe_at,last_success_at,probe_error FROM (
+		SELECT tunnel_id,machine_id,probe_state,last_probe_at,last_success_at,probe_error,
+			ROW_NUMBER() OVER (PARTITION BY machine_id ORDER BY last_probe_at DESC,tunnel_id DESC) AS row_num
+		FROM hub_observations
+	) WHERE row_num=1`)
 	if err != nil {
 		return nil, err
 	}
@@ -972,7 +1052,17 @@ func (p *Provisioner) StartHealthLoop(ctx context.Context) {
 }
 
 func (p *Provisioner) ExpireOnce(ctx context.Context) error {
-	now := nowUTC()
+	nowTime := time.Now().UTC()
+	now := nowTime.Format(time.RFC3339)
+	if _, err := p.store.db.ExecContext(ctx, `DELETE FROM jwt_blacklist WHERE expires_at<=?`, now); err != nil {
+		return err
+	}
+	if _, err := p.store.db.ExecContext(ctx, `DELETE FROM events WHERE created_at<?`, nowTime.Add(-eventRetention).Format(time.RFC3339)); err != nil {
+		return err
+	}
+	if _, err := p.store.db.ExecContext(ctx, `DELETE FROM rate_limits WHERE reset_at<=?`, now); err != nil {
+		return err
+	}
 	if _, err := p.store.db.ExecContext(ctx, `UPDATE requests SET status='expired' WHERE status IN ('pending','approved') AND expires_at < ?`, now); err != nil {
 		return err
 	}

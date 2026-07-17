@@ -907,7 +907,25 @@ code, pre { font-family: var(--font-mono); font-size: 13px; }
   padding: 1px 6px;
 }
 
-/* ── Empty state ── */
+/* ── Loading and empty states ── */
+
+.load-state {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 16px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--muted);
+  background: var(--surface);
+}
+
+.load-state.error {
+  border-color: var(--danger);
+  color: var(--danger);
+}
 
 .empty-state {
   text-align: center;

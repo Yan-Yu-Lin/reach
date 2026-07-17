@@ -34,6 +34,8 @@ func runCLI(ctx context.Context, args []string) error {
 		return cliSSHConfig(ctx, args[1:])
 	case "health":
 		return cliHealth(ctx, args[1:])
+	case "db-check":
+		return cliDBCheck(ctx, args[1:])
 	case "hash-secret":
 		return cliHashSecret(args[1:])
 	case "ws-server":
@@ -231,6 +233,32 @@ func cliHealth(ctx context.Context, args []string) error {
 	return nil
 }
 
+func cliDBCheck(ctx context.Context, args []string) error {
+	fs, cfgPath := baseFS("db-check", args)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("usage: reachd db-check [--config path]")
+	}
+	cfg, err := LoadConfig(*cfgPath)
+	if err != nil {
+		return err
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	store, err := OpenStore(cfg.DBPath)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	if err := store.CheckReady(checkCtx); err != nil {
+		return err
+	}
+	fmt.Println("database ready")
+	return nil
+}
+
 func cliHashSecret(args []string) error {
 	fs := flag.NewFlagSet("hash-secret", flag.ContinueOnError)
 	stdin := fs.Bool("stdin", true, "read secret from stdin")
@@ -299,5 +327,6 @@ Usage:
   reachctl remove <slug-or-id>
   reachctl ssh-config
   reachctl health
+  reachd db-check [--config /etc/reach/config.yaml]
   printf 'secret' | reachd hash-secret`)
 }

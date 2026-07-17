@@ -5,13 +5,19 @@
   "scripts": {
     "dev": "nuxt dev --host 127.0.0.1 --port 3009",
     "build": "nuxt build",
-    "preview": "nuxt preview --host 127.0.0.1 --port 3009"
+    "preview": "nuxt preview --host 127.0.0.1 --port 3009",
+    "generate": "nuxt generate",
+    "typecheck": "nuxt typecheck",
+    "test": "vitest run"
   },
   "dependencies": {
     "nuxt": "^4.1.0",
     "vue": "^3.5.0"
   },
   "devDependencies": {
-    "typescript": "^5.9.0"
+    "@types/node": "^26.1.1",
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.4",
+    "vue-tsc": "^3.0.0"
   }
 }

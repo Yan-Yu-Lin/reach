@@ -10,6 +10,8 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -511,26 +513,65 @@ func (s *Server) handleAdminEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 	_, _ = fmt.Fprint(w, "retry: 2000\n\n")
-	if replay, err := s.events.ReplaySince(r.Context(), lastEventID(r), 500); err == nil {
+	ch, oldest, boundary, cancel, err := s.events.Subscribe(r.Context())
+	if err != nil {
+		return
+	}
+	defer cancel()
+	var cursor int64
+	if requestedCursor, ok := eventCursor(r); ok {
+		cursor = requestedCursor
+		if cursor > boundary || (oldest > 0 && cursor < oldest-1) {
+			_ = writeSSE(w, ReachEvent{Type: "machine.resync_required", Data: map[string]any{"reason": "cursor_out_of_range"}, CreatedAt: nowUTC()})
+			flusher.Flush()
+			return
+		}
+		replay, overflow, err := s.events.ReplayRange(r.Context(), cursor, boundary, eventReplayLimit)
+		if err != nil {
+			_ = writeSSE(w, ReachEvent{Type: "machine.resync_required", Data: map[string]any{"reason": "replay_failed"}, CreatedAt: nowUTC()})
+			flusher.Flush()
+			return
+		}
+		if overflow {
+			_ = writeSSE(w, ReachEvent{Type: "machine.resync_required", Data: map[string]any{"reason": "replay_overflow"}, CreatedAt: nowUTC()})
+			flusher.Flush()
+			return
+		}
 		for _, ev := range replay {
-			_ = writeSSE(w, ev)
+			if err := writeSSE(w, ev); err != nil {
+				return
+			}
+			if id, err := strconv.ParseInt(ev.ID, 10, 64); err == nil {
+				cursor = id
+			}
 		}
 	}
-	_ = writeSSE(w, ReachEvent{ID: "0", Type: "hello", Data: map[string]any{"ok": true}, CreatedAt: nowUTC()})
+	_ = writeSSE(w, ReachEvent{Type: "hello", Data: map[string]any{"ok": true}, CreatedAt: nowUTC()})
 	flusher.Flush()
-	ch, cancel := s.events.Subscribe()
-	defer cancel()
 	tick := time.NewTicker(25 * time.Second)
 	defer tick.Stop()
 	for {
 		select {
 		case <-r.Context().Done():
 			return
-		case ev := <-ch:
+		case ev, ok := <-ch:
+			if !ok {
+				return
+			}
+			id, err := strconv.ParseInt(ev.ID, 10, 64)
+			if err == nil && id <= cursor {
+				continue
+			}
 			if err := writeSSE(w, ev); err != nil {
 				return
 			}
 			flusher.Flush()
+			if ev.Type == "machine.resync_required" {
+				return
+			}
+			if err == nil {
+				cursor = id
+			}
 		case <-tick.C:
 			if err := writeSSEComment(w, "keepalive"); err != nil {
 				return
@@ -584,7 +625,11 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		s.publishEvent(r.Context(), "ssh_config.changed", m.ID, map[string]any{"reason": "ssh_compat_changed", "machine_id": m.ID})
 	}
 	s.maybeQueueAutoAgentUpdate(r.Context(), m, hb)
-	cmds := s.pendingCommands(r.Context(), m.ID)
+	cmds, err := s.pendingCommands(r.Context(), m.ID)
+	if err != nil {
+		writeErr(w, 500, "could not load pending commands")
+		return
+	}
 	resp := HeartbeatResponse{OK: true, ServerTime: now, DesiredGeneration: m.DesiredGeneration, DesiredState: m.DesiredState, Heartbeat: HeartbeatPolicy{NextIntervalSeconds: int(s.cfg.HealthInterval.Seconds()), OfflineAfterSeconds: int(s.cfg.OfflineAfter.Seconds())}, DesiredConfig: s.desiredConfig(r.Context(), m, tunnels), Commands: cmds, Update: agentUpdateHintFor(s.cfg, hb.AgentVersion)}
 	writeJSON(w, 200, resp)
 }
@@ -661,27 +706,67 @@ func (s *Server) storeCommandResults(ctx context.Context, hb AgentHeartbeat) {
 	}
 }
 
-func (s *Server) pendingCommands(ctx context.Context, machineID string) []AgentCommandDelivery {
-	rows, err := s.store.db.QueryContext(ctx, `SELECT id,generation,type,payload_json,expires_at FROM agent_commands WHERE machine_id=? AND status IN ('pending','sent') AND (expires_at IS NULL OR expires_at>?) ORDER BY created_at LIMIT 10`, machineID, nowUTC())
+const commandRetryLease = 30 * time.Second
+
+func (s *Server) pendingCommands(ctx context.Context, machineID string) ([]AgentCommandDelivery, error) {
+	now := time.Now().UTC()
+	nowText := now.Format(time.RFC3339)
+	retryBefore := now.Add(-commandRetryLease).Format(time.RFC3339)
+	tx, err := s.store.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil
+		return nil, err
 	}
-	defer rows.Close()
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `UPDATE agent_commands SET status='sent',sent_at=?
+		WHERE id IN (
+			SELECT id FROM agent_commands
+			WHERE machine_id=? AND (status='pending' OR (status='sent' AND (sent_at IS NULL OR sent_at<=?)))
+			AND (expires_at IS NULL OR expires_at>?)
+			ORDER BY created_at,id LIMIT 10
+		) AND (status='pending' OR (status='sent' AND (sent_at IS NULL OR sent_at<=?)))
+		RETURNING id,generation,type,payload_json,expires_at,created_at`, nowText, machineID, retryBefore, nowText, retryBefore)
+	if err != nil {
+		return nil, err
+	}
 	var out []AgentCommandDelivery
-	now := nowUTC()
+	var createdByID = map[string]string{}
 	for rows.Next() {
 		var c AgentCommandDelivery
 		var payload, exp sql.NullString
-		if rows.Scan(&c.ID, &c.Generation, &c.Type, &payload, &exp) == nil {
-			if payload.Valid {
-				c.Payload = json.RawMessage(payload.String)
-			}
-			c.ExpiresAt = exp.String
-			out = append(out, c)
-			_, _ = s.store.db.ExecContext(ctx, `UPDATE agent_commands SET status='sent', sent_at=COALESCE(sent_at,?) WHERE id=?`, now, c.ID)
+		var created string
+		if err := rows.Scan(&c.ID, &c.Generation, &c.Type, &payload, &exp, &created); err != nil {
+			_ = rows.Close()
+			return nil, err
 		}
+		if payload.Valid {
+			c.Payload = json.RawMessage(payload.String)
+		}
+		c.ExpiresAt = exp.String
+		createdByID[c.ID] = created
+		out = append(out, c)
 	}
-	return out
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(out) == 0 {
+		if err := tx.Commit(); err != nil {
+			return nil, err
+		}
+		return out, nil
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if createdByID[out[i].ID] == createdByID[out[j].ID] {
+			return out[i].ID < out[j].ID
+		}
+		return createdByID[out[i].ID] < createdByID[out[j].ID]
+	})
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (s *Server) desiredConfig(ctx context.Context, m Machine, tunnels []Tunnel) DesiredAgentConfig {
@@ -948,19 +1033,16 @@ func (s *Server) handleAdminMachineAction(w http.ResponseWriter, r *http.Request
 	}
 	claims := claimsFrom(r.Context())
 	if action == "" && r.Method == "GET" {
-		m, t, err := s.prov.getMachineAndTunnels(r.Context(), id)
-		if err != nil {
+		item, err := s.prov.GetMachineDetail(r.Context(), id)
+		if errors.Is(err, sql.ErrNoRows) {
 			writeErr(w, 404, "machine not found")
 			return
 		}
-		list, _ := s.prov.ListMachines(r.Context())
-		for _, item := range list {
-			if item.Machine.ID == m.ID {
-				writeJSON(w, 200, item)
-				return
-			}
+		if err != nil {
+			writeErr(w, 500, "query failed")
+			return
 		}
-		writeJSON(w, 200, MachineWithTunnels{Machine: m, Tunnels: t})
+		writeJSON(w, 200, item)
 		return
 	}
 	if r.Method != "POST" {
@@ -1267,7 +1349,11 @@ func validateMetadataValue(v any, depth int) error {
 func (s *Server) authenticateAdminToken(ctx context.Context, token string) (*Claims, string, error) {
 	claims, err := ParseJWT(s.cfg.JWTSecret, token)
 	if err == nil {
-		if s.isJWTBlacklisted(ctx, token) {
+		blacklisted, lookupErr := s.isJWTBlacklisted(ctx, token)
+		if lookupErr != nil {
+			return nil, "", lookupErr
+		}
+		if blacklisted {
 			return nil, "", errors.New("blacklisted token")
 		}
 		return claims, "jwt", nil
@@ -1309,17 +1395,21 @@ func (s *Server) revokeServiceToken(ctx context.Context, token string) error {
 
 func (s *Server) blacklistJWT(ctx context.Context, token string, expiresAt time.Time) error {
 	now := time.Now().UTC()
-	_, _ = s.store.db.ExecContext(ctx, `DELETE FROM jwt_blacklist WHERE expires_at<=?`, now.Format(time.RFC3339))
 	_, err := s.store.db.ExecContext(ctx, `INSERT OR REPLACE INTO jwt_blacklist (token_hash,expires_at,created_at) VALUES (?,?,?)`, TokenHash(token), expiresAt.UTC().Format(time.RFC3339), now.Format(time.RFC3339))
 	return err
 }
 
-func (s *Server) isJWTBlacklisted(ctx context.Context, token string) bool {
+func (s *Server) isJWTBlacklisted(ctx context.Context, token string) (bool, error) {
 	now := time.Now().UTC().Format(time.RFC3339)
-	_, _ = s.store.db.ExecContext(ctx, `DELETE FROM jwt_blacklist WHERE expires_at<=?`, now)
 	var found string
 	err := s.store.db.QueryRowContext(ctx, `SELECT token_hash FROM jwt_blacklist WHERE token_hash=? AND expires_at>?`, TokenHash(token), now).Scan(&found)
-	return err == nil
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *Server) Run(ctx context.Context) error {

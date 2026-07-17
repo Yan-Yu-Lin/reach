@@ -117,8 +117,31 @@ export function useReachApi() {
     const headers = new Headers(opts.headers || {})
     if (!headers.has('Content-Type') && opts.body) headers.set('Content-Type', 'application/json')
     if (token.value) headers.set('Authorization', `Bearer ${token.value}`)
-    const res = await fetch(`${apiBase}${path}`, { ...opts, headers })
-    const text = await res.text()
+
+    const timeoutController = new AbortController()
+    const timeout = setTimeout(() => timeoutController.abort(), 15_000)
+    const requestController = new AbortController()
+    const abortRequest = () => requestController.abort()
+    timeoutController.signal.addEventListener('abort', abortRequest, { once: true })
+    opts.signal?.addEventListener('abort', abortRequest, { once: true })
+    if (opts.signal?.aborted) requestController.abort()
+
+    let res: Response
+    let text: string
+    try {
+      res = await fetch(`${apiBase}${path}`, { ...opts, headers, signal: requestController.signal })
+      text = await res.text()
+    } catch (error) {
+      if (timeoutController.signal.aborted && !opts.signal?.aborted) {
+        throw new ReachApiError('Request timed out. Please try again.', 0, null)
+      }
+      throw error
+    } finally {
+      clearTimeout(timeout)
+      timeoutController.signal.removeEventListener('abort', abortRequest)
+      opts.signal?.removeEventListener('abort', abortRequest)
+    }
+
     let body: any = text
     try { body = text ? JSON.parse(text) : null } catch {}
     if (!res.ok) {
