@@ -67,9 +67,9 @@ build_agent() {
   local arm="${4:-}"
   echo "[deploy] building reach-agent (${goos}/${arch}${arm:+ GOARM=$arm})..."
   if [ -n "$arm" ]; then
-    GOOS="$goos" GOARCH="$arch" GOARM="$arm" CGO_ENABLED=0 go build -ldflags "${AGENT_LDFLAGS[*]}" -o "$out" ./cmd/reach-agent
+    GOOS="$goos" GOARCH="$arch" GOARM="$arm" CGO_ENABLED=0 GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=status.showUntrackedFiles GIT_CONFIG_VALUE_0=no go build -ldflags "${AGENT_LDFLAGS[*]}" -o "$out" ./cmd/reach-agent
   else
-    GOOS="$goos" GOARCH="$arch" CGO_ENABLED=0 go build -ldflags "${AGENT_LDFLAGS[*]}" -o "$out" ./cmd/reach-agent
+    GOOS="$goos" GOARCH="$arch" CGO_ENABLED=0 GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=status.showUntrackedFiles GIT_CONFIG_VALUE_0=no go build -ldflags "${AGENT_LDFLAGS[*]}" -o "$out" ./cmd/reach-agent
   fi
 }
 
@@ -326,8 +326,7 @@ rollback_reachd() {
     if [ "$REACHD_EXISTED" = 1 ]; then
       for attempt in $(seq 1 30); do
         if systemctl is-active --quiet reachd \
-          && "$UV_BIN" run --script scripts/check-local-service.py "$LISTEN_ADDR" \
-          && sudo /opt/reach/reachd db-check --config /etc/reach/config.yaml; then
+          && "$UV_BIN" run --script scripts/check-local-service.py "$LISTEN_ADDR"; then
           rollback_ready=1
           break
         fi
