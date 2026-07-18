@@ -551,6 +551,9 @@ else
 fi
 
 echo "[deploy] stopping reachd for a consistent database backup..."
+if sudo test -f /opt/reach/reachd; then
+  REACHD_EXISTED=1
+fi
 SERVICE_STOPPED=1
 sudo systemctl stop reachd
 if systemctl is-active --quiet reachd; then
@@ -573,8 +576,7 @@ echo "[deploy] database backup: $DB_BACKUP_PATH"
 
 REACHD_ROLLBACK="/opt/reach/reachd.rollback.${DEPLOY_TS}"
 ROLLBACK_ARMED=1
-if sudo test -f /opt/reach/reachd; then
-  REACHD_EXISTED=1
+if [ "$REACHD_EXISTED" = 1 ]; then
   sudo cp -a /opt/reach/reachd "$REACHD_ROLLBACK"
 fi
 sudo install -m 0755 /tmp/reachd-build /opt/reach/reachd.candidate

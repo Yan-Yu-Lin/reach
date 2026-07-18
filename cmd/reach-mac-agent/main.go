@@ -95,9 +95,10 @@ Usage:
 }
 
 const (
-	maxSSHConfigBytes = 2 << 20
-	maxSSEEventBytes  = 2 << 20
-	eventSyncAttempts = 3
+	maxSSHConfigBytes  = 2 << 20
+	maxSSEEventBytes   = 2 << 20
+	eventSyncAttempts  = 3
+	defaultSyncTimeout = 15 * time.Second
 )
 
 var errSSEEventTooLarge = errors.New("SSE event exceeds size limit")
@@ -111,6 +112,7 @@ type Agent struct {
 	cursorWriter func(string) error
 	streamFn     func(context.Context, *string) error
 	backoffHook  func(time.Duration)
+	syncTimeout  time.Duration
 }
 
 func (a Agent) syncOnce(ctx context.Context) error {
@@ -291,7 +293,13 @@ func parseSSE(ctx context.Context, r io.Reader, fn func(Event) error) error {
 }
 
 func (a Agent) Sync(ctx context.Context) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(a.cfg.APIURL, "/")+"/api/admin/ssh-config", nil)
+	timeout := a.syncTimeout
+	if timeout <= 0 {
+		timeout = defaultSyncTimeout
+	}
+	syncCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(syncCtx, http.MethodGet, strings.TrimRight(a.cfg.APIURL, "/")+"/api/admin/ssh-config", nil)
 	if err != nil {
 		return err
 	}
@@ -475,7 +483,10 @@ func writeAtomic(path string, data []byte, mode os.FileMode) error {
 		return err
 	}
 	defer directory.Close()
-	return directory.Sync()
+	if err := directory.Sync(); err != nil && !errors.Is(err, syscall.ENOTSUP) && !errors.Is(err, syscall.EINVAL) {
+		return err
+	}
+	return nil
 }
 
 func (a Agent) stateDir() string {

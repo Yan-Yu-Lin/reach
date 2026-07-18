@@ -143,6 +143,31 @@ func TestRunDoesNotOpenStreamWhenPreSyncFails(t *testing.T) {
 	}
 }
 
+func TestSyncTimesOutWhenResponseBodyStalls(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+	agent := Agent{
+		cfg:         Config{APIURL: server.URL, Token: "token", OutFile: filepath.Join(t.TempDir(), "reach.conf")},
+		log:         log.New(io.Discard, "", 0),
+		syncTimeout: 100 * time.Millisecond,
+	}
+	started := time.Now()
+	err := agent.Sync(context.Background())
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Sync error = %v, want deadline exceeded", err)
+	}
+	if time.Since(started) > time.Second {
+		t.Fatalf("Sync timeout took too long: %s", time.Since(started))
+	}
+}
+
 func TestSyncRejectsOversizedAndTruncatedResponses(t *testing.T) {
 	for _, tc := range []struct {
 		name string
