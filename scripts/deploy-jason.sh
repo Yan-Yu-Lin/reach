@@ -176,6 +176,7 @@ AGENT_STAGING_DIR="${AGENT_DOWNLOAD_ROOT}/.v${AGENT_VERSION}.tmp.$$"
 ARTIFACT_DIR="${REACH_AGENT_ARTIFACT_DIR:-}"
 BUILD_ARTIFACT_DIR=""
 MUTATION_STARTED=0
+DEPLOY_COMMITTED=0
 ROLLBACK_ARMED=0
 SERVICE_STOPPED=0
 DB_MAY_HAVE_MIGRATED=0
@@ -228,6 +229,9 @@ cleanup() {
 
 rollback_reachd() {
   local exit_code="${ROLLBACK_EXIT_CODE:-$?}"
+  if [ "$DEPLOY_COMMITTED" = 1 ]; then
+    exit "$exit_code"
+  fi
   if [ "${ROLLBACK_RUNNING:-0}" = 1 ]; then
     exit "$exit_code"
   fi
@@ -359,8 +363,8 @@ rollback_reachd() {
 
 rollback_signal() {
   local signal="$1"
-  if [ "$MUTATION_STARTED" != 1 ]; then
-    echo "[deploy] ERROR: received $signal before deployment mutation" >&2
+  if [ "$MUTATION_STARTED" != 1 ] || [ "$DEPLOY_COMMITTED" = 1 ]; then
+    echo "[deploy] ERROR: received $signal outside deployment transaction" >&2
     case "$signal" in HUP) exit 129 ;; INT) exit 130 ;; TERM) exit 143 ;; esac
   fi
   echo "[deploy] ERROR: received $signal; rolling back" >&2
@@ -698,14 +702,15 @@ if [ "$PUBLISH_AGENT_RELEASE" = 1 ]; then
   sudo mv -f /var/lib/reach/setup.ps1.candidate /var/lib/reach/setup.ps1
   sudo mv -f "$AGENT_DOWNLOAD_ROOT/latest.txt.candidate" "$AGENT_DOWNLOAD_ROOT/latest.txt"
   sudo mv -f "$AGENT_DOWNLOAD_ROOT/latest.json.candidate" "$AGENT_DOWNLOAD_ROOT/latest.json"
-  PUBLICATION_ARMED=0
   rm -f /tmp/reach-latest-version /tmp/reach-latest.json /tmp/reach-setup.sh /tmp/reach-setup.ps1
 fi
 
+DEPLOY_COMMITTED=1
 ROLLBACK_ARMED=0
 CARRIER_STATE_SNAPSHOTTED=0
 CARRIER_ROLLBACK_ARMED=0
 DASHBOARD_SWAP_ARMED=0
+PUBLICATION_ARMED=0
 
 echo "[deploy] pruning deployment backups (retain $BACKUP_RETAIN)..."
 if ! sudo "$UV_BIN" run --script scripts/prune-deploy-backups.py --retain "$BACKUP_RETAIN" \
