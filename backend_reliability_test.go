@@ -46,6 +46,18 @@ func insertTestMachine(t *testing.T, store *Store, id, slug string) {
 	}
 }
 
+func TestOpenStoreRejectsQuestionMarkPath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "question?mark.db")
+	store, err := OpenStore(path)
+	if store != nil {
+		_ = store.Close()
+		t.Fatal("OpenStore accepted a path that SQLite would truncate")
+	}
+	if err == nil || !strings.Contains(err.Error(), "must not contain '?'") {
+		t.Fatalf("OpenStore error = %v", err)
+	}
+}
+
 func TestDatabaseReadinessCheck(t *testing.T) {
 	_, store, _ := newReliabilityTestServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)

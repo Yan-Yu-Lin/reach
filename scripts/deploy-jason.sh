@@ -452,6 +452,7 @@ else
   LISTEN_ADDR="$(sudo "$UV_BIN" run --script scripts/read-reach-config.py --config /etc/reach/config.yaml listen_addr)"
 fi
 case "$DB_PATH" in
+  *\?*) echo "[deploy] ERROR: db_path must not contain ?: $DB_PATH" >&2; exit 1 ;;
   /*) ;;
   *) echo "[deploy] ERROR: db_path must be absolute: $DB_PATH" >&2; exit 1 ;;
 esac

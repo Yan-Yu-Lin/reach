@@ -17,6 +17,9 @@ import (
 type Store struct{ db *sql.DB }
 
 func OpenStore(path string) (*Store, error) {
+	if strings.Contains(path, "?") {
+		return nil, fmt.Errorf("sqlite database path must not contain '?'")
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return nil, err
 	}
