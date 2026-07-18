@@ -99,6 +99,7 @@ const (
 	maxSSEEventBytes   = 2 << 20
 	eventSyncAttempts  = 3
 	defaultSyncTimeout = 15 * time.Second
+	defaultSSEIdle     = 75 * time.Second
 )
 
 var errSSEEventTooLarge = errors.New("SSE event exceeds size limit")
@@ -113,6 +114,7 @@ type Agent struct {
 	streamFn     func(context.Context, *string) error
 	backoffHook  func(time.Duration)
 	syncTimeout  time.Duration
+	sseIdle      time.Duration
 }
 
 func (a Agent) syncOnce(ctx context.Context) error {
@@ -180,8 +182,12 @@ func (a Agent) stream(ctx context.Context, lastID *string) error {
 		return fmt.Errorf("events returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	a.log.Printf("connected to Reach event stream")
+	idle := a.sseIdle
+	if idle <= 0 {
+		idle = defaultSSEIdle
+	}
 	reconciledAtBoundary := false
-	return parseSSE(ctx, resp.Body, func(ev Event) error {
+	return parseSSEWithIdle(ctx, resp.Body, idle, func(ev Event) error {
 		syncRequired := false
 		switch ev.Type {
 		case "hello":
@@ -241,55 +247,110 @@ func (a Agent) syncWithRetry(ctx context.Context, eventType string) error {
 }
 
 func parseSSE(ctx context.Context, r io.Reader, fn func(Event) error) error {
+	return parseSSEWithIdle(ctx, r, 0, fn)
+}
+
+func parseSSEWithIdle(ctx context.Context, r io.Reader, idle time.Duration, fn func(Event) error) error {
+	type scanResult struct {
+		line string
+		err  error
+	}
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 64*1024), maxSSEEventBytes)
+	lines := make(chan scanResult, 1)
+	done := make(chan struct{})
+	defer close(done)
+	send := func(result scanResult) bool {
+		select {
+		case lines <- result:
+			return true
+		case <-done:
+			return false
+		}
+	}
+	go func() {
+		defer close(lines)
+		for sc.Scan() {
+			if !send(scanResult{line: sc.Text()}) {
+				return
+			}
+		}
+		if err := sc.Err(); err != nil {
+			_ = send(scanResult{err: err})
+		}
+	}()
+	var timer *time.Timer
+	if idle > 0 {
+		timer = time.NewTimer(idle)
+		defer timer.Stop()
+	}
 	var ev Event
 	var data []string
 	eventBytes := 0
-	for sc.Scan() {
+	for {
+		var idleC <-chan time.Time
+		if timer != nil {
+			idleC = timer.C
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		default:
-		}
-		line := sc.Text()
-		if len(line) > maxSSEEventBytes-eventBytes-1 {
-			return errSSEEventTooLarge
-		}
-		eventBytes += len(line) + 1
-		if line == "" {
-			if ev.Type != "" || len(data) > 0 {
-				ev.Data = strings.Join(data, "\n")
-				if ev.Type == "" {
-					ev.Type = "message"
-				}
-				if err := fn(ev); err != nil {
-					return err
-				}
+		case <-idleC:
+			return fmt.Errorf("SSE stream idle for %s", idle)
+		case result, ok := <-lines:
+			if !ok {
+				return nil
 			}
-			ev = Event{}
-			data = nil
-			eventBytes = 0
-			continue
-		}
-		if strings.HasPrefix(line, ":") {
-			continue
-		}
-		k, v, ok := strings.Cut(line, ":")
-		if !ok {
-			continue
-		}
-		v = strings.TrimPrefix(v, " ")
-		switch k {
-		case "id":
-			ev.ID = v
-		case "event":
-			ev.Type = v
-		case "data":
-			data = append(data, v)
+			if result.err != nil {
+				return result.err
+			}
+			if timer != nil {
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(idle)
+			}
+			line := result.line
+			if len(line) > maxSSEEventBytes-eventBytes-1 {
+				return errSSEEventTooLarge
+			}
+			eventBytes += len(line) + 1
+			if line == "" {
+				if ev.Type != "" || len(data) > 0 {
+					ev.Data = strings.Join(data, "\n")
+					if ev.Type == "" {
+						ev.Type = "message"
+					}
+					if err := fn(ev); err != nil {
+						return err
+					}
+				}
+				ev = Event{}
+				data = nil
+				eventBytes = 0
+				continue
+			}
+			if strings.HasPrefix(line, ":") {
+				continue
+			}
+			k, v, ok := strings.Cut(line, ":")
+			if !ok {
+				continue
+			}
+			v = strings.TrimPrefix(v, " ")
+			switch k {
+			case "id":
+				ev.ID = v
+			case "event":
+				ev.Type = v
+			case "data":
+				data = append(data, v)
+			}
 		}
 	}
-	return sc.Err()
 }
 
 func (a Agent) Sync(ctx context.Context) error {

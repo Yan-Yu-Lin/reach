@@ -143,6 +143,32 @@ func TestRunDoesNotOpenStreamWhenPreSyncFails(t *testing.T) {
 	}
 }
 
+func TestStreamReconnectsWhenSSEGoesIdle(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, ": keepalive\n\n")
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+	agent := Agent{
+		cfg:     Config{APIURL: server.URL, Token: "token", OutFile: filepath.Join(t.TempDir(), "reach.conf")},
+		log:     log.New(io.Discard, "", 0),
+		sseIdle: 100 * time.Millisecond,
+	}
+	lastID := ""
+	started := time.Now()
+	err := agent.stream(context.Background(), &lastID)
+	if err == nil || !strings.Contains(err.Error(), "SSE stream idle") {
+		t.Fatalf("stream error = %v, want idle timeout", err)
+	}
+	if time.Since(started) > time.Second {
+		t.Fatalf("SSE idle timeout took too long: %s", time.Since(started))
+	}
+}
+
 func TestSyncTimesOutWhenResponseBodyStalls(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
