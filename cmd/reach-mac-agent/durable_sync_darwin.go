@@ -3,14 +3,18 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
-func syncFileDurable(file *os.File) error {
-	_, _, errno := syscall.Syscall(syscall.SYS_FCNTL, file.Fd(), syscall.F_FULLFSYNC, 0)
-	if errno != 0 {
-		return errno
+func durableSync(file *os.File) error {
+	if _, err := unix.FcntlInt(file.Fd(), unix.F_FULLFSYNC, 0); err == nil {
+		return nil
+	} else if !errors.Is(err, syscall.ENOTSUP) && !errors.Is(err, syscall.EINVAL) {
+		return err
 	}
-	return nil
+	return file.Sync()
 }

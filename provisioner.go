@@ -31,6 +31,7 @@ type Provisioner struct {
 	publishEvent func(string, string, map[string]any)
 	pruneEvents  func(context.Context, string) error
 	probeTunnel  func(context.Context, int) (bool, string)
+	observedMu   sync.Mutex
 	healthMu     sync.RWMutex
 	healthReport []map[string]any
 }
@@ -702,7 +703,7 @@ func (p *Provisioner) loadAgentObservation(ctx context.Context, machineID string
 func (p *Provisioner) loadHubObservation(ctx context.Context, machineID string) (*HubObservation, error) {
 	var h HubObservation
 	var ok, probeErr sql.NullString
-	err := p.store.db.QueryRowContext(ctx, `SELECT tunnel_id,machine_id,probe_state,last_probe_at,last_success_at,probe_error FROM hub_observations WHERE machine_id=? ORDER BY last_probe_at DESC LIMIT 1`, machineID).Scan(&h.TunnelID, &h.MachineID, &h.ProbeState, &h.LastProbeAt, &ok, &probeErr)
+	err := p.store.db.QueryRowContext(ctx, `SELECT tunnel_id,machine_id,probe_state,last_probe_at,last_success_at,probe_error FROM hub_observations WHERE machine_id=? ORDER BY last_probe_at DESC,tunnel_id DESC LIMIT 1`, machineID).Scan(&h.TunnelID, &h.MachineID, &h.ProbeState, &h.LastProbeAt, &ok, &probeErr)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -966,6 +967,9 @@ func (p *Provisioner) RunHealthCheck(ctx context.Context) ([]map[string]any, err
 }
 
 func (p *Provisioner) recomputeObserved(ctx context.Context, machineID string) (bool, string, string, error) {
+	p.observedMu.Lock()
+	defer p.observedMu.Unlock()
+
 	var desired, old, oldStatus string
 	var hbAt, agentTunnel, localSSH, probe sql.NullString
 	if err := p.store.db.QueryRowContext(ctx, `SELECT desired_state,observed_state,status FROM machines WHERE id=?`, machineID).Scan(&desired, &old, &oldStatus); err != nil {
@@ -974,7 +978,7 @@ func (p *Provisioner) recomputeObserved(ctx context.Context, machineID string) (
 	if err := p.store.db.QueryRowContext(ctx, `SELECT heartbeat_at,tunnel_state,local_ssh_state FROM agent_observations WHERE machine_id=?`, machineID).Scan(&hbAt, &agentTunnel, &localSSH); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return false, "", "", err
 	}
-	if err := p.store.db.QueryRowContext(ctx, `SELECT probe_state FROM hub_observations WHERE machine_id=? ORDER BY last_probe_at DESC LIMIT 1`, machineID).Scan(&probe); err != nil && !errors.Is(err, sql.ErrNoRows) {
+	if err := p.store.db.QueryRowContext(ctx, `SELECT probe_state FROM hub_observations WHERE machine_id=? ORDER BY last_probe_at DESC,tunnel_id DESC LIMIT 1`, machineID).Scan(&probe); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return false, "", "", err
 	}
 	observed := ObservedUnknown

@@ -37,7 +37,7 @@ jobs:
       - uses: astral-sh/setup-uv@v6
 
       - name: Check shell syntax
-        run: bash -n scripts/deploy-from-mac.sh scripts/deploy-jason.sh
+        run: bash -n scripts/deploy-from-mac.sh scripts/deploy-jason.sh scripts/validate-release-version.sh
 
       - name: Check Python helpers
         run: python3 -m py_compile scripts/*.py
@@ -62,15 +62,50 @@ jobs:
       - name: Smoke test release artifact helper
         run: |
           artifacts="$(mktemp -d)"
-          for name in \
-            reach-agent_linux_amd64 reach-agent_linux_arm64 reach-agent_linux_386 \
-            reach-agent_linux_armv6 reach-agent_linux_armv7 reach-agent_darwin_amd64 \
-            reach-agent_darwin_arm64 reach-agent_windows_amd64.exe reach-agent_windows_arm64.exe; do
-            printf '%s' "$name" > "$artifacts/$name"
+          commit="$GITHUB_SHA"
+          for target in \
+            'linux amd64 reach-agent_linux_amd64' \
+            'linux arm64 reach-agent_linux_arm64' \
+            'linux 386 reach-agent_linux_386' \
+            'linux arm reach-agent_linux_armv6 6' \
+            'linux arm reach-agent_linux_armv7 7' \
+            'darwin amd64 reach-agent_darwin_amd64' \
+            'darwin arm64 reach-agent_darwin_arm64' \
+            'windows amd64 reach-agent_windows_amd64.exe' \
+            'windows arm64 reach-agent_windows_arm64.exe'; do
+            read -r goos goarch name goarm <<< "$target"
+            GOOS="$goos" GOARCH="$goarch" GOARM="$goarm" CGO_ENABLED=0 go build -o "$artifacts/$name" ./cmd/reach-agent
           done
           (cd "$artifacts" && sha256sum reach-agent_* > checksums.txt)
-          go run ./cmd/reach-release manifest --dir "$artifacts" --version "1.2.3 quoted" --commit "$GITHUB_SHA"
-          uv run --script scripts/verify-release-artifacts.py --dir "$artifacts" --version "1.2.3 quoted" --commit "$GITHUB_SHA"
+          go run ./cmd/reach-release manifest --dir "$artifacts" --version "1.2.3" --commit "$commit"
+          uv run --script scripts/verify-release-artifacts.py --dir "$artifacts" --version "1.2.3" --commit "$commit"
+          work="$(mktemp -d)"
+          go run ./cmd/reach-release keygen --key "$work/release.key" --pub "$work/release.pub" --password-file "$work/release.pass"
+          go run ./cmd/reach-release sign --key "$work/release.key" --password-file "$work/release.pass" --manifest "$artifacts/manifest.json"
+          public_key="$(tail -n 1 "$work/release.pub")"
+          go run ./cmd/reach-release verify --public-key "$public_key" --manifest "$artifacts/manifest.json" --artifacts-dir "$artifacts"
+          printf 'tampered\n' >> "$artifacts/reach-agent_linux_amd64"
+          ! go run ./cmd/reach-release verify --public-key "$public_key" --manifest "$artifacts/manifest.json" --artifacts-dir "$artifacts"
+
+      - name: Reject unsafe deployment versions
+        run: |
+          for version in '.leading' 'has space' 'slash/version' 'quote"version'; do
+            ! bash scripts/validate-release-version.sh "$version"
+          done
+          long_version="1$(printf '%0128d' 0)"
+          ! bash scripts/validate-release-version.sh "$long_version"
+          bash scripts/validate-release-version.sh '1.2.3-dev+build_1'
+
+      - name: Smoke test manifest signature verification
+        run: |
+          work="$(mktemp -d)"
+          go run ./cmd/reach-release keygen --key "$work/release.key" --pub "$work/release.pub" --password-file "$work/release.pass"
+          printf '{}\n' > "$work/manifest.json"
+          go run ./cmd/reach-release sign --key "$work/release.key" --password-file "$work/release.pass" --manifest "$work/manifest.json"
+          public_key="$(tail -n 1 "$work/release.pub")"
+          go run ./cmd/reach-release verify --public-key "$public_key" --manifest "$work/manifest.json"
+          printf 'tampered\n' >> "$work/manifest.json"
+          ! go run ./cmd/reach-release verify --public-key "$public_key" --manifest "$work/manifest.json"
 
   dashboard:
     runs-on: ubuntu-latest

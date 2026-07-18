@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -60,6 +61,62 @@ func TestRecomputeObservedKeepsReachableStaleHeartbeatDegraded(t *testing.T) {
 	}
 	if observed != ObservedGone || status != ObservedGone {
 		t.Fatalf("unreachable stale heartbeat should be gone, got observed=%q status=%q", observed, status)
+	}
+}
+
+func TestRecomputeObservedConcurrentCallsRemainConsistent(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenStore(filepath.Join(t.TempDir(), "reach.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := DefaultConfig()
+	cfg.InitialAdmin.PasswordHash, err = HashSecret("test-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Migrate(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO machines (id,slug,status,desired_state,observed_state,created_at) VALUES ('m_concurrent','concurrent-box','offline','active','offline',?)`, nowUTC()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO tunnels (id,machine_id,hub_id,unix_user,remote_port,tunnel_pubkey,status,created_at) VALUES ('t_concurrent','m_concurrent','primary','rt-concurr1',9202,'ssh-ed25519 test','online',?)`, nowUTC()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO agent_observations (machine_id,heartbeat_at,tunnel_state,local_ssh_state) VALUES ('m_concurrent',?,'connected','healthy')`, nowUTC()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO hub_observations (tunnel_id,machine_id,probe_state,last_probe_at,last_success_at) VALUES ('t_concurrent','m_concurrent','reachable',?,?)`, nowUTC(), nowUTC()); err != nil {
+		t.Fatal(err)
+	}
+
+	p := NewProvisioner(store, cfg)
+	const calls = 16
+	errs := make(chan error, calls)
+	var wg sync.WaitGroup
+	for i := 0; i < calls; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _, _, err := p.recomputeObserved(ctx, "m_concurrent")
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	var observed, status string
+	if err := store.db.QueryRowContext(ctx, `SELECT observed_state,status FROM machines WHERE id='m_concurrent'`).Scan(&observed, &status); err != nil {
+		t.Fatal(err)
+	}
+	if observed != ObservedOnline || status != ObservedOnline {
+		t.Fatalf("concurrent recompute got observed=%q status=%q", observed, status)
 	}
 }
 

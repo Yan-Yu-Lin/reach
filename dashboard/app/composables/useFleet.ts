@@ -1,4 +1,5 @@
 import { mapSettledLimited, summarizeSettled } from '~/utils/concurrency'
+import { createAuthoritativeRefreshRetry } from '~/utils/authoritativeRefreshRetry'
 import { planFleetEvent } from '~/utils/fleetEvents'
 import { createRefreshCoordinator, type RefreshBatch } from '~/utils/refreshCoordinator'
 
@@ -14,6 +15,9 @@ export function useFleet() {
   const error = ref('')
   const selectedId = ref<string | null>(null)
   let disposeSSE: (() => void) | null = null
+  const authoritativeRetry = createAuthoritativeRefreshRetry(() => {
+    void refreshCoordinator.requestFull(true).catch(() => {})
+  })
 
   const pendingRequests = computed(() =>
     requests.value.filter(r => r.status === 'pending')
@@ -97,8 +101,10 @@ export function useFleet() {
         if (failures.length > 0) {
           const failure = failures[0] as any
           error.value = failure?.message || 'Failed to load dashboard data'
+          authoritativeRetry.failed()
         } else {
           error.value = ''
+          authoritativeRetry.succeeded()
         }
       } finally {
         loading.value = false
@@ -168,6 +174,7 @@ export function useFleet() {
 
   function dispose() {
     disposeSSE?.()
+    authoritativeRetry.dispose()
     refreshCoordinator.dispose()
   }
 

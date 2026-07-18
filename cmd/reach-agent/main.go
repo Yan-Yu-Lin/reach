@@ -256,6 +256,8 @@ type Daemon struct {
 	tunnelStartedAt   time.Time
 	desired           HeartbeatResponse
 	pendingResults    []CommandResult
+	completedCommands map[string]CommandResult
+	completedOrder    []string
 	appliedGeneration int64
 	stopping          bool
 	titleController   *ProcessTitleController
@@ -500,7 +502,8 @@ func validateConfig(cfg Config) error {
 }
 
 func NewDaemon(cfg Config) *Daemon {
-	d := &Daemon{cfg: cfg, logger: log.New(os.Stdout, "reach-agent ", log.LstdFlags|log.Lmicroseconds)}
+	d := &Daemon{cfg: cfg, logger: log.New(os.Stdout, "reach-agent ", log.LstdFlags|log.Lmicroseconds), completedCommands: map[string]CommandResult{}}
+	d.loadCommandLedger()
 	d.status = RuntimeStatus{MachineID: cfg.MachineID, Slug: cfg.Slug, AgentVersion: version, Transport: "unknown", LocalSSH: ComponentState{State: "unknown", Host: cfg.LocalSSH.Host, Port: cfg.LocalSSH.Port, Mode: localSSHMode(cfg)}, Tunnel: TunnelState{State: "stopped", RemotePort: cfg.Tunnel.RemotePort}, Persistence: PersistenceState{Backend: firstNonEmpty(cfg.Install.PersistenceBackend, "unknown"), Quality: firstNonEmpty(cfg.Install.PersistenceQuality, "unknown"), RebootSafe: cfg.Install.PersistenceRebootSafe}}
 	return d
 }
@@ -603,6 +606,26 @@ func (d *Daemon) applyDesiredProcessTitle(cfg *DesiredProcessTitleConfig) {
 }
 
 func (d *Daemon) applyCommand(ctx context.Context, cmd AgentCommand) {
+	d.mu.Lock()
+	previous, completed := d.completedCommands[cmd.ID]
+	d.mu.Unlock()
+	if completed {
+		if previous.Status == "executing" {
+			previous.Status = "failed"
+			previous.Message = "previous command execution was interrupted; manual reconciliation required"
+			if err := d.rememberCommandResult(previous); err != nil {
+				d.logger.Printf("command ledger reconciliation failed: %v", err)
+			}
+		}
+		d.queueResult(previous)
+		return
+	}
+	reservation := CommandResult{CommandID: cmd.ID, Status: "executing", Message: "command execution started"}
+	if err := d.rememberCommandResult(reservation); err != nil {
+		d.queueResult(CommandResult{CommandID: cmd.ID, Status: "failed", Message: "reserve command execution: " + err.Error()})
+		return
+	}
+
 	res := CommandResult{CommandID: cmd.ID, Status: "acked"}
 	switch cmd.Type {
 	case "start_tunnel":
@@ -639,6 +662,11 @@ func (d *Daemon) applyCommand(ctx context.Context, cmd AgentCommand) {
 	case "uninstall":
 		_, _ = d.sendHeartbeat(ctx, &ShutdownNotice{Reason: "server_uninstall", WillRemoveLocalFiles: true})
 		res.Message = "starting uninstall"
+		if err := d.rememberCommandResult(res); err != nil {
+			failed := CommandResult{CommandID: cmd.ID, Status: "failed", Message: "persist uninstall command: " + err.Error()}
+			d.queueResult(failed)
+			return
+		}
 		d.queueResult(res)
 		_, _ = d.sendHeartbeat(ctx, nil)
 		go func() {
@@ -676,12 +704,21 @@ func (d *Daemon) applyCommand(ctx context.Context, cmd AgentCommand) {
 		if err := updateBinaryCommand(context.Background(), args); err != nil {
 			res.Status = "failed"
 			res.Message = err.Error()
+			if err := d.rememberCommandResult(res); err != nil {
+				d.logger.Printf("command ledger update failed: %v", err)
+			}
 		} else {
 			res.Message = "started detached agent update to " + payload.Version
+			if err := d.rememberCommandResult(res); err != nil {
+				d.logger.Printf("command ledger update failed: %v", err)
+			}
 		}
 	default:
 		res.Status = "failed"
 		res.Message = "unknown command"
+	}
+	if err := d.rememberCommandResult(res); err != nil {
+		d.logger.Printf("command ledger write failed: %v", err)
 	}
 	d.queueResult(res)
 	_, _ = d.sendHeartbeat(ctx, nil)
@@ -721,7 +758,97 @@ func (d *Daemon) confirmPendingUpdateAfterHeartbeat() {
 func (d *Daemon) queueResult(res CommandResult) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	for i := range d.pendingResults {
+		if d.pendingResults[i].CommandID == res.CommandID {
+			d.pendingResults[i] = res
+			return
+		}
+	}
 	d.pendingResults = append(d.pendingResults, res)
+}
+
+const commandLedgerLimit = 256
+
+type commandLedger struct {
+	Completed []CommandResult `json:"completed"`
+}
+
+func (d *Daemon) commandLedgerPath() string {
+	if strings.TrimSpace(d.cfg.Install.DataDir) == "" {
+		return ""
+	}
+	return filepath.Join(d.cfg.Install.DataDir, "command-ledger.json")
+}
+
+func (d *Daemon) loadCommandLedger() {
+	path := d.commandLedgerPath()
+	if path == "" {
+		return
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var ledger commandLedger
+	if json.Unmarshal(b, &ledger) != nil {
+		return
+	}
+	start := 0
+	if len(ledger.Completed) > commandLedgerLimit {
+		start = len(ledger.Completed) - commandLedgerLimit
+	}
+	for _, result := range ledger.Completed[start:] {
+		if result.CommandID == "" {
+			continue
+		}
+		if _, exists := d.completedCommands[result.CommandID]; !exists {
+			d.completedOrder = append(d.completedOrder, result.CommandID)
+		}
+		d.completedCommands[result.CommandID] = result
+	}
+}
+
+func (d *Daemon) rememberCommandResult(result CommandResult) error {
+	if result.CommandID == "" {
+		return nil
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	completed := make(map[string]CommandResult, len(d.completedCommands)+1)
+	for id, previous := range d.completedCommands {
+		completed[id] = previous
+	}
+	order := append([]string(nil), d.completedOrder...)
+	if _, exists := completed[result.CommandID]; !exists {
+		order = append(order, result.CommandID)
+	}
+	completed[result.CommandID] = result
+	for len(order) > commandLedgerLimit {
+		delete(completed, order[0])
+		order = order[1:]
+	}
+
+	path := d.commandLedgerPath()
+	if path != "" {
+		ledger := commandLedger{Completed: make([]CommandResult, 0, len(order))}
+		for _, id := range order {
+			ledger.Completed = append(ledger.Completed, completed[id])
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			return fmt.Errorf("create command ledger directory: %w", err)
+		}
+		b, err := json.Marshal(ledger)
+		if err != nil {
+			return fmt.Errorf("encode command ledger: %w", err)
+		}
+		if err := writeFileAtomic(path, b, 0o600); err != nil {
+			return fmt.Errorf("write command ledger: %w", err)
+		}
+	}
+	d.completedCommands = completed
+	d.completedOrder = order
+	return nil
 }
 
 func (d *Daemon) startTunnel(ctx context.Context, transport string) error {
@@ -819,7 +946,6 @@ func (d *Daemon) sendHeartbeat(ctx context.Context, shutdown *ShutdownNotice) (H
 	st := d.snapshot()
 	d.mu.Lock()
 	results := append([]CommandResult(nil), d.pendingResults...)
-	d.pendingResults = nil
 	d.mu.Unlock()
 	sshCaps := d.cfg.Tunnel.SSHCompat
 	sshCaps.ClientOptions = d.cfg.LocalSSH.ClientOptions
@@ -848,6 +974,7 @@ func (d *Daemon) sendHeartbeat(ctx context.Context, shutdown *ShutdownNotice) (H
 				if err := json.Unmarshal(b, &out); err != nil {
 					return out, err
 				}
+				d.acknowledgeResults(results)
 				return out, nil
 			}
 			err = fmt.Errorf("heartbeat status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(b)))
@@ -866,6 +993,25 @@ func (d *Daemon) sendHeartbeat(ctx context.Context, shutdown *ShutdownNotice) (H
 		}
 	}
 	return HeartbeatResponse{}, fmt.Errorf("heartbeat failed after %d attempts: %w", attempts, lastErr)
+}
+
+func (d *Daemon) acknowledgeResults(sent []CommandResult) {
+	if len(sent) == 0 {
+		return
+	}
+	acked := make(map[string]struct{}, len(sent))
+	for _, result := range sent {
+		acked[result.CommandID] = struct{}{}
+	}
+	d.mu.Lock()
+	remaining := d.pendingResults[:0]
+	for _, result := range d.pendingResults {
+		if _, ok := acked[result.CommandID]; !ok {
+			remaining = append(remaining, result)
+		}
+	}
+	d.pendingResults = remaining
+	d.mu.Unlock()
 }
 
 func (d *Daemon) checkLocalSSH(ctx context.Context) error {

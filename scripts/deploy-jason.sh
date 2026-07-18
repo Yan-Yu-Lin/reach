@@ -35,10 +35,17 @@ UV_BIN="$(cd "$(dirname "$UV_BIN")" && pwd)/$(basename "$UV_BIN")"
 command -v flock >/dev/null || { echo "[deploy] ERROR: flock is required" >&2; exit 1; }
 LOCK_DIR="${XDG_RUNTIME_DIR:-$HOME/.cache/reach}"
 mkdir -p "$LOCK_DIR"
-exec 9>"$LOCK_DIR/deploy.lock"
-if ! flock -n 9; then
-  echo "[deploy] ERROR: another Reach deployment is running" >&2
-  exit 1
+if [ "${REACH_DEPLOY_LOCK_HELD:-0}" = 1 ]; then
+  if ! flock -n 9; then
+    echo "[deploy] ERROR: inherited deployment lock is not held" >&2
+    exit 1
+  fi
+else
+  exec 9>"$LOCK_DIR/deploy.lock"
+  if ! flock -n 9; then
+    echo "[deploy] ERROR: another Reach deployment is running" >&2
+    exit 1
+  fi
 fi
 
 version_from_git() {
@@ -60,9 +67,9 @@ build_agent() {
   local arm="${4:-}"
   echo "[deploy] building reach-agent (${goos}/${arch}${arm:+ GOARM=$arm})..."
   if [ -n "$arm" ]; then
-    GOOS="$goos" GOARCH="$arch" GOARM="$arm" CGO_ENABLED=0 go build -ldflags "$AGENT_LDFLAGS" -o "$out" ./cmd/reach-agent
+    GOOS="$goos" GOARCH="$arch" GOARM="$arm" CGO_ENABLED=0 go build -ldflags "${AGENT_LDFLAGS[*]}" -o "$out" ./cmd/reach-agent
   else
-    GOOS="$goos" GOARCH="$arch" CGO_ENABLED=0 go build -ldflags "$AGENT_LDFLAGS" -o "$out" ./cmd/reach-agent
+    GOOS="$goos" GOARCH="$arch" CGO_ENABLED=0 go build -ldflags "${AGENT_LDFLAGS[*]}" -o "$out" ./cmd/reach-agent
   fi
 }
 
@@ -158,20 +165,36 @@ else
 fi
 
 AGENT_VERSION="${REACH_AGENT_VERSION:-$(version_from_git)}"
-AGENT_LDFLAGS="-X main.version=${AGENT_VERSION}"
+bash scripts/validate-release-version.sh "$AGENT_VERSION" || {
+  echo "[deploy] ERROR: invalid agent version" >&2
+  exit 1
+}
+AGENT_LDFLAGS=("-X" "main.version=${AGENT_VERSION}")
 AGENT_DOWNLOAD_ROOT="/var/lib/reach/downloads/reach-agent"
 AGENT_DOWNLOAD_DIR="${AGENT_DOWNLOAD_ROOT}/v${AGENT_VERSION}"
 AGENT_STAGING_DIR="${AGENT_DOWNLOAD_ROOT}/.v${AGENT_VERSION}.tmp.$$"
 ARTIFACT_DIR="${REACH_AGENT_ARTIFACT_DIR:-}"
 BUILD_ARTIFACT_DIR=""
+MUTATION_STARTED=0
 ROLLBACK_ARMED=0
 SERVICE_STOPPED=0
 DB_MAY_HAVE_MIGRATED=0
 DB_BACKUP_PATH=""
 REACHD_ROLLBACK=""
+REACHD_EXISTED=0
 CARRIER_ROLLBACK=""
+CARRIER_EXISTED=0
+CARRIER_UNIT_BACKUP=""
+CARRIER_UNIT_EXISTED=0
+CARRIER_WAS_ENABLED=0
+CARRIER_WAS_ACTIVE=0
+LEGACY_WAS_ENABLED=0
+LEGACY_WAS_ACTIVE=0
+CARRIER_STATE_SNAPSHOTTED=0
 CARRIER_ROLLBACK_ARMED=0
+DASHBOARD_EXISTED=0
 DASHBOARD_SWAP_ARMED=0
+DASHBOARD_MUTATED=0
 DASHBOARD_STAGE=""
 DASHBOARD_BACKUP=""
 PUBLISH_AGENT_RELEASE="${REACH_PUBLISH_AGENT_RELEASE:-0}"
@@ -203,8 +226,12 @@ cleanup() {
 }
 
 rollback_reachd() {
-  local exit_code=$?
-  trap - ERR
+  local exit_code="${ROLLBACK_EXIT_CODE:-$?}"
+  if [ "${ROLLBACK_RUNNING:-0}" = 1 ]; then
+    exit "$exit_code"
+  fi
+  ROLLBACK_RUNNING=1
+  trap - ERR INT TERM HUP
   set +e
   if [ "$PUBLICATION_ARMED" = 1 ]; then
     echo "[deploy] restoring previous agent publication" >&2
@@ -236,23 +263,41 @@ rollback_reachd() {
   fi
   if [ "$DASHBOARD_SWAP_ARMED" = 1 ]; then
     local dashboard_rollback_source=""
-    if [ -n "$DASHBOARD_BACKUP" ] && sudo test -d "$DASHBOARD_BACKUP"; then
+    if [ "$DASHBOARD_MUTATED" != 1 ]; then
+      :
+    elif [ -n "$DASHBOARD_BACKUP" ] && sudo test -d "$DASHBOARD_BACKUP"; then
       dashboard_rollback_source="$DASHBOARD_BACKUP"
     elif [ -n "$DASHBOARD_STAGE" ] && sudo test -d "$DASHBOARD_STAGE"; then
       dashboard_rollback_source="$DASHBOARD_STAGE"
     fi
-    if [ -n "$dashboard_rollback_source" ]; then
+    if [ "$DASHBOARD_EXISTED" = 1 ] && [ -n "$dashboard_rollback_source" ]; then
       echo "[deploy] restoring previous dashboard" >&2
       sudo "$UV_BIN" run --script scripts/atomic-directory-swap.py "$dashboard_rollback_source" /opt/reach-dashboard
+    elif [ "$DASHBOARD_MUTATED" = 1 ] && [ "$DASHBOARD_EXISTED" = 0 ] && sudo test -e /opt/reach-dashboard; then
+      echo "[deploy] removing partial fresh dashboard installation" >&2
+      sudo mv /opt/reach-dashboard "/opt/reach-dashboard.failed.$DEPLOY_TS"
     fi
   fi
-  if [ "$CARRIER_ROLLBACK_ARMED" = 1 ]; then
-    echo "[deploy] restoring previous WebSocket carrier" >&2
-    sudo systemctl stop reach-ws-carrier.service
-    sudo install -m 0755 "$CARRIER_ROLLBACK" /opt/reach/reach-ws-carrier.rollback-candidate
-    sudo mv -f /opt/reach/reach-ws-carrier.rollback-candidate /opt/reach/reach-ws-carrier
-    sudo systemctl start reach-ws-carrier.service
-    systemctl is-active reach-ws-carrier.service >&2
+  if [ "$CARRIER_STATE_SNAPSHOTTED" = 1 ]; then
+    echo "[deploy] restoring previous WebSocket carrier state" >&2
+    sudo systemctl disable --now reach-ws-carrier.service 2>/dev/null || true
+    if [ "$CARRIER_UNIT_EXISTED" = 1 ] && sudo test -f "$CARRIER_UNIT_BACKUP"; then
+      sudo cp -a "$CARRIER_UNIT_BACKUP" /etc/systemd/system/reach-ws-carrier.service.rollback-candidate
+      sudo mv -f /etc/systemd/system/reach-ws-carrier.service.rollback-candidate /etc/systemd/system/reach-ws-carrier.service
+    elif sudo test -e /etc/systemd/system/reach-ws-carrier.service; then
+      sudo mv /etc/systemd/system/reach-ws-carrier.service "/etc/systemd/system/reach-ws-carrier.service.failed.$DEPLOY_TS"
+    fi
+    if [ "$CARRIER_EXISTED" = 1 ] && sudo test -f "$CARRIER_ROLLBACK"; then
+      sudo install -m 0755 "$CARRIER_ROLLBACK" /opt/reach/reach-ws-carrier.rollback-candidate
+      sudo mv -f /opt/reach/reach-ws-carrier.rollback-candidate /opt/reach/reach-ws-carrier
+    elif sudo test -e /opt/reach/reach-ws-carrier; then
+      sudo mv /opt/reach/reach-ws-carrier "/opt/reach/reach-ws-carrier.failed.$DEPLOY_TS"
+    fi
+    sudo systemctl daemon-reload
+    if [ "$CARRIER_WAS_ENABLED" = 1 ]; then sudo systemctl enable reach-ws-carrier.service; else sudo systemctl disable reach-ws-carrier.service 2>/dev/null || true; fi
+    if [ "$CARRIER_WAS_ACTIVE" = 1 ]; then sudo systemctl start reach-ws-carrier.service; else sudo systemctl stop reach-ws-carrier.service 2>/dev/null || true; fi
+    if [ "$LEGACY_WAS_ENABLED" = 1 ]; then sudo systemctl enable reach-wstunnel.service; else sudo systemctl disable reach-wstunnel.service 2>/dev/null || true; fi
+    if [ "$LEGACY_WAS_ACTIVE" = 1 ]; then sudo systemctl start reach-wstunnel.service; else sudo systemctl stop reach-wstunnel.service 2>/dev/null || true; fi
   fi
   if [ "$ROLLBACK_ARMED" = 1 ]; then
     echo "[deploy] ERROR: deployment failed; restoring previous reachd binary" >&2
@@ -267,19 +312,28 @@ rollback_reachd() {
         fi
       done
     fi
-    sudo install -m 0755 "$REACHD_ROLLBACK" /opt/reach/reachd.rollback-candidate
-    sudo mv -f /opt/reach/reachd.rollback-candidate /opt/reach/reachd
-    sudo systemctl start reachd
-    rollback_ready=0
-    for attempt in $(seq 1 30); do
-      if systemctl is-active --quiet reachd \
-        && "$UV_BIN" run --script scripts/check-local-service.py "$LISTEN_ADDR" \
-        && sudo /opt/reach/reachd db-check --config /etc/reach/config.yaml; then
-        rollback_ready=1
-        break
-      fi
-      sleep 1
-    done
+    if [ "$REACHD_EXISTED" = 1 ] && [ -n "$REACHD_ROLLBACK" ] && sudo test -f "$REACHD_ROLLBACK"; then
+      sudo install -m 0755 "$REACHD_ROLLBACK" /opt/reach/reachd.rollback-candidate
+      sudo mv -f /opt/reach/reachd.rollback-candidate /opt/reach/reachd
+      sudo systemctl start reachd
+    else
+      echo "[deploy] removing partial fresh reachd installation" >&2
+      sudo systemctl stop reachd 2>/dev/null || true
+      if sudo test -e /opt/reach/reachd; then sudo mv /opt/reach/reachd "/opt/reach/reachd.failed.$DEPLOY_TS"; fi
+      rollback_ready=1
+    fi
+    rollback_ready="${rollback_ready:-0}"
+    if [ "$REACHD_EXISTED" = 1 ]; then
+      for attempt in $(seq 1 30); do
+        if systemctl is-active --quiet reachd \
+          && "$UV_BIN" run --script scripts/check-local-service.py "$LISTEN_ADDR" \
+          && sudo /opt/reach/reachd db-check --config /etc/reach/config.yaml; then
+          rollback_ready=1
+          break
+        fi
+        sleep 1
+      done
+    fi
     if [ "$rollback_ready" != 1 ]; then
       sudo systemctl stop reachd
       echo "[deploy] ERROR: previous reachd cannot become ready with the migrated database; leaving reachd stopped" >&2
@@ -291,14 +345,36 @@ rollback_reachd() {
       sudo journalctl -u reachd -n 80 --no-pager >&2 || true
     fi
   elif [ "$SERVICE_STOPPED" = 1 ]; then
-    echo "[deploy] ERROR: deployment failed while reachd was stopped; restarting previous service" >&2
-    sudo systemctl start reachd
+    if [ "$REACHD_EXISTED" = 1 ]; then
+      echo "[deploy] ERROR: deployment failed while reachd was stopped; restarting previous service" >&2
+      sudo systemctl start reachd
+    else
+      sudo systemctl stop reachd 2>/dev/null || true
+    fi
   fi
   exit "$exit_code"
 }
 
+rollback_signal() {
+  local signal="$1"
+  if [ "$MUTATION_STARTED" != 1 ]; then
+    echo "[deploy] ERROR: received $signal before deployment mutation" >&2
+    case "$signal" in HUP) exit 129 ;; INT) exit 130 ;; TERM) exit 143 ;; esac
+  fi
+  echo "[deploy] ERROR: received $signal; rolling back" >&2
+  case "$signal" in
+    HUP) ROLLBACK_EXIT_CODE=129 ;;
+    INT) ROLLBACK_EXIT_CODE=130 ;;
+    TERM) ROLLBACK_EXIT_CODE=143 ;;
+  esac
+  rollback_reachd
+}
+
 trap cleanup EXIT
 trap rollback_reachd ERR
+trap 'rollback_signal HUP' HUP
+trap 'rollback_signal INT' INT
+trap 'rollback_signal TERM' TERM
 
 echo "[deploy] agent version: ${AGENT_VERSION}"
 
@@ -311,6 +387,10 @@ case "$BACKUP_RETAIN" in
 esac
 
 if [ "$PUBLISH_AGENT_RELEASE" = 1 ] && [ -z "$ARTIFACT_DIR" ]; then
+  if [ -z "${REACH_RELEASE_KEY:-}" ]; then
+    echo "[deploy] ERROR: publishing hub-built artifacts requires REACH_RELEASE_KEY" >&2
+    exit 1
+  fi
   BUILD_ARTIFACT_DIR="$(mktemp -d)"
   ARTIFACT_DIR="$BUILD_ARTIFACT_DIR"
 
@@ -329,16 +409,16 @@ if [ "$PUBLISH_AGENT_RELEASE" = 1 ] && [ -z "$ARTIFACT_DIR" ]; then
     --dir "$ARTIFACT_DIR" --version "$AGENT_VERSION" --commit "$deploy_commit"
   if sign_manifest_if_configured "$ARTIFACT_DIR"; then
     echo "[deploy] signed release manifest"
-  elif [ "${REACH_REQUIRE_SIGNED_MANIFEST:-0}" = 1 ]; then
-    echo "[deploy] ERROR: REACH_REQUIRE_SIGNED_MANIFEST=1 but REACH_RELEASE_KEY is not set" >&2
-    exit 1
   else
-    echo "[deploy] WARNING: manifest.json.minisig not created; update-binary will reject this release"
+    echo "[deploy] ERROR: failed to sign release manifest" >&2
+    exit 1
   fi
+  go run ./cmd/reach-release verify --manifest "$ARTIFACT_DIR/manifest.json" --artifacts-dir "$ARTIFACT_DIR"
 elif [ "$PUBLISH_AGENT_RELEASE" = 1 ]; then
   require_agent_artifacts "$ARTIFACT_DIR"
   "$UV_BIN" run --script scripts/verify-release-artifacts.py \
     --dir "$ARTIFACT_DIR" --version "$AGENT_VERSION" --commit "$deploy_commit"
+  go run ./cmd/reach-release verify --manifest "$ARTIFACT_DIR/manifest.json" --artifacts-dir "$ARTIFACT_DIR"
 fi
 
 if [ "$PUBLISH_AGENT_RELEASE" = 1 ] && [ -e "$AGENT_DOWNLOAD_DIR" ] && [ "${REACH_OVERWRITE_VERSION:-0}" != 1 ]; then
@@ -365,6 +445,10 @@ else
   DB_PATH="$(sudo "$UV_BIN" run --script scripts/read-reach-config.py --config /etc/reach/config.yaml db_path)"
   LISTEN_ADDR="$(sudo "$UV_BIN" run --script scripts/read-reach-config.py --config /etc/reach/config.yaml listen_addr)"
 fi
+case "$DB_PATH" in
+  /*) ;;
+  *) echo "[deploy] ERROR: db_path must be absolute: $DB_PATH" >&2; exit 1 ;;
+esac
 case "$LISTEN_ADDR" in
   127.0.0.1:*|localhost:*) ;;
   *) echo "[deploy] ERROR: refusing listen_addr not accepted by Reach: $LISTEN_ADDR" >&2; exit 1 ;;
@@ -394,11 +478,24 @@ sudo install -d -m 0755 "$DASHBOARD_STAGE"
 sudo cp -a dashboard/.output/public/. "$DASHBOARD_STAGE/"
 
 echo "[deploy] staging auxiliary binary..."
+MUTATION_STARTED=1
 CARRIER_ROLLBACK="/opt/reach/reach-ws-carrier.rollback.${DEPLOY_TS}"
+CARRIER_UNIT_BACKUP="/var/lib/reach/deploy-backups/reach-ws-carrier.service.${DEPLOY_TS}"
+sudo install -d -m 0700 /var/lib/reach/deploy-backups
 if sudo test -f /opt/reach/reach-ws-carrier; then
+  CARRIER_EXISTED=1
   sudo cp -a /opt/reach/reach-ws-carrier "$CARRIER_ROLLBACK"
-  CARRIER_ROLLBACK_ARMED=1
 fi
+if sudo test -f /etc/systemd/system/reach-ws-carrier.service; then
+  CARRIER_UNIT_EXISTED=1
+  sudo cp -a /etc/systemd/system/reach-ws-carrier.service "$CARRIER_UNIT_BACKUP"
+fi
+if systemctl is-enabled --quiet reach-ws-carrier.service 2>/dev/null; then CARRIER_WAS_ENABLED=1; fi
+if systemctl is-active --quiet reach-ws-carrier.service 2>/dev/null; then CARRIER_WAS_ACTIVE=1; fi
+if systemctl is-enabled --quiet reach-wstunnel.service 2>/dev/null; then LEGACY_WAS_ENABLED=1; fi
+if systemctl is-active --quiet reach-wstunnel.service 2>/dev/null; then LEGACY_WAS_ACTIVE=1; fi
+CARRIER_STATE_SNAPSHOTTED=1
+CARRIER_ROLLBACK_ARMED=1
 sudo install -m 0755 /tmp/reach-ws-carrier /opt/reach/reach-ws-carrier.candidate
 sudo mv -f /opt/reach/reach-ws-carrier.candidate /opt/reach/reach-ws-carrier
 rm -f /tmp/reach-ws-carrier
@@ -438,11 +535,15 @@ sudo systemctl enable --now reach-ws-carrier.service
 
 echo "[deploy] swapping dashboard into place..."
 if sudo test -d /opt/reach-dashboard; then
+  DASHBOARD_EXISTED=1
   DASHBOARD_SWAP_ARMED=1
+  DASHBOARD_MUTATED=1
   sudo "$UV_BIN" run --script scripts/atomic-directory-swap.py "$DASHBOARD_STAGE" /opt/reach-dashboard
   sudo mv "$DASHBOARD_STAGE" "$DASHBOARD_BACKUP"
   DASHBOARD_STAGE=""
 else
+  DASHBOARD_SWAP_ARMED=1
+  DASHBOARD_MUTATED=1
   sudo "$UV_BIN" run --script scripts/atomic-directory-swap.py "$DASHBOARD_STAGE" /opt/reach-dashboard
   DASHBOARD_STAGE=""
 fi
@@ -469,9 +570,10 @@ fi
 echo "[deploy] database backup: $DB_BACKUP_PATH"
 
 REACHD_ROLLBACK="/opt/reach/reachd.rollback.${DEPLOY_TS}"
+ROLLBACK_ARMED=1
 if sudo test -f /opt/reach/reachd; then
+  REACHD_EXISTED=1
   sudo cp -a /opt/reach/reachd "$REACHD_ROLLBACK"
-  ROLLBACK_ARMED=1
 fi
 sudo install -m 0755 /tmp/reachd-build /opt/reach/reachd.candidate
 sudo mv -f /opt/reach/reachd.candidate /opt/reach/reachd
@@ -594,6 +696,7 @@ if [ "$PUBLISH_AGENT_RELEASE" = 1 ]; then
 fi
 
 ROLLBACK_ARMED=0
+CARRIER_STATE_SNAPSHOTTED=0
 CARRIER_ROLLBACK_ARMED=0
 DASHBOARD_SWAP_ARMED=0
 
@@ -602,6 +705,10 @@ if ! sudo "$UV_BIN" run --script scripts/prune-deploy-backups.py --retain "$BACK
   '/opt/reach-dashboard.backup.*' \
   '/opt/reach/reachd.rollback.*' \
   '/opt/reach/reach-ws-carrier.rollback.*' \
+  '/var/lib/reach/deploy-backups/reach-ws-carrier.service.*' \
+  '/var/lib/reach/deploy-backups/agent-publication.*' \
+  "$AGENT_DOWNLOAD_ROOT/v*.replaced.*" \
+  "$DB_BACKUP_DIR/failed.*" \
   "$DB_BACKUP_DIR/$(basename "$DB_PATH").*"; then
   echo "[deploy] WARNING: deployment succeeded, but backup pruning failed" >&2
 fi

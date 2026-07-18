@@ -8,12 +8,13 @@ set -Eeuo pipefail
 
 cd "$(dirname "$0")/.."
 
+SOURCE_ROOT="$PWD"
 export CGO_ENABLED=0
 DEPLOY_HOST="${REACH_DEPLOY_HOST:-reach-hub}"
 
 require_clean_product_tree() {
   local status
-  status="$(git status --porcelain --untracked-files=normal)"
+  status="$(git -C "$SOURCE_ROOT" status --porcelain --untracked-files=normal)"
   status="$(printf '%s\n' "$status" | grep -v '^?? \.claude/$' || true)"
   if [ -n "$status" ]; then
     echo "[mac] ERROR: product tree has tracked or nonignored untracked changes" >&2
@@ -55,14 +56,18 @@ build_agent() {
   local arm="${4:-}"
   echo "[mac] building reach-agent (${goos}/${arch}${arm:+ GOARM=$arm})..."
   if [ -n "$arm" ]; then
-    GOOS="$goos" GOARCH="$arch" GOARM="$arm" CGO_ENABLED=0 go build -ldflags "$AGENT_LDFLAGS" -o "$out" ./cmd/reach-agent
+    GOOS="$goos" GOARCH="$arch" GOARM="$arm" CGO_ENABLED=0 go build -ldflags "${AGENT_LDFLAGS[*]}" -o "$out" ./cmd/reach-agent
   else
-    GOOS="$goos" GOARCH="$arch" CGO_ENABLED=0 go build -ldflags "$AGENT_LDFLAGS" -o "$out" ./cmd/reach-agent
+    GOOS="$goos" GOARCH="$arch" CGO_ENABLED=0 go build -ldflags "${AGENT_LDFLAGS[*]}" -o "$out" ./cmd/reach-agent
   fi
 }
 
 AGENT_VERSION="${REACH_AGENT_VERSION:-$(version_from_git)}"
-AGENT_LDFLAGS="-X main.version=${AGENT_VERSION}"
+bash scripts/validate-release-version.sh "$AGENT_VERSION" || {
+  echo "[mac] ERROR: invalid agent version" >&2
+  exit 1
+}
+AGENT_LDFLAGS=("-X" "main.version=${AGENT_VERSION}")
 RELEASE_KEY="${REACH_RELEASE_KEY:-$HOME/.minisign/reach-release.key}"
 RELEASE_PASSWORD_FILE="${REACH_RELEASE_KEY_PASSWORD_FILE:-}"
 if [ -z "$RELEASE_PASSWORD_FILE" ] && [ -f "$HOME/.minisign/reach-release.pass" ]; then
@@ -73,18 +78,24 @@ fi
 
 echo "[mac] agent version: $AGENT_VERSION"
 
-ARTIFACT_DIR="$(mktemp -d)"
-AGENT_TAR="/tmp/reach-agent-artifacts-${AGENT_VERSION}.tar.gz"
-REMOTE_ARTIFACT_DIR="/tmp/reach-agent-artifacts-${AGENT_VERSION}-$(date -u +%Y%m%dT%H%M%SZ)"
-REMOTE_AGENT_TAR="/tmp/$(basename "$AGENT_TAR")"
+RUN_ID="$(printf '%s' "$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM" | tr -cd 'A-Za-z0-9._-')"
+BUILD_WORKTREE="$SOURCE_ROOT/.claude/worktrees/deploy-$RUN_ID"
+git worktree add --detach "$BUILD_WORKTREE" "$DEPLOY_COMMIT" >/dev/null
+cd "$BUILD_WORKTREE"
+ARTIFACT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/reach-agent-artifacts.XXXXXX")"
+AGENT_TAR="${ARTIFACT_DIR}.tar.gz"
+REMOTE_ARTIFACT_DIR=""
+REMOTE_AGENT_TAR=""
 cleanup() {
   trash "$ARTIFACT_DIR" "$AGENT_TAR" 2>/dev/null || true
-  ssh "$DEPLOY_HOST" "bash -s" -- "$REMOTE_ARTIFACT_DIR" "$REMOTE_AGENT_TAR" <<'REMOTE_CLEANUP' >/dev/null 2>&1 || true
+  git -C "$SOURCE_ROOT" worktree remove --force "$BUILD_WORKTREE" >/dev/null 2>&1 || true
+  if [ -n "$REMOTE_ARTIFACT_DIR" ] && [ -n "$REMOTE_AGENT_TAR" ]; then
+    ssh "$DEPLOY_HOST" "bash -s" -- "$REMOTE_ARTIFACT_DIR" "$REMOTE_AGENT_TAR" <<'REMOTE_CLEANUP' >/dev/null 2>&1 || true
 set -u
 artifact_dir="$1"
 artifact_tar="$2"
-case "$artifact_dir" in /tmp/reach-agent-artifacts-*) ;; *) exit 1 ;; esac
-case "$artifact_tar" in /tmp/reach-agent-artifacts-*.tar.gz) ;; *) exit 1 ;; esac
+case "$artifact_dir" in /tmp/reach-agent-artifacts.*) ;; *) exit 1 ;; esac
+case "$artifact_tar" in /tmp/reach-agent-artifacts.*.tar.gz) ;; *) exit 1 ;; esac
 if command -v trash >/dev/null 2>&1; then
   trash "$artifact_dir" "$artifact_tar" 2>/dev/null || true
 else
@@ -96,6 +107,7 @@ else
   fi
 fi
 REMOTE_CLEANUP
+  fi
 }
 trap cleanup EXIT
 
@@ -119,8 +131,20 @@ if [ -n "$RELEASE_PASSWORD_FILE" ]; then
   SIGN_ARGS+=(--password-file "$RELEASE_PASSWORD_FILE")
 fi
 go run ./cmd/reach-release sign "${SIGN_ARGS[@]}" --manifest "$ARTIFACT_DIR/manifest.json" --out "$ARTIFACT_DIR/manifest.json.minisig" --trusted-comment "reach-agent version=$AGENT_VERSION commit=$DEPLOY_COMMIT"
+go run ./cmd/reach-release verify --manifest "$ARTIFACT_DIR/manifest.json" --artifacts-dir "$ARTIFACT_DIR"
 
 tar czf "$AGENT_TAR" -C "$ARTIFACT_DIR" .
+
+require_clean_product_tree
+test "$(git -C "$SOURCE_ROOT" rev-parse HEAD)" = "$DEPLOY_COMMIT" || {
+  echo "[mac] ERROR: source HEAD changed while building artifacts" >&2
+  exit 1
+}
+REMOTE_PATHS="$(ssh "$DEPLOY_HOST" 'artifact_dir=$(mktemp -d /tmp/reach-agent-artifacts.XXXXXX); artifact_tar="${artifact_dir}.tar.gz"; : > "$artifact_tar"; printf "%s\n%s\n" "$artifact_dir" "$artifact_tar"')"
+REMOTE_ARTIFACT_DIR="${REMOTE_PATHS%%$'\n'*}"
+REMOTE_AGENT_TAR="$(printf '%s\n' "$REMOTE_PATHS" | tail -n 1 | tr -d '\r\n')"
+case "$REMOTE_ARTIFACT_DIR" in /tmp/reach-agent-artifacts.*) ;; *) echo "[mac] ERROR: unsafe remote artifact directory" >&2; exit 1 ;; esac
+case "$REMOTE_AGENT_TAR" in /tmp/reach-agent-artifacts.*.tar.gz) ;; *) echo "[mac] ERROR: unsafe remote artifact tar" >&2; exit 1 ;; esac
 
 echo "[mac] uploading signed agent artifacts to ${DEPLOY_HOST}..."
 scp "$AGENT_TAR" "${DEPLOY_HOST}:${REMOTE_AGENT_TAR}"
@@ -135,8 +159,8 @@ artifact_dir="$2"
 artifact_tar="$3"
 agent_version="$4"
 cleanup_remote() {
-  case "$artifact_dir" in /tmp/reach-agent-artifacts-*) ;; *) return 1 ;; esac
-  case "$artifact_tar" in /tmp/reach-agent-artifacts-*.tar.gz) ;; *) return 1 ;; esac
+  case "$artifact_dir" in /tmp/reach-agent-artifacts.*) ;; *) return 1 ;; esac
+  case "$artifact_tar" in /tmp/reach-agent-artifacts.*.tar.gz) ;; *) return 1 ;; esac
   if command -v trash >/dev/null 2>&1; then
     trash "$artifact_dir" "$artifact_tar" 2>/dev/null || true
   else
@@ -145,6 +169,19 @@ cleanup_remote() {
   fi
 }
 trap cleanup_remote EXIT
+cd "$HOME"
+command -v flock >/dev/null || { echo "[mac] ERROR: flock is required on hub" >&2; exit 1; }
+lock_dir="${XDG_RUNTIME_DIR:-$HOME/.cache/reach}"
+mkdir -p "$lock_dir"
+exec 9>"$lock_dir/deploy.lock"
+if ! flock -n 9; then
+  echo "[mac] ERROR: another Reach deployment is running" >&2
+  exit 1
+fi
+if [ ! -d "$HOME/reach/.git" ]; then
+  command -v gh >/dev/null || { echo "[mac] ERROR: hub clone missing at ~/reach and gh is unavailable" >&2; exit 1; }
+  gh repo clone Yan-Yu-Lin/reach "$HOME/reach"
+fi
 cd "$HOME/reach"
 status="$(git status --porcelain --untracked-files=normal)"
 status="$(printf '%s\n' "$status" | grep -v '^?? \.claude/$' || true)"
@@ -170,8 +207,9 @@ REACH_DEPLOY_COMMIT="$deploy_commit" \
 REACH_PUBLISH_AGENT_RELEASE=1 \
 REACH_AGENT_VERSION="$agent_version" \
 REACH_AGENT_ARTIFACT_DIR="$artifact_dir" \
+REACH_DEPLOY_LOCK_HELD=1 \
 CGO_ENABLED=0 \
-bash scripts/deploy-jason.sh
+bash scripts/deploy-jason.sh 9>&9
 REMOTE_DEPLOY
 
 echo "[mac] done. Published reach-agent v${AGENT_VERSION}."

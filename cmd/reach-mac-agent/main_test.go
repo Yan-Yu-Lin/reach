@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -62,7 +63,7 @@ func TestHelloReconcilesAfterSubscriptionBoundary(t *testing.T) {
 	}
 }
 
-func TestCursorWriteFailureDoesNotAdvanceMemory(t *testing.T) {
+func TestCursorWriteFailureAdvancesMemoryWithoutLivelock(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, "id: 42\nevent: agent.heartbeat\ndata: {}\n\n")
@@ -76,8 +77,8 @@ func TestCursorWriteFailureDoesNotAdvanceMemory(t *testing.T) {
 	}
 	lastID := "41"
 	err := agent.stream(context.Background(), &lastID)
-	if !errors.Is(err, want) || lastID != "41" {
-		t.Fatalf("error=%v memory cursor=%q", err, lastID)
+	if err != nil || lastID != "42" || agent.readLastEventID() != "" {
+		t.Fatalf("error=%v memory cursor=%q disk cursor=%q", err, lastID, agent.readLastEventID())
 	}
 }
 
@@ -175,6 +176,49 @@ func (zeroReader) Read(p []byte) (int, error) {
 		p[i] = 'x'
 	}
 	return len(p), nil
+}
+
+func TestParseSSEAcceptsEventAboveDefaultScannerLimit(t *testing.T) {
+	payload := strings.Repeat("x", 70*1024)
+	var got string
+	err := parseSSE(context.Background(), strings.NewReader("id: 1\nevent: test\ndata: "+payload+"\n\n"), func(ev Event) error {
+		got = ev.Data
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != payload {
+		t.Fatalf("payload length = %d, want %d", len(got), len(payload))
+	}
+}
+
+func TestRunBackoffGrowsAcrossRepeatedStreamFailures(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var delays []time.Duration
+	agent := Agent{
+		cfg:          Config{OutFile: filepath.Join(t.TempDir(), "reach.conf")},
+		log:          log.New(io.Discard, "", 0),
+		syncOverride: func(context.Context) error { return nil },
+		streamFn:     func(context.Context, *string) error { return errors.New("events unavailable") },
+		backoffHook: func(delay time.Duration) {
+			delays = append(delays, delay)
+			if len(delays) == 3 {
+				cancel()
+			}
+		},
+	}
+	_ = agent.Run(ctx)
+	want := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second}
+	if len(delays) != len(want) {
+		t.Fatalf("delays = %v", delays)
+	}
+	for i := range want {
+		if delays[i] != want[i] {
+			t.Fatalf("delays = %v, want %v", delays, want)
+		}
+	}
 }
 
 func TestParseSSEStopsOnCallbackError(t *testing.T) {

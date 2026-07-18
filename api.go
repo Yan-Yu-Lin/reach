@@ -175,7 +175,11 @@ func (s *Server) publishEvent(ctx context.Context, typ, machineID string, data m
 		}
 		publishCtx, cancel := context.WithTimeout(base, eventPublishTimeout)
 		defer cancel()
-		s.events.Publish(publishCtx, typ, machineID, data)
+		published := s.events.Publish(publishCtx, typ, machineID, data)
+		if published.Type == "machine.resync_required" && typ != published.Type {
+			reason, _ := published.Data["reason"].(string)
+			log.Printf("event publish failed: type=%s machine_id=%s reason=%s", typ, machineID, reason)
+		}
 	}
 }
 

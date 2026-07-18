@@ -96,6 +96,7 @@ Usage:
 
 const (
 	maxSSHConfigBytes = 2 << 20
+	maxSSEEventBytes  = 2 << 20
 	eventSyncAttempts = 3
 )
 
@@ -106,6 +107,8 @@ type Agent struct {
 	log          *log.Logger
 	syncOverride func(context.Context) error
 	cursorWriter func(string) error
+	streamFn     func(context.Context, *string) error
+	backoffHook  func(time.Duration)
 }
 
 func (a Agent) syncOnce(ctx context.Context) error {
@@ -119,19 +122,25 @@ func (a Agent) Run(ctx context.Context) error {
 	backoff := time.Second
 	lastID := a.readLastEventID()
 	for ctx.Err() == nil {
-		// Always do a full reconciliation before opening a new event stream. SSE
-		// is only a wake-up signal; config correctness must not depend on never
-		// missing an in-memory event while disconnected or while proxies recycle
-		// long-lived connections.
 		if err := a.syncOnce(ctx); err != nil {
 			a.log.Printf("reconnect sync failed: %v", err)
 		} else {
-			backoff = time.Second
-			err := a.stream(ctx, &lastID)
+			stream := a.streamFn
+			if stream == nil {
+				stream = a.stream
+			}
+			startedAt := time.Now()
+			err := stream(ctx, &lastID)
 			if ctx.Err() != nil {
 				break
 			}
 			a.log.Printf("event stream ended: %v", err)
+			if time.Since(startedAt) >= 10*time.Second {
+				backoff = time.Second
+			}
+		}
+		if a.backoffHook != nil {
+			a.backoffHook(backoff)
 		}
 		t := time.NewTimer(backoff)
 		select {
@@ -180,7 +189,7 @@ func (a Agent) stream(ctx context.Context, lastID *string) error {
 			a.log.Printf("server requested event resync; resetting cursor before reconnect")
 			if lastID != nil {
 				if err := a.persistLastEventID(""); err != nil {
-					return fmt.Errorf("clear event cursor: %w", err)
+					a.log.Printf("could not persist cleared event cursor; continuing safely: %v", err)
 				}
 				*lastID = ""
 			}
@@ -198,7 +207,7 @@ func (a Agent) stream(ctx context.Context, lastID *string) error {
 		}
 		if lastID != nil && ev.ID != "" && ev.ID != "0" {
 			if err := a.persistLastEventID(ev.ID); err != nil {
-				return fmt.Errorf("persist event cursor %s: %w", ev.ID, err)
+				a.log.Printf("could not persist event cursor %s; continuing safely: %v", ev.ID, err)
 			}
 			*lastID = ev.ID
 		}
@@ -229,6 +238,7 @@ func (a Agent) syncWithRetry(ctx context.Context, eventType string) error {
 
 func parseSSE(ctx context.Context, r io.Reader, fn func(Event) error) error {
 	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 64*1024), maxSSEEventBytes)
 	var ev Event
 	var data []string
 	for sc.Scan() {
@@ -442,7 +452,7 @@ func writeAtomic(path string, data []byte, mode os.FileMode) error {
 		_ = tmp.Close()
 		return err
 	}
-	if err := syncFileDurable(tmp); err != nil {
+	if err := durableSync(tmp); err != nil {
 		_ = tmp.Close()
 		return err
 	}

@@ -4,6 +4,6 @@ package main
 
 import "os"
 
-func syncFileDurable(file *os.File) error {
+func durableSync(file *os.File) error {
 	return file.Sync()
 }
