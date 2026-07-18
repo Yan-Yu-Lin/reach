@@ -203,7 +203,11 @@ func verifyCommand(args []string) error {
 			return fmt.Errorf("release manifest is missing git_commit")
 		}
 		for _, target := range releaseTargets {
-			if err := verifyReleaseBinary(filepath.Join(*artifactsDir, target.Name), target, parsed.GitCommit); err != nil {
+			asset, ok := parsed.Assets[target.Name]
+			if !ok {
+				return fmt.Errorf("release manifest is missing %s", target.Name)
+			}
+			if err := verifyReleaseBinary(filepath.Join(*artifactsDir, target.Name), target, asset, parsed.GitCommit); err != nil {
 				return err
 			}
 		}
@@ -212,7 +216,15 @@ func verifyCommand(args []string) error {
 	return nil
 }
 
-func verifyReleaseBinary(path string, target releaseTarget, commit string) error {
+func verifyReleaseBinary(path string, target releaseTarget, asset releaseAsset, commit string) error {
+	binary, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", target.Name, err)
+	}
+	sum := sha256.Sum256(binary)
+	if hex.EncodeToString(sum[:]) != asset.SHA256 || int64(len(binary)) != asset.Size {
+		return fmt.Errorf("%s does not match signed manifest checksum or size", target.Name)
+	}
 	info, err := buildinfo.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("inspect %s build info: %w", target.Name, err)
