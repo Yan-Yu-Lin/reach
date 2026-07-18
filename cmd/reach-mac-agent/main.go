@@ -94,9 +94,25 @@ Usage:
 `, version)
 }
 
+const (
+	maxSSHConfigBytes = 2 << 20
+	eventSyncAttempts = 3
+)
+
+var errEventResync = errors.New("event resync required")
+
 type Agent struct {
-	cfg Config
-	log *log.Logger
+	cfg          Config
+	log          *log.Logger
+	syncOverride func(context.Context) error
+	cursorWriter func(string) error
+}
+
+func (a Agent) syncOnce(ctx context.Context) error {
+	if a.syncOverride != nil {
+		return a.syncOverride(ctx)
+	}
+	return a.Sync(ctx)
 }
 
 func (a Agent) Run(ctx context.Context) error {
@@ -107,7 +123,7 @@ func (a Agent) Run(ctx context.Context) error {
 		// is only a wake-up signal; config correctness must not depend on never
 		// missing an in-memory event while disconnected or while proxies recycle
 		// long-lived connections.
-		if err := a.Sync(ctx); err != nil {
+		if err := a.syncOnce(ctx); err != nil {
 			a.log.Printf("reconnect sync failed: %v", err)
 		} else {
 			backoff = time.Second
@@ -131,6 +147,7 @@ func (a Agent) Run(ctx context.Context) error {
 }
 
 func (a Agent) stream(ctx context.Context, lastID *string) error {
+	cursorless := lastID == nil || *lastID == ""
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(a.cfg.APIURL, "/")+"/api/admin/events", nil)
 	if err != nil {
 		return err
@@ -150,37 +167,64 @@ func (a Agent) stream(ctx context.Context, lastID *string) error {
 		return fmt.Errorf("events returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	a.log.Printf("connected to Reach event stream")
+	reconciledAtBoundary := false
 	return parseSSE(ctx, resp.Body, func(ev Event) error {
 		syncRequired := false
-		resetCursor := false
 		switch ev.Type {
 		case "hello":
+			if cursorless && !reconciledAtBoundary {
+				syncRequired = true
+				reconciledAtBoundary = true
+			}
 		case "machine.resync_required":
-			a.log.Printf("server requested event resync; resetting cursor and syncing SSH config")
-			syncRequired = true
-			resetCursor = true
-		case "ssh_config.changed", "machine.created", "machine.desired_changed", "machine.observed_changed", "machine.online", "machine.degraded", "machine.offline", "machine.gone", "machine.disabled", "machine.enabled", "machine.retiring", "machine.retired":
+			a.log.Printf("server requested event resync; resetting cursor before reconnect")
+			if lastID != nil {
+				if err := a.persistLastEventID(""); err != nil {
+					return fmt.Errorf("clear event cursor: %w", err)
+				}
+				*lastID = ""
+			}
+			return errEventResync
+		case "ssh_config.changed", "machine.created", "machine.desired_changed", "machine.observed_changed", "machine.health_changed", "machine.online", "machine.degraded", "machine.offline", "machine.gone", "machine.disabled", "machine.enabled", "machine.retiring", "machine.retired":
 			a.log.Printf("event %s id=%s; syncing SSH config", ev.Type, ev.ID)
 			syncRequired = true
 		default:
 			a.log.Printf("event %s id=%s", ev.Type, ev.ID)
 		}
 		if syncRequired {
-			if err := a.Sync(ctx); err != nil {
-				return fmt.Errorf("sync for event %s: %w", ev.Type, err)
+			if err := a.syncWithRetry(ctx, ev.Type); err != nil {
+				return err
 			}
 		}
-		if lastID != nil {
-			if resetCursor {
-				*lastID = ""
-				a.writeLastEventID("")
-			} else if ev.ID != "" && ev.ID != "0" {
-				*lastID = ev.ID
-				a.writeLastEventID(ev.ID)
+		if lastID != nil && ev.ID != "" && ev.ID != "0" {
+			if err := a.persistLastEventID(ev.ID); err != nil {
+				return fmt.Errorf("persist event cursor %s: %w", ev.ID, err)
 			}
+			*lastID = ev.ID
 		}
 		return nil
 	})
+}
+
+func (a Agent) syncWithRetry(ctx context.Context, eventType string) error {
+	var err error
+	for attempt := 0; attempt < eventSyncAttempts; attempt++ {
+		if err = a.syncOnce(ctx); err == nil {
+			return nil
+		}
+		if attempt == eventSyncAttempts-1 {
+			break
+		}
+		delay := time.Duration(1<<attempt) * 100 * time.Millisecond
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return fmt.Errorf("sync for event %s after %d attempts: %w", eventType, eventSyncAttempts, err)
 }
 
 func parseSSE(ctx context.Context, r io.Reader, fn func(Event) error) error {
@@ -239,7 +283,10 @@ func (a Agent) Sync(ctx context.Context) error {
 		return err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	body, err := readBounded(resp.Body, maxSSHConfigBytes)
+	if err != nil {
+		return fmt.Errorf("read ssh-config response: %w", err)
+	}
 	if resp.StatusCode/100 != 2 {
 		return fmt.Errorf("ssh-config returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
@@ -253,6 +300,17 @@ func (a Agent) Sync(ctx context.Context) error {
 	}
 	a.log.Printf("synced %s", a.cfg.OutFile)
 	return nil
+}
+
+func readBounded(r io.Reader, limit int64) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > limit {
+		return nil, fmt.Errorf("response exceeds %d bytes", limit)
+	}
+	return body, nil
 }
 
 func (a *Agent) ensureServiceToken(ctx context.Context) {
@@ -402,9 +460,11 @@ func (a Agent) readLastEventID() string {
 	return strings.TrimSpace(string(b))
 }
 
-func (a Agent) writeLastEventID(id string) {
-	_ = os.MkdirAll(a.stateDir(), 0o700)
-	_ = os.WriteFile(filepath.Join(a.stateDir(), "last-event-id"), []byte(id+"\n"), 0o600)
+func (a Agent) persistLastEventID(id string) error {
+	if a.cursorWriter != nil {
+		return a.cursorWriter(id)
+	}
+	return writeAtomic(filepath.Join(a.stateDir(), "last-event-id"), []byte(id+"\n"), 0o600)
 }
 
 func ensureInclude(configPath, includePath string) error {

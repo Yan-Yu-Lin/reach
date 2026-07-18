@@ -112,17 +112,49 @@ require_agent_artifacts() {
   done
 }
 
+require_clean_tree() {
+  local status
+  status="$(git status --porcelain --untracked-files=normal)"
+  status="$(printf '%s\n' "$status" | grep -v '^?? \.claude/$' || true)"
+  if [ -n "$status" ]; then
+    echo "[deploy] ERROR: product tree has tracked or nonignored untracked changes" >&2
+    printf '%s\n' "$status" >&2
+    exit 1
+  fi
+}
+
+require_clean_tree
 if [ -n "${REACH_DEPLOY_COMMIT:-}" ]; then
   echo "[deploy] checking out explicit commit ${REACH_DEPLOY_COMMIT}..."
-  if ! git rev-parse --verify --quiet "${REACH_DEPLOY_COMMIT}^{commit}" >/dev/null; then
-    git fetch origin "$REACH_DEPLOY_COMMIT"
+  git fetch origin
+  if ! git cat-file -e "${REACH_DEPLOY_COMMIT}^{commit}" 2>/dev/null; then
+    echo "[deploy] ERROR: commit ${REACH_DEPLOY_COMMIT} is unavailable after fetching origin" >&2
+    exit 1
   fi
   deploy_commit="$(git rev-parse "${REACH_DEPLOY_COMMIT}^{commit}")"
+  if [ -z "$(git for-each-ref --format='%(refname)' --contains "$deploy_commit" refs/remotes/origin/)" ]; then
+    echo "[deploy] ERROR: commit ${deploy_commit} is not reachable from an origin branch" >&2
+    exit 1
+  fi
   git checkout --detach "$deploy_commit"
   test "$(git rev-parse HEAD)" = "$deploy_commit"
 else
+  if ! current_branch="$(git symbolic-ref --quiet --short HEAD)"; then
+    default_branch="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+    default_branch="${default_branch#origin/}"
+    if [ -z "$default_branch" ]; then
+      default_branch=main
+    fi
+    echo "[deploy] detached HEAD; switching to ${default_branch}..."
+    if git show-ref --verify --quiet "refs/heads/$default_branch"; then
+      git switch "$default_branch"
+    else
+      git switch --track -c "$default_branch" "origin/$default_branch"
+    fi
+  fi
   echo "[deploy] pulling latest..."
   git pull --ff-only
+  deploy_commit="$(git rev-parse HEAD)"
 fi
 
 AGENT_VERSION="${REACH_AGENT_VERSION:-$(version_from_git)}"
@@ -134,6 +166,8 @@ ARTIFACT_DIR="${REACH_AGENT_ARTIFACT_DIR:-}"
 BUILD_ARTIFACT_DIR=""
 ROLLBACK_ARMED=0
 SERVICE_STOPPED=0
+DB_MAY_HAVE_MIGRATED=0
+DB_BACKUP_PATH=""
 REACHD_ROLLBACK=""
 CARRIER_ROLLBACK=""
 CARRIER_ROLLBACK_ARMED=0
@@ -221,12 +255,41 @@ rollback_reachd() {
     systemctl is-active reach-ws-carrier.service >&2
   fi
   if [ "$ROLLBACK_ARMED" = 1 ]; then
-    echo "[deploy] ERROR: deployment failed; restoring previous reachd" >&2
+    echo "[deploy] ERROR: deployment failed; restoring previous reachd binary" >&2
     sudo systemctl stop reachd
+    if [ "$DB_MAY_HAVE_MIGRATED" = 1 ]; then
+      failed_db_dir="$(dirname "$DB_PATH")/backups/failed.${DEPLOY_TS}"
+      echo "[deploy] preserving failed database files in $failed_db_dir" >&2
+      sudo install -d -m 0700 "$failed_db_dir"
+      for db_file in "$DB_PATH" "$DB_PATH-wal" "$DB_PATH-shm"; do
+        if sudo test -e "$db_file"; then
+          sudo cp -a "$db_file" "$failed_db_dir/"
+        fi
+      done
+    fi
     sudo install -m 0755 "$REACHD_ROLLBACK" /opt/reach/reachd.rollback-candidate
     sudo mv -f /opt/reach/reachd.rollback-candidate /opt/reach/reachd
     sudo systemctl start reachd
-    systemctl is-active reachd >&2
+    rollback_ready=0
+    for attempt in $(seq 1 30); do
+      if systemctl is-active --quiet reachd \
+        && "$UV_BIN" run --script scripts/check-local-service.py "$LISTEN_ADDR" \
+        && sudo /opt/reach/reachd db-check --config /etc/reach/config.yaml; then
+        rollback_ready=1
+        break
+      fi
+      sleep 1
+    done
+    if [ "$rollback_ready" != 1 ]; then
+      sudo systemctl stop reachd
+      echo "[deploy] ERROR: previous reachd cannot become ready with the migrated database; leaving reachd stopped" >&2
+      echo "[deploy] ERROR: predeploy database backup: $DB_BACKUP_PATH" >&2
+      if [ "$DB_MAY_HAVE_MIGRATED" = 1 ]; then
+        echo "[deploy] ERROR: failed database forensic set: $failed_db_dir" >&2
+      fi
+      echo "[deploy] ERROR: database was not restored automatically; operator approval is required" >&2
+      sudo journalctl -u reachd -n 80 --no-pager >&2 || true
+    fi
   elif [ "$SERVICE_STOPPED" = 1 ]; then
     echo "[deploy] ERROR: deployment failed while reachd was stopped; restarting previous service" >&2
     sudo systemctl start reachd
@@ -262,6 +325,8 @@ if [ "$PUBLISH_AGENT_RELEASE" = 1 ] && [ -z "$ARTIFACT_DIR" ]; then
   build_agent "$ARTIFACT_DIR/reach-agent_windows_arm64.exe" windows arm64
   write_checksums "$ARTIFACT_DIR"
   create_manifest "$ARTIFACT_DIR"
+  "$UV_BIN" run --script scripts/verify-release-artifacts.py \
+    --dir "$ARTIFACT_DIR" --version "$AGENT_VERSION" --commit "$deploy_commit"
   if sign_manifest_if_configured "$ARTIFACT_DIR"; then
     echo "[deploy] signed release manifest"
   elif [ "${REACH_REQUIRE_SIGNED_MANIFEST:-0}" = 1 ]; then
@@ -272,6 +337,8 @@ if [ "$PUBLISH_AGENT_RELEASE" = 1 ] && [ -z "$ARTIFACT_DIR" ]; then
   fi
 elif [ "$PUBLISH_AGENT_RELEASE" = 1 ]; then
   require_agent_artifacts "$ARTIFACT_DIR"
+  "$UV_BIN" run --script scripts/verify-release-artifacts.py \
+    --dir "$ARTIFACT_DIR" --version "$AGENT_VERSION" --commit "$deploy_commit"
 fi
 
 if [ "$PUBLISH_AGENT_RELEASE" = 1 ] && [ -e "$AGENT_DOWNLOAD_DIR" ] && [ "${REACH_OVERWRITE_VERSION:-0}" != 1 ]; then
@@ -410,6 +477,7 @@ sudo install -m 0755 /tmp/reachd-build /opt/reach/reachd.candidate
 sudo mv -f /opt/reach/reachd.candidate /opt/reach/reachd
 rm -f /tmp/reachd-build
 
+DB_MAY_HAVE_MIGRATED=1
 sudo systemctl start reachd
 SERVICE_STOPPED=0
 for attempt in $(seq 1 30); do
@@ -530,11 +598,13 @@ CARRIER_ROLLBACK_ARMED=0
 DASHBOARD_SWAP_ARMED=0
 
 echo "[deploy] pruning deployment backups (retain $BACKUP_RETAIN)..."
-sudo "$UV_BIN" run --script scripts/prune-deploy-backups.py --retain "$BACKUP_RETAIN" \
+if ! sudo "$UV_BIN" run --script scripts/prune-deploy-backups.py --retain "$BACKUP_RETAIN" \
   '/opt/reach-dashboard.backup.*' \
   '/opt/reach/reachd.rollback.*' \
   '/opt/reach/reach-ws-carrier.rollback.*' \
-  "$DB_BACKUP_DIR/$(basename "$DB_PATH").*"
+  "$DB_BACKUP_DIR/$(basename "$DB_PATH").*"; then
+  echo "[deploy] WARNING: deployment succeeded, but backup pruning failed" >&2
+fi
 
 if [ "$PUBLISH_AGENT_RELEASE" = 1 ]; then
   echo "[deploy] done. Published reach-agent v${AGENT_VERSION}."

@@ -28,6 +28,46 @@ jobs:
       - name: Build linux/amd64 static
         run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ./...
 
+  deployment-scripts:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Check shell syntax
+        run: bash -n scripts/deploy-from-mac.sh scripts/deploy-jason.sh
+
+      - name: Check Python helpers
+        run: python3 -m py_compile scripts/*.py
+
+      - name: Smoke test config helper
+        run: |
+          config="$(mktemp)"
+          cat > "$config" <<'EOF'
+          db_path: "/var/lib/reach/db with spaces/reach.db"
+          listen_addr: '127.0.0.1:9301'
+          default_hub:
+            api_url: "https://example.test/api?name=reach&mode=quoted"
+          EOF
+          test "$(uv run --script scripts/read-reach-config.py --config "$config" db_path)" = "/var/lib/reach/db with spaces/reach.db"
+          test "$(uv run --script scripts/read-reach-config.py --config "$config" listen_addr)" = "127.0.0.1:9301"
+          test "$(uv run --script scripts/read-reach-config.py --config "$config" default_hub.api_url)" = "https://example.test/api?name=reach&mode=quoted"
+
+      - name: Smoke test release artifact helper
+        run: |
+          artifacts="$(mktemp -d)"
+          for name in \
+            reach-agent_linux_amd64 reach-agent_linux_arm64 reach-agent_linux_386 \
+            reach-agent_linux_armv6 reach-agent_linux_armv7 reach-agent_darwin_amd64 \
+            reach-agent_darwin_arm64 reach-agent_windows_amd64.exe reach-agent_windows_arm64.exe; do
+            printf '%s' "$name" > "$artifacts/$name"
+          done
+          (cd "$artifacts" && sha256sum reach-agent_* > checksums.txt)
+          go run ./cmd/reach-release manifest --dir "$artifacts" --version "1.2.3 quoted" --commit "$GITHUB_SHA"
+          uv run --script scripts/verify-release-artifacts.py --dir "$artifacts" --version "1.2.3 quoted" --commit "$GITHUB_SHA"
+
   dashboard:
     runs-on: ubuntu-latest
 

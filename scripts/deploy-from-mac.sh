@@ -11,6 +11,31 @@ cd "$(dirname "$0")/.."
 export CGO_ENABLED=0
 DEPLOY_HOST="${REACH_DEPLOY_HOST:-reach-hub}"
 
+require_clean_product_tree() {
+  local status
+  status="$(git status --porcelain --untracked-files=normal)"
+  status="$(printf '%s\n' "$status" | grep -v '^?? \.claude/$' || true)"
+  if [ -n "$status" ]; then
+    echo "[mac] ERROR: product tree has tracked or nonignored untracked changes" >&2
+    printf '%s\n' "$status" >&2
+    exit 1
+  fi
+}
+
+require_clean_product_tree
+DEPLOY_BRANCH="$(git symbolic-ref --quiet --short HEAD)" || {
+  echo "[mac] ERROR: deploy-from-mac requires a branch, not detached HEAD" >&2
+  exit 1
+}
+DEPLOY_COMMIT="$(git rev-parse HEAD)"
+echo "[mac] fetching origin/${DEPLOY_BRANCH} and verifying ${DEPLOY_COMMIT} is pushed..."
+git fetch origin "$DEPLOY_BRANCH"
+if ! git rev-parse --verify --quiet "origin/$DEPLOY_BRANCH^{commit}" >/dev/null || \
+   ! git merge-base --is-ancestor "$DEPLOY_COMMIT" "origin/$DEPLOY_BRANCH"; then
+  echo "[mac] ERROR: HEAD ${DEPLOY_COMMIT} is not reachable from origin/${DEPLOY_BRANCH}" >&2
+  exit 1
+fi
+
 version_from_git() {
   local tag sha ts base
   if tag="$(git describe --tags --exact-match --match 'v[0-9]*' 2>/dev/null)"; then
@@ -51,7 +76,12 @@ echo "[mac] agent version: $AGENT_VERSION"
 ARTIFACT_DIR="$(mktemp -d)"
 AGENT_TAR="/tmp/reach-agent-artifacts-${AGENT_VERSION}.tar.gz"
 REMOTE_ARTIFACT_DIR="/tmp/reach-agent-artifacts-${AGENT_VERSION}-$(date -u +%Y%m%dT%H%M%SZ)"
-trap 'trash "$ARTIFACT_DIR" "$AGENT_TAR" 2>/dev/null || true' EXIT
+REMOTE_AGENT_TAR="/tmp/$(basename "$AGENT_TAR")"
+cleanup() {
+  trash "$ARTIFACT_DIR" "$AGENT_TAR" 2>/dev/null || true
+  ssh "$DEPLOY_HOST" "rm -rf '$REMOTE_ARTIFACT_DIR' '$REMOTE_AGENT_TAR'" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
 
 build_agent "$ARTIFACT_DIR/reach-agent_linux_amd64" linux amd64
 build_agent "$ARTIFACT_DIR/reach-agent_linux_arm64" linux arm64
@@ -66,21 +96,52 @@ build_agent "$ARTIFACT_DIR/reach-agent_windows_arm64.exe" windows arm64
   cd "$ARTIFACT_DIR"
   shasum -a 256 reach-agent_* | awk '{print $1 "  " $2}' > checksums.txt
 )
-go run ./cmd/reach-release manifest --dir "$ARTIFACT_DIR" --version "$AGENT_VERSION" --commit "$(git rev-parse HEAD)"
+go run ./cmd/reach-release manifest --dir "$ARTIFACT_DIR" --version "$AGENT_VERSION" --commit "$DEPLOY_COMMIT"
+uv run --script scripts/verify-release-artifacts.py --dir "$ARTIFACT_DIR" --version "$AGENT_VERSION" --commit "$DEPLOY_COMMIT"
 SIGN_ARGS=(--key "$RELEASE_KEY")
 if [ -n "$RELEASE_PASSWORD_FILE" ]; then
   SIGN_ARGS+=(--password-file "$RELEASE_PASSWORD_FILE")
 fi
-go run ./cmd/reach-release sign "${SIGN_ARGS[@]}" --manifest "$ARTIFACT_DIR/manifest.json" --out "$ARTIFACT_DIR/manifest.json.minisig" --trusted-comment "reach-agent version=$AGENT_VERSION commit=$(git rev-parse HEAD)"
+go run ./cmd/reach-release sign "${SIGN_ARGS[@]}" --manifest "$ARTIFACT_DIR/manifest.json" --out "$ARTIFACT_DIR/manifest.json.minisig" --trusted-comment "reach-agent version=$AGENT_VERSION commit=$DEPLOY_COMMIT"
 
 tar czf "$AGENT_TAR" -C "$ARTIFACT_DIR" .
 
 echo "[mac] uploading signed agent artifacts to ${DEPLOY_HOST}..."
-scp "$AGENT_TAR" "${DEPLOY_HOST}:/tmp/"
-ssh "${DEPLOY_HOST}" "mkdir -p '$REMOTE_ARTIFACT_DIR' && tar xzf '/tmp/$(basename "$AGENT_TAR")' -C '$REMOTE_ARTIFACT_DIR'"
+scp "$AGENT_TAR" "${DEPLOY_HOST}:${REMOTE_AGENT_TAR}"
 
-DEPLOY_COMMIT="$(git rev-parse HEAD)"
-echo "[mac] running deploy of ${DEPLOY_COMMIT} on ${DEPLOY_HOST}..."
-ssh "${DEPLOY_HOST}" "cd ~/reach && REACH_DEPLOY_COMMIT='$DEPLOY_COMMIT' REACH_PUBLISH_AGENT_RELEASE=1 REACH_AGENT_VERSION='$AGENT_VERSION' REACH_AGENT_ARTIFACT_DIR='$REMOTE_ARTIFACT_DIR' CGO_ENABLED=0 bash scripts/deploy-jason.sh"
+# Do not trust whatever deploy script the hub happened to have before this run.
+# Update its clone using Git, check out the exact pushed commit, then execute that script.
+ssh "${DEPLOY_HOST}" "bash -s" -- "$DEPLOY_COMMIT" "$REMOTE_ARTIFACT_DIR" "$REMOTE_AGENT_TAR" "$AGENT_VERSION" <<'REMOTE_DEPLOY'
+set -Eeuo pipefail
+deploy_commit="$1"
+artifact_dir="$2"
+artifact_tar="$3"
+agent_version="$4"
+cd "$HOME/reach"
+if [ -n "$(git status --porcelain --untracked-files=normal -- . ':(exclude).claude')" ]; then
+  echo "[mac] ERROR: hub product tree has tracked or nonignored untracked changes" >&2
+  git status --short --untracked-files=normal -- . ':(exclude).claude' >&2
+  exit 1
+fi
+git fetch origin
+if ! git cat-file -e "${deploy_commit}^{commit}" 2>/dev/null; then
+  echo "[mac] ERROR: pushed commit ${deploy_commit} is unavailable on hub" >&2
+  exit 1
+fi
+if [ -z "$(git for-each-ref --format='%(refname)' --contains "$deploy_commit" refs/remotes/origin/)" ]; then
+  echo "[mac] ERROR: commit ${deploy_commit} is not reachable from an origin branch on hub" >&2
+  exit 1
+fi
+git checkout --detach "$deploy_commit"
+test "$(git rev-parse HEAD)" = "$deploy_commit"
+mkdir -p "$artifact_dir"
+tar xzf "$artifact_tar" -C "$artifact_dir"
+REACH_DEPLOY_COMMIT="$deploy_commit" \
+REACH_PUBLISH_AGENT_RELEASE=1 \
+REACH_AGENT_VERSION="$agent_version" \
+REACH_AGENT_ARTIFACT_DIR="$artifact_dir" \
+CGO_ENABLED=0 \
+bash scripts/deploy-jason.sh
+REMOTE_DEPLOY
 
 echo "[mac] done. Published reach-agent v${AGENT_VERSION}."

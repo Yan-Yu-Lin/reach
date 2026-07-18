@@ -93,9 +93,10 @@ func serveCommand(ctx context.Context, args []string) error {
 	if cfg.JWTSecret == "" {
 		return fmt.Errorf("jwt_secret is required for API server")
 	}
+	server := NewServer(cfg, store, prov)
 	prov.StartHealthLoop(ctx)
 	prov.StartMaintenanceLoop(ctx)
-	return NewServer(cfg, store, prov).Run(ctx)
+	return server.Run(ctx)
 }
 
 func cliCreate(ctx context.Context, args []string) error {
