@@ -79,7 +79,23 @@ REMOTE_ARTIFACT_DIR="/tmp/reach-agent-artifacts-${AGENT_VERSION}-$(date -u +%Y%m
 REMOTE_AGENT_TAR="/tmp/$(basename "$AGENT_TAR")"
 cleanup() {
   trash "$ARTIFACT_DIR" "$AGENT_TAR" 2>/dev/null || true
-  ssh "$DEPLOY_HOST" "rm -rf '$REMOTE_ARTIFACT_DIR' '$REMOTE_AGENT_TAR'" >/dev/null 2>&1 || true
+  ssh "$DEPLOY_HOST" "bash -s" -- "$REMOTE_ARTIFACT_DIR" "$REMOTE_AGENT_TAR" <<'REMOTE_CLEANUP' >/dev/null 2>&1 || true
+set -u
+artifact_dir="$1"
+artifact_tar="$2"
+case "$artifact_dir" in /tmp/reach-agent-artifacts-*) ;; *) exit 1 ;; esac
+case "$artifact_tar" in /tmp/reach-agent-artifacts-*.tar.gz) ;; *) exit 1 ;; esac
+if command -v trash >/dev/null 2>&1; then
+  trash "$artifact_dir" "$artifact_tar" 2>/dev/null || true
+else
+  if [ -d "$artifact_dir" ]; then
+    find "$artifact_dir" -depth -delete
+  fi
+  if [ -f "$artifact_tar" ]; then
+    find "$artifact_tar" -delete
+  fi
+fi
+REMOTE_CLEANUP
 }
 trap cleanup EXIT
 
@@ -110,13 +126,25 @@ echo "[mac] uploading signed agent artifacts to ${DEPLOY_HOST}..."
 scp "$AGENT_TAR" "${DEPLOY_HOST}:${REMOTE_AGENT_TAR}"
 
 # Do not trust whatever deploy script the hub happened to have before this run.
-# Update its clone using Git, check out the exact pushed commit, then execute that script.
+# The remote bootstrap first fetches and checks out the exact pushed commit, then
+# runs that commit's deployment script. No source files are copied from the Mac.
 ssh "${DEPLOY_HOST}" "bash -s" -- "$DEPLOY_COMMIT" "$REMOTE_ARTIFACT_DIR" "$REMOTE_AGENT_TAR" "$AGENT_VERSION" <<'REMOTE_DEPLOY'
 set -Eeuo pipefail
 deploy_commit="$1"
 artifact_dir="$2"
 artifact_tar="$3"
 agent_version="$4"
+cleanup_remote() {
+  case "$artifact_dir" in /tmp/reach-agent-artifacts-*) ;; *) return 1 ;; esac
+  case "$artifact_tar" in /tmp/reach-agent-artifacts-*.tar.gz) ;; *) return 1 ;; esac
+  if command -v trash >/dev/null 2>&1; then
+    trash "$artifact_dir" "$artifact_tar" 2>/dev/null || true
+  else
+    if [ -d "$artifact_dir" ]; then find "$artifact_dir" -depth -delete; fi
+    if [ -f "$artifact_tar" ]; then find "$artifact_tar" -delete; fi
+  fi
+}
+trap cleanup_remote EXIT
 cd "$HOME/reach"
 if [ -n "$(git status --porcelain --untracked-files=normal -- . ':(exclude).claude')" ]; then
   echo "[mac] ERROR: hub product tree has tracked or nonignored untracked changes" >&2

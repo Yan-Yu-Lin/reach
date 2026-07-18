@@ -46,7 +46,7 @@ jobs:
         run: |
           config="$(mktemp)"
           cat > "$config" <<'EOF'
-          db_path: "/var/lib/reach/db with spaces/reach.db"
+          db_path: '/var/lib/reach/db with spaces/reach.db'
           listen_addr: '127.0.0.1:9301'
           default_hub:
             api_url: "https://example.test/api?name=reach&mode=quoted"
@@ -54,6 +54,10 @@ jobs:
           test "$(uv run --script scripts/read-reach-config.py --config "$config" db_path)" = "/var/lib/reach/db with spaces/reach.db"
           test "$(uv run --script scripts/read-reach-config.py --config "$config" listen_addr)" = "127.0.0.1:9301"
           test "$(uv run --script scripts/read-reach-config.py --config "$config" default_hub.api_url)" = "https://example.test/api?name=reach&mode=quoted"
+          empty_config="$(mktemp)"
+          : > "$empty_config"
+          test "$(uv run --script scripts/read-reach-config.py --config "$empty_config" db_path)" = "/var/lib/reach/reach.db"
+          test "$(uv run --script scripts/read-reach-config.py --config "$empty_config" listen_addr)" = "127.0.0.1:9300"
 
       - name: Smoke test release artifact helper
         run: |
