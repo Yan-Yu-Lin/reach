@@ -146,9 +146,11 @@ cleanup_remote() {
 }
 trap cleanup_remote EXIT
 cd "$HOME/reach"
-if [ -n "$(git status --porcelain --untracked-files=normal -- . ':(exclude).claude')" ]; then
+status="$(git status --porcelain --untracked-files=normal)"
+status="$(printf '%s\n' "$status" | grep -v '^?? \.claude/$' || true)"
+if [ -n "$status" ]; then
   echo "[mac] ERROR: hub product tree has tracked or nonignored untracked changes" >&2
-  git status --short --untracked-files=normal -- . ':(exclude).claude' >&2
+  printf '%s\n' "$status" >&2
   exit 1
 fi
 git fetch origin
