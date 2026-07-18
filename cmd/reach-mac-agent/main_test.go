@@ -193,6 +193,21 @@ func TestParseSSEAcceptsEventAboveDefaultScannerLimit(t *testing.T) {
 	}
 }
 
+func TestParseSSERejectsAggregateEventAboveLimit(t *testing.T) {
+	line := "data: " + strings.Repeat("x", 64*1024) + "\n"
+	var body strings.Builder
+	for body.Len() <= maxSSEEventBytes {
+		body.WriteString(line)
+	}
+	err := parseSSE(context.Background(), strings.NewReader(body.String()), func(Event) error {
+		t.Fatal("oversized aggregate event reached callback")
+		return nil
+	})
+	if !errors.Is(err, errSSEEventTooLarge) {
+		t.Fatalf("parseSSE error = %v, want %v", err, errSSEEventTooLarge)
+	}
+}
+
 func TestRunBackoffGrowsAcrossRepeatedStreamFailures(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

@@ -100,6 +100,8 @@ const (
 	eventSyncAttempts = 3
 )
 
+var errSSEEventTooLarge = errors.New("SSE event exceeds size limit")
+
 var errEventResync = errors.New("event resync required")
 
 type Agent struct {
@@ -241,6 +243,7 @@ func parseSSE(ctx context.Context, r io.Reader, fn func(Event) error) error {
 	sc.Buffer(make([]byte, 64*1024), maxSSEEventBytes)
 	var ev Event
 	var data []string
+	eventBytes := 0
 	for sc.Scan() {
 		select {
 		case <-ctx.Done():
@@ -248,6 +251,10 @@ func parseSSE(ctx context.Context, r io.Reader, fn func(Event) error) error {
 		default:
 		}
 		line := sc.Text()
+		if len(line) > maxSSEEventBytes-eventBytes-1 {
+			return errSSEEventTooLarge
+		}
+		eventBytes += len(line) + 1
 		if line == "" {
 			if ev.Type != "" || len(data) > 0 {
 				ev.Data = strings.Join(data, "\n")
@@ -260,6 +267,7 @@ func parseSSE(ctx context.Context, r io.Reader, fn func(Event) error) error {
 			}
 			ev = Event{}
 			data = nil
+			eventBytes = 0
 			continue
 		}
 		if strings.HasPrefix(line, ":") {

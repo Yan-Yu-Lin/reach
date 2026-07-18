@@ -206,6 +206,7 @@ SETUP_PS1_BACKUP=""
 LATEST_TXT_BACKUP=""
 LATEST_JSON_BACKUP=""
 AGENT_VERSION_BACKUP=""
+AGENT_VERSION_EXISTED=0
 AGENT_BIN_EXISTED=0
 SETUP_SH_EXISTED=0
 SETUP_PS1_EXISTED=0
@@ -254,11 +255,13 @@ rollback_reachd() {
         sudo mv "$destination" "$destination.failed.$DEPLOY_TS"
       fi
     done
-    if sudo test -d "$AGENT_DOWNLOAD_DIR"; then
-      sudo mv "$AGENT_DOWNLOAD_DIR" "$AGENT_DOWNLOAD_DIR.failed.$DEPLOY_TS"
-    fi
     if [ -n "$AGENT_VERSION_BACKUP" ] && sudo test -d "$AGENT_VERSION_BACKUP"; then
+      if sudo test -d "$AGENT_DOWNLOAD_DIR"; then
+        sudo mv "$AGENT_DOWNLOAD_DIR" "$AGENT_DOWNLOAD_DIR.failed.$DEPLOY_TS"
+      fi
       sudo mv "$AGENT_VERSION_BACKUP" "$AGENT_DOWNLOAD_DIR"
+    elif [ "$AGENT_VERSION_EXISTED" = 0 ] && sudo test -d "$AGENT_DOWNLOAD_DIR"; then
+      sudo mv "$AGENT_DOWNLOAD_DIR" "$AGENT_DOWNLOAD_DIR.failed.$DEPLOY_TS"
     fi
   fi
   if [ "$DASHBOARD_SWAP_ARMED" = 1 ]; then
@@ -679,9 +682,12 @@ if [ "$PUBLISH_AGENT_RELEASE" = 1 ]; then
   sudo install -m 0644 /tmp/reach-latest-version "$AGENT_DOWNLOAD_ROOT/latest.txt.candidate"
   sudo install -m 0644 /tmp/reach-latest.json "$AGENT_DOWNLOAD_ROOT/latest.json.candidate"
 
-  PUBLICATION_ARMED=1
   if sudo test -e "$AGENT_DOWNLOAD_DIR"; then
+    AGENT_VERSION_EXISTED=1
     AGENT_VERSION_BACKUP="$AGENT_DOWNLOAD_DIR.replaced.$DEPLOY_TS"
+  fi
+  PUBLICATION_ARMED=1
+  if [ "$AGENT_VERSION_EXISTED" = 1 ]; then
     sudo mv "$AGENT_DOWNLOAD_DIR" "$AGENT_VERSION_BACKUP"
   fi
   sudo mv "$AGENT_STAGING_DIR" "$AGENT_DOWNLOAD_DIR"
