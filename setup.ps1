@@ -129,9 +129,10 @@ if ($PSVersionTable.PSVersion.Major -lt 5 -or ($PSVersionTable.PSVersion.Major -
 if ([Environment]::OSVersion.Version.Build -lt 17763) {
   Die "Windows 10 / Windows Server build 1809 (17763) or later is required for built-in OpenSSH Server"
 }
-if (-not (Test-ReachAdmin)) {
-  Die "Reach Windows target support is admin-first for now. Re-run PowerShell as Administrator."
-}
+# Not elevated -> per-user install: files under %LOCALAPPDATA%\Reach, no
+# OpenSSH Server (reach-agent serves SSH itself on loopback), logon task.
+$UserMode = -not (Test-ReachAdmin)
+$InstallMode = if ($UserMode) { 'user' } else { 'system' }
 
 if (-not $TargetUser) { $TargetUser = $env:USERNAME }
 if (-not $TargetUser) { Die "Could not determine target user; pass -TargetUser" }
@@ -140,10 +141,19 @@ if (-not $Token -and $TokenFile -and (Test-Path -LiteralPath $TokenFile)) {
 }
 if ($Token) { Warn "auth codes passed to setup.ps1 may be visible in process history; prefer -TokenFile for shared machines." }
 
-$ProgramFilesRoot = if ($env:ProgramW6432) { $env:ProgramW6432 } elseif ($env:ProgramFiles) { $env:ProgramFiles } else { 'C:\Program Files' }
-$ProgramDataRoot = if ($env:ProgramData) { $env:ProgramData } else { 'C:\ProgramData' }
-$InstallDir = Join-Path $ProgramFilesRoot 'Reach'
-$ProgramDataDir = Join-Path $ProgramDataRoot 'Reach'
+if ($UserMode) {
+  $LocalAppDataRoot = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { Join-Path $env:USERPROFILE 'AppData\Local' }
+  $InstallDir = Join-Path $LocalAppDataRoot 'Reach'
+  $ProgramDataDir = $InstallDir
+  $DataDir = Join-Path $InstallDir 'data'
+  Log "Not running as Administrator: per-user install in $InstallDir"
+} else {
+  $ProgramFilesRoot = if ($env:ProgramW6432) { $env:ProgramW6432 } elseif ($env:ProgramFiles) { $env:ProgramFiles } else { 'C:\Program Files' }
+  $ProgramDataRoot = if ($env:ProgramData) { $env:ProgramData } else { 'C:\ProgramData' }
+  $InstallDir = Join-Path $ProgramFilesRoot 'Reach'
+  $ProgramDataDir = Join-Path $ProgramDataRoot 'Reach'
+  $DataDir = $ProgramDataDir
+}
 $AgentPath = Join-Path $InstallDir 'reach-agent.exe'
 
 if ($Uninstall -or $Reinstall) {
@@ -153,7 +163,7 @@ if ($Uninstall -or $Reinstall) {
   $installEnvPath = Join-Path $ProgramDataDir 'install.env'
   if (Test-Path -LiteralPath $AgentPath) {
     try {
-      & $AgentPath uninstall --mode system --yes
+      & $AgentPath uninstall --mode $InstallMode --yes --config-dir $ProgramDataDir --data-dir $DataDir --agent-path $AgentPath
       if ($LASTEXITCODE -ne 0) { $needsFallbackUninstall = $true }
     } catch {
       $needsFallbackUninstall = $true
@@ -170,32 +180,46 @@ if ($Uninstall -or $Reinstall) {
     try {
       $fallbackAgent = Join-Path $fallbackTmp 'reach-agent.exe'
       Save-ReachAgentCandidate $fallbackAgent
-      & $fallbackAgent uninstall --mode system --yes --config-dir $ProgramDataDir --data-dir $ProgramDataDir --agent-path $AgentPath
+      & $fallbackAgent uninstall --mode $InstallMode --yes --config-dir $ProgramDataDir --data-dir $DataDir --agent-path $AgentPath
       if ($LASTEXITCODE -ne 0) { $agentUninstallFailed = $true }
     } finally {
       Remove-Item -LiteralPath $fallbackTmp -Recurse -Force -ErrorAction SilentlyContinue
     }
   }
   try {
-    $task = Get-ScheduledTask -TaskPath '\Reach\' -TaskName 'reach-agent' -ErrorAction SilentlyContinue
-    if ($task) {
-      Stop-ScheduledTask -TaskPath '\Reach\' -TaskName 'reach-agent' -ErrorAction SilentlyContinue
-      Unregister-ScheduledTask -TaskPath '\Reach\' -TaskName 'reach-agent' -Confirm:$false
+    if ($UserMode) {
+      $task = Get-ScheduledTask -TaskName 'reach-agent-user' -ErrorAction SilentlyContinue
+      if ($task) {
+        Stop-ScheduledTask -TaskName 'reach-agent-user' -ErrorAction SilentlyContinue
+        Unregister-ScheduledTask -TaskName 'reach-agent-user' -Confirm:$false
+      }
+    } else {
+      $task = Get-ScheduledTask -TaskPath '\Reach\' -TaskName 'reach-agent' -ErrorAction SilentlyContinue
+      if ($task) {
+        Stop-ScheduledTask -TaskPath '\Reach\' -TaskName 'reach-agent' -ErrorAction SilentlyContinue
+        Unregister-ScheduledTask -TaskPath '\Reach\' -TaskName 'reach-agent' -Confirm:$false
+      }
     }
   } catch { Warn "Task Scheduler cleanup returned: $_" }
   if ($agentUninstallFailed) {
     Die "reach-agent uninstall failed; preserving $ProgramDataDir so authorized_keys cleanup can be retried"
   }
-  Remove-Item -LiteralPath $ProgramDataDir -Recurse -Force -ErrorAction SilentlyContinue
   Remove-Item -LiteralPath $AgentPath -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $ProgramDataDir -Recurse -Force -ErrorAction SilentlyContinue
   if ($Uninstall) { Log "Reach uninstall complete"; exit 0 }
 }
 
 if ($Repair -and -not $UpdateAgent) {
   if (-not (Test-Path -LiteralPath $AgentPath)) { Die "$AgentPath is missing; rerun setup.ps1 install" }
-  & $AgentPath check --config (Join-Path $ProgramDataDir 'agent.yaml')
-  Start-ScheduledTask -TaskPath '\Reach\' -TaskName 'reach-agent'
-  Log "Repair requested; reach-agent scheduled task started."
+  $cfg = Join-Path $ProgramDataDir 'agent.yaml'
+  & $AgentPath check --config $cfg
+  if ($UserMode) {
+    Start-Process -FilePath $AgentPath -ArgumentList @('run', '--config', ('"' + $cfg + '"')) -WindowStyle Hidden
+    Log "Repair requested; reach-agent started in the background."
+  } else {
+    Start-ScheduledTask -TaskPath '\Reach\' -TaskName 'reach-agent'
+    Log "Repair requested; reach-agent scheduled task started."
+  }
   exit 0
 }
 if ($Repair -and $UpdateAgent) {
@@ -208,14 +232,15 @@ try {
   $candidate = Join-Path $tmp 'reach-agent.exe'
   Save-ReachAgentCandidate $candidate
 
-  Ensure-ReachOpenSSHServer
+  if (-not $UserMode) { Ensure-ReachOpenSSHServer }
 
   Log "Installing reach-agent to $AgentPath"
   New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
   New-Item -ItemType Directory -Force -Path $ProgramDataDir | Out-Null
   Copy-Item -LiteralPath $candidate -Destination $AgentPath -Force
 
-  $installArgs = @('install', '--mode', 'system', '--agent-path', $AgentPath, '--api-url', $ApiUrl, '--transport', $Transport, '--target-user', $TargetUser)
+  $installArgs = @('install', '--mode', $InstallMode, '--agent-path', $AgentPath, '--api-url', $ApiUrl, '--transport', $Transport, '--target-user', $TargetUser)
+  if ($UserMode) { $installArgs += @('--config-dir', $ProgramDataDir, '--data-dir', $DataDir) }
   if ($Name) { $installArgs += @('--name', $Name) }
   if ($Token) { $installArgs += @('--token', $Token) }
   if ($Yes) { $installArgs += '--yes' }

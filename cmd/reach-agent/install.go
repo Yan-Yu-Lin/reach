@@ -146,9 +146,6 @@ func installCommand(ctx context.Context, args []string) error {
 			return fmt.Errorf("system install needs root; use --mode user or rerun via sudo")
 		}
 	case "user":
-		if runtime.GOOS == "windows" {
-			return fmt.Errorf("Windows user-mode install is not supported yet; rerun setup.ps1 from an elevated Administrator PowerShell")
-		}
 	default:
 		return fmt.Errorf("--mode must be auto, system, or user")
 	}
@@ -197,7 +194,7 @@ func installCommand(ctx context.Context, args []string) error {
 	if err := os.MkdirAll(opt.DataDir, 0o700); err != nil {
 		return err
 	}
-	if runtime.GOOS == "windows" {
+	if runtime.GOOS == "windows" && opt.InstallMode == "system" {
 		if err := ensureWindowsOpenSSHServer(ctx); err != nil {
 			return err
 		}
@@ -286,7 +283,10 @@ func installCommand(ctx context.Context, args []string) error {
 
 func defaultInstallMode() string {
 	if runtime.GOOS == "windows" {
-		return "system"
+		if windowsIsElevated() {
+			return "system"
+		}
+		return "user"
 	}
 	if os.Geteuid() == 0 {
 		return "system"
@@ -445,6 +445,11 @@ func userHome(user string) (string, error) {
 
 func prepareLocalSSH(ctx context.Context, opt installOptions, targetHome string, compat SSHCompatConfig) (localSSHPlan, error) {
 	if runtime.GOOS == "windows" {
+		if opt.InstallMode == "user" {
+			// No admin: Windows OpenSSH Server cannot be installed or started, so
+			// reach-agent serves SSH itself.
+			return prepareInternalSSHD(ctx, opt, compat)
+		}
 		return prepareWindowsLocalSSH(ctx, opt, targetHome, compat)
 	}
 	if opt.InstallMode == "system" {
@@ -977,6 +982,9 @@ func writeYAML0600(path string, v any) error {
 
 func installPersistence(ctx context.Context, opt installOptions, cfgPath string) (string, error) {
 	if runtime.GOOS == "windows" {
+		if opt.InstallMode == "user" {
+			return installWindowsUserPersistence(ctx, opt, cfgPath)
+		}
 		if err := installWindowsScheduledTask(ctx, opt, cfgPath); err != nil {
 			return "", err
 		}
@@ -1368,6 +1376,12 @@ func processAlive(pid int) bool {
 	if err != nil {
 		return false
 	}
+	if runtime.GOOS == "windows" {
+		// FindProcess opens a handle on Windows, so success means the PID exists;
+		// Signal(0) is not supported there.
+		_ = p.Release()
+		return true
+	}
 	return p.Signal(syscall.Signal(0)) == nil
 }
 
@@ -1632,7 +1646,7 @@ func readInstallEnv(path string) map[string]string {
 
 func stopPersistence(ctx context.Context, opt installOptions) {
 	if runtime.GOOS == "windows" {
-		stopWindowsPersistence(ctx)
+		stopWindowsPersistence(ctx, opt)
 		return
 	}
 	if runtime.GOOS == "darwin" {
@@ -1710,7 +1724,13 @@ func removePID(path string) {
 	}
 	if pid, ok := readPID(path); ok && processAlive(pid) {
 		if p, err := os.FindProcess(pid); err == nil {
-			_ = p.Signal(syscall.SIGTERM)
+			if runtime.GOOS == "windows" {
+				// taskkill /T also stops the agent's internal-sshd child.
+				_ = exec.Command("taskkill.exe", "/T", "/F", "/PID", strconv.Itoa(pid)).Run()
+				_ = p.Kill()
+			} else {
+				_ = p.Signal(syscall.SIGTERM)
+			}
 		}
 	}
 	_ = os.Remove(path)

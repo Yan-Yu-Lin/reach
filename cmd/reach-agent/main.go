@@ -1043,11 +1043,11 @@ func (d *Daemon) checkLocalSSH(ctx context.Context) error {
 }
 
 func (d *Daemon) startLocalSSH(ctx context.Context) error {
-	if runtime.GOOS == "windows" {
-		return d.startWindowsLocalSSH(ctx)
-	}
 	if d.cfg.LocalSSH.InternalSSHD {
 		return d.startInternalSSHD(ctx)
+	}
+	if runtime.GOOS == "windows" {
+		return d.startWindowsLocalSSH(ctx)
 	}
 	if d.cfg.LocalSSH.UserSSHD {
 		return d.startUserSSHD(ctx)
@@ -1102,6 +1102,7 @@ func (d *Daemon) startInternalSSHD(ctx context.Context) error {
 	cmd := exec.CommandContext(ctx, self, args...)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
+	cmd.SysProcAttr = hiddenChildSysProcAttr()
 	if err := cmd.Start(); err != nil {
 		return err
 	}
@@ -1187,6 +1188,14 @@ func (d *Daemon) probeDirectSSH(ctx context.Context) bool {
 }
 
 func probeSSH(ctx context.Context, host string, port int, timeout time.Duration) error {
+	if runtime.GOOS == "windows" {
+		// Spawning ssh-keyscan from a windowless agent flashes a console window on
+		// every probe; reading the server banner is enough.
+		if banner := sshServerBanner(ctx, host, port, timeout); strings.HasPrefix(banner, "SSH-") {
+			return nil
+		}
+		return fmt.Errorf("no ssh banner on %s:%d", host, port)
+	}
 	if _, err := exec.LookPath("ssh-keyscan"); err == nil {
 		probeCtx, cancel := context.WithTimeout(ctx, timeout+time.Second)
 		defer cancel()

@@ -87,7 +87,9 @@ The Linux setup script supports two install modes.
 | System mode | Run as root, or with accepted passwordless sudo | Linux: `/opt/reach`, `/etc/reach`, `/var/lib/reach`, `/etc/systemd/system/reach-agent.service`; macOS: same Reach paths with `/Library/LaunchDaemons/dev.arthurlin.reach-agent.plist` |
 | User mode | No root/sudo | Linux: `~/.local/bin/reach-agent`, `~/.config/reach`, `~/.local/share/reach`, `~/.config/systemd/user/reach-agent.service`; macOS: same Reach paths with `~/Library/LaunchAgents/dev.arthurlin.reach-agent.plist` |
 
-Windows targets are supported as an admin-first MVP. Run `setup.ps1` from an elevated PowerShell session. It installs to `C:\Program Files\Reach`, stores state in `C:\ProgramData\Reach`, enables Windows OpenSSH Server, and creates a `\Reach\reach-agent` Task Scheduler task running as `SYSTEM`.
+Windows targets: from a non-elevated PowerShell, `setup.ps1` does a per-user install instead (no admin): files in `%LOCALAPPDATA%\Reach`, reach-agent serves SSH itself on loopback (`internal-sshd`, exec runs as `cmd.exe /c` like Win32-OpenSSH; no pty, no sftp), a per-user logon task when allowed plus a hidden detached agent right away. The admin path below is unchanged.
+
+Windows admin install: Run `setup.ps1` from an elevated PowerShell session. It installs to `C:\Program Files\Reach`, stores state in `C:\ProgramData\Reach`, enables Windows OpenSSH Server, and creates a `\Reach\reach-agent` Task Scheduler task running as `SYSTEM`.
 
 ### Files and directories
 

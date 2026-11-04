@@ -7,3 +7,5 @@ import "syscall"
 func detachedSysProcAttr() *syscall.SysProcAttr {
 	return &syscall.SysProcAttr{Setsid: true}
 }
+
+func hiddenChildSysProcAttr() *syscall.SysProcAttr { return nil }

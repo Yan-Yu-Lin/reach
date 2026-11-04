@@ -15,3 +15,9 @@ func detachedSysProcAttr() *syscall.SysProcAttr {
 		HideWindow:    true,
 	}
 }
+
+// hiddenChildSysProcAttr keeps a supervised child (internal-sshd) from opening
+// a console window when the agent itself runs without one.
+func hiddenChildSysProcAttr() *syscall.SysProcAttr {
+	return &syscall.SysProcAttr{CreationFlags: windowsCreateNoWindow, HideWindow: true}
+}

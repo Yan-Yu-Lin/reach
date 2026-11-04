@@ -19,6 +19,26 @@ func windowsIsElevated() bool {
 }
 
 func applyWindowsModeDefaults(opt *installOptions) {
+	if opt.InstallMode == "user" {
+		// Per-user install: everything under %LOCALAPPDATA%\Reach, no admin needed.
+		base := os.Getenv("LOCALAPPDATA")
+		if base == "" {
+			if home := os.Getenv("USERPROFILE"); home != "" {
+				base = filepath.Join(home, "AppData", "Local")
+			}
+		}
+		root := filepath.Join(base, "Reach")
+		if opt.ConfigDir == "" {
+			opt.ConfigDir = root
+		}
+		if opt.DataDir == "" {
+			opt.DataDir = filepath.Join(root, "data")
+		}
+		if opt.AgentPath == "" {
+			opt.AgentPath = filepath.Join(root, "reach-agent.exe")
+		}
+		return
+	}
 	programData := os.Getenv("ProgramData")
 	if programData == "" {
 		programData = `C:\ProgramData`
@@ -261,7 +281,18 @@ Start-ScheduledTask -TaskPath $taskPath -TaskName $taskName
 	return nil
 }
 
-func stopWindowsPersistence(ctx context.Context) {
+func stopWindowsPersistence(ctx context.Context, opt installOptions) {
+	if opt.InstallMode == "user" {
+		_, _ = powershellOutput(ctx, `
+$task = Get-ScheduledTask -TaskName 'reach-agent-user' -ErrorAction SilentlyContinue
+if ($task) {
+  Stop-ScheduledTask -TaskName 'reach-agent-user' -ErrorAction SilentlyContinue
+  Unregister-ScheduledTask -TaskName 'reach-agent-user' -Confirm:$false
+}
+`)
+		removePID(filepath.Join(opt.DataDir, "reach-agent.pid"))
+		return
+	}
 	_, _ = powershellOutput(ctx, `
 $task = Get-ScheduledTask -TaskPath '\Reach\' -TaskName 'reach-agent' -ErrorAction SilentlyContinue
 if ($task) {
@@ -271,11 +302,37 @@ if ($task) {
 `)
 }
 
+// installWindowsUserPersistence registers a logon task for the current user
+// (no SYSTEM, no elevation) and starts the agent now as a hidden detached
+// process. A locked-down machine may refuse the task; the agent still runs
+// until logoff.
+func installWindowsUserPersistence(ctx context.Context, opt installOptions, cfgPath string) (string, error) {
+	backend := "detached process for this login only"
+	script := `
+param([string]$Exe, [string]$Cfg)
+$taskArgs = 'run --config "' + $Cfg + '"'
+$action = New-ScheduledTaskAction -Execute $Exe -Argument $taskArgs
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User ([Security.Principal.WindowsIdentity]::GetCurrent().Name)
+$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Seconds 0) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+$principal = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive -RunLevel Limited
+Register-ScheduledTask -TaskName 'reach-agent-user' -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Description 'Reach target agent (per-user)' -Force | Out-Null
+`
+	if out, err := powershellOutput(ctx, script, opt.AgentPath, cfgPath); err != nil {
+		fmt.Printf("[reach warning] per-user logon task unavailable (%v): %s\n", err, strings.TrimSpace(out))
+	} else {
+		backend = "Windows Scheduled Task reach-agent-user (at logon) + detached process now"
+	}
+	if err := startDetached(opt.AgentPath, cfgPath, filepath.Join(opt.DataDir, "agent.log"), filepath.Join(opt.DataDir, "reach-agent.pid")); err != nil {
+		return "", err
+	}
+	return backend, nil
+}
+
 func (d *Daemon) startWindowsLocalSSH(ctx context.Context) error {
 	return ensureWindowsOpenSSHServer(ctx)
 }
 
-func applyAuthorizedKeysPermissions(authFile, user string, _ bool) error {
+func applyAuthorizedKeysPermissions(authFile, user string, systemInstall bool) error {
 	abs, _ := filepath.Abs(authFile)
 	programData := os.Getenv("ProgramData")
 	if programData == "" {
@@ -295,6 +352,12 @@ func applyAuthorizedKeysPermissions(authFile, user string, _ bool) error {
 	}
 	cmd := exec.Command("icacls.exe", authFile, "/inheritance:r", "/grant", grantUser+":F", "/grant", "*S-1-5-18:F", "/grant", "*S-1-5-32-544:F")
 	if out, err := cmd.CombinedOutput(); err != nil {
+		if !systemInstall {
+			// Per-user installs keep keys in the user's own profile; tightening the
+			// ACL is best effort there.
+			fmt.Printf("[reach warning] could not tighten %s ACL: %s\n", authFile, strings.TrimSpace(string(out)))
+			return nil
+		}
 		return fmt.Errorf("set authorized_keys ACL failed: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil

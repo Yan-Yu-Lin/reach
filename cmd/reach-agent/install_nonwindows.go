@@ -18,10 +18,13 @@ func prepareWindowsLocalSSH(ctx context.Context, opt installOptions, targetHome 
 func installWindowsScheduledTask(ctx context.Context, opt installOptions, cfgPath string) error {
 	return nil
 }
-func ensureWindowsOpenSSHServer(ctx context.Context) error       { return nil }
-func stopWindowsPersistence(ctx context.Context)                 {}
-func (d *Daemon) startWindowsLocalSSH(ctx context.Context) error { return nil }
-func windowsDistroString() string                                { return "" }
+func installWindowsUserPersistence(ctx context.Context, opt installOptions, cfgPath string) (string, error) {
+	return "", nil
+}
+func ensureWindowsOpenSSHServer(ctx context.Context) error           { return nil }
+func stopWindowsPersistence(ctx context.Context, opt installOptions) {}
+func (d *Daemon) startWindowsLocalSSH(ctx context.Context) error     { return nil }
+func windowsDistroString() string                                    { return "" }
 
 func applyAuthorizedKeysPermissions(authFile, user string, chownFiles bool) error {
 	if chownFiles {
