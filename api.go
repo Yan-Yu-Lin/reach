@@ -1724,7 +1724,8 @@ func (s *Server) isJWTBlacklisted(ctx context.Context, token string) (bool, erro
 }
 
 func (s *Server) Run(ctx context.Context) error {
-	srv := &http.Server{Addr: s.cfg.ListenAddr, Handler: s, ReadHeaderTimeout: 5 * time.Second}
+	// No WriteTimeout: /api/admin/events is a long-lived SSE stream.
+	srv := &http.Server{Addr: s.cfg.ListenAddr, Handler: s, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, IdleTimeout: 120 * time.Second, MaxHeaderBytes: 64 << 10}
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
