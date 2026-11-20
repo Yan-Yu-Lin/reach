@@ -219,11 +219,63 @@ if [ "$ACTION" = "repair" ] && [ "$UPDATE_AGENT" = 1 ]; then
 fi
 
 base_url="${API_URL%/}/downloads/reach-agent/v${REACH_AGENT_VERSION}"
-case "$API_URL" in https://*|http://127.0.0.1*|http://localhost*) ;; *) die "API URL must use https://" ;; esac
+# validate_api_url accepts https://HOST[:PORT][/PATH] for any DNS host, and
+# plain http only when HOST is exactly 127.0.0.1, ::1 or localhost. The
+# authority is parsed, so prefixes like http://localhost.evil.example and
+# userinfo tricks (https://good@evil) are rejected (astra P2-11).
+validate_api_url() {
+  local url="$1" scheme rest authority host port
+  case "$url" in
+    https://*) scheme=https; rest="${url#https://}" ;;
+    http://*) scheme=http; rest="${url#http://}" ;;
+    *) return 1 ;;
+  esac
+  authority="${rest%%/*}"
+  case "$authority" in ''|*@*|*\\*|*' '*|*'?'*|*'#'*) return 1 ;; esac
+  case "$authority" in
+    \[*\]) host="$authority"; port="" ;;
+    \[*\]:*) host="${authority%]:*}]"; port="${authority##*]:}" ;;
+    *:*) host="${authority%:*}"; port="${authority##*:}" ;;
+    *) host="$authority"; port="" ;;
+  esac
+  if [ -n "$port" ]; then
+    case "$port" in *[!0-9]*) return 1 ;; esac
+  fi
+  if [ "$scheme" = http ]; then
+    case "$host" in 127.0.0.1|localhost|'[::1]') return 0 ;; *) return 1 ;; esac
+  fi
+  case "$host" in *[!A-Za-z0-9.-]*|.*|*..*) return 1 ;; esac
+  return 0
+}
+validate_api_url "$API_URL" || die "API URL must be https:// (plain http only for exactly 127.0.0.1 or localhost): $API_URL"
 tmpdir="$(mktemp -d)"
 trap 'rm -r -f "$tmpdir"' EXIT
 
-fetch() { curl -fsSL --proto '=https,http' --proto-redir '=https' --max-filesize "$3" "$1" -o "$2"; }
+# Pick curl flags this curl supports. --proto/--proto-redir appeared in
+# 7.21.0; CentOS 6 ships 7.19.7 (astra P2-06). Without them redirects are
+# not followed at all (no -L), so a redirect cannot switch protocol or host.
+CURL_ARGS=(-fsS)
+curl_supports() { curl --help all 2>/dev/null | grep -q -- "$1" || curl --help 2>/dev/null | grep -q -- "$1"; }
+if curl_supports --proto-redir; then
+  CURL_ARGS+=(-L --proto '=https,http' --proto-redir '=https')
+else
+  warn "curl $(curl --version 2>/dev/null | awk 'NR==1{print $2}') lacks --proto; downloading without following redirects."
+fi
+if curl_supports --max-filesize; then
+  CURL_MAXSIZE=1
+else
+  CURL_MAXSIZE=0
+fi
+fetch() {
+  local url="$1" out="$2" max="$3"
+  validate_api_url "$url" || die "refusing to download from $url"
+  if [ "$CURL_MAXSIZE" = 1 ]; then
+    curl "${CURL_ARGS[@]}" --max-filesize "$max" "$url" -o "$out"
+  else
+    curl "${CURL_ARGS[@]}" "$url" -o "$out"
+  fi
+  [ "$(wc -c < "$out" | tr -d ' ')" -le "$max" ] || die "download from $url exceeds $max bytes"
+}
 
 sha256_of() {
   if have sha256sum; then sha256sum "$1" | awk '{print $1}'

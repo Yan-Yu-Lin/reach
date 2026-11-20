@@ -114,6 +114,17 @@ function Invoke-ReachDownload([string]$Url, [string]$OutFile) {
   Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing
 }
 
+# Test-ReachApiUrl parses the URL and compares the host exactly, so
+# http://localhost.evil.example and userinfo tricks are rejected (astra P2-11).
+function Test-ReachApiUrl([string]$Url) {
+  $uri = $null
+  if (-not [Uri]::TryCreate($Url, [UriKind]::Absolute, [ref]$uri)) { return $false }
+  if ($uri.UserInfo) { return $false }
+  if ($uri.Scheme -eq 'https') { return [bool]$uri.Host }
+  if ($uri.Scheme -eq 'http') { return @('127.0.0.1', 'localhost', '[::1]') -contains $uri.Host.ToLowerInvariant() }
+  return $false
+}
+
 function Get-ReachPinnedHash([string]$Asset) {
   if (-not $ReachPinnedSha256s -or $ReachPinnedVersion -ne $Version) { return $null }
   foreach ($pin in ($ReachPinnedSha256s -split '\s+')) {
@@ -124,7 +135,7 @@ function Get-ReachPinnedHash([string]$Asset) {
 }
 
 function Save-ReachAgentCandidate([string]$Destination) {
-  if (-not ($ApiUrl -match '^https://' -or $ApiUrl -match '^http://(127\.0\.0\.1|localhost)')) { Die "API URL must use https://" }
+  if (-not (Test-ReachApiUrl $ApiUrl)) { Die "API URL must be https:// (plain http only for exactly 127.0.0.1 or localhost): $ApiUrl" }
   $asset = Get-ReachAgentAsset
   $baseUrl = ($ApiUrl.TrimEnd('/')) + "/downloads/reach-agent/v$Version"
   $dir = Split-Path -Parent $Destination
