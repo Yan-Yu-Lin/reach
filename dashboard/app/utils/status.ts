@@ -12,6 +12,7 @@ export type UiStatus =
   | 'retiring'
   | 'stuck'
   | 'failed'
+  | 'disable_failed'
   | 'retired'
   | 'unknown'
 
@@ -31,6 +32,7 @@ export const STATUS_LABEL: Record<UiStatus, string> = {
   retiring: 'Retiring',
   stuck: 'Retire stuck',
   failed: 'Cleanup failed',
+  disable_failed: 'Disable failed',
   retired: 'Retired',
   unknown: 'Unknown',
 }
@@ -41,10 +43,11 @@ function parseTime(value?: string | null): number | null {
   return Number.isFinite(t) ? t : null
 }
 
-/** Best evidence of when the machine was last alive. */
+/** Best evidence of when the machine was last alive (including live-only heartbeats). */
 export function lastSeenAt(item: MachineWithTunnels): number | null {
   const candidates = [
     parseTime(item.agent_observation?.heartbeat_at),
+    parseTime(item.live_heartbeat_at),
     parseTime(item.hub_observation?.last_success_at),
     ...item.tunnels.map(t => parseTime(t.last_seen_at)),
   ].filter((t): t is number => t !== null)
@@ -56,9 +59,10 @@ export function uiStatus(item: MachineWithTunnels, now = Date.now()): UiStatus {
   const m = item.machine
   const cleanup = m.cleanup_state || ''
   if (m.desired_state === 'retired') return 'retired'
-  if (m.status === 'cleanup_failed' || m.status === 'disable_failed' || cleanup === 'cleanup_failed' || cleanup === 'disable_failed') {
-    return 'failed'
-  }
+  // Disable failing and cleanup failing need different actions (retry disable vs force
+  // retire), so they are different statuses even though both are red.
+  if (m.status === 'disable_failed' || cleanup === 'disable_failed') return 'disable_failed'
+  if (m.status === 'cleanup_failed' || cleanup === 'cleanup_failed') return 'failed'
   if (m.desired_state === 'retiring') {
     if (cleanup === 'timed_out') return 'stuck'
     const since = parseTime(m.desired_changed_at) ?? parseTime(m.updated_at)
@@ -94,6 +98,7 @@ const GROUP_OF: Record<UiStatus, FleetGroupKey | null> = {
   degraded: 'attention',
   stuck: 'attention',
   failed: 'attention',
+  disable_failed: 'attention',
   unknown: 'attention',
   pending: 'attention',
   online: 'online',
@@ -106,7 +111,7 @@ const GROUP_OF: Record<UiStatus, FleetGroupKey | null> = {
 // Inside a group, show the most urgent first, then by name. A machine that just dropped is
 // what Arthur most likely needs to act on; stuck removals can wait for a day at home.
 const URGENCY: Record<UiStatus, number> = {
-  offline: 0, degraded: 1, failed: 2, stuck: 3, pending: 4, unknown: 5,
+  offline: 0, degraded: 1, disable_failed: 2, failed: 2, stuck: 3, pending: 4, unknown: 5,
   online: 6, retiring: 7, disabled: 8, dormant: 9, retired: 10,
 }
 
@@ -171,12 +176,11 @@ export function statusSentence(item: MachineWithTunnels, status: UiStatus, now =
       return 'Removal requested. Waiting for the agent to confirm the uninstall.'
     case 'stuck':
       return 'Removal started but the agent never confirmed. Force retire finishes the hub-side cleanup.'
+    case 'disable_failed':
+      return item.machine.desired_state === 'disabled'
+        ? 'Disable did not finish: the hub could not block the tunnel key, so it may still work. Retry disable.'
+        : 'Removal could not block the tunnel key on the hub, so it may still work. Force retire tries again.'
     case 'failed':
-      if (item.machine.status === 'disable_failed' || item.machine.cleanup_state === 'disable_failed') {
-        return item.machine.desired_state === 'disabled'
-          ? 'Disable did not finish: the hub could not block the tunnel key, so it may still work. Retry disable.'
-          : 'Removal could not block the tunnel key on the hub, so it may still work. Force retire tries again.'
-      }
       return 'Hub-side cleanup failed, so the tunnel account was kept. Force retire tries the cleanup again.'
     case 'retired':
       return 'Removed.'
@@ -185,24 +189,60 @@ export function statusSentence(item: MachineWithTunnels, status: UiStatus, now =
   }
 }
 
-export type CheckState = 'ok' | 'fail' | 'unknown'
+export type CheckState = 'ok' | 'fail' | 'unknown' | 'na'
 export type ConnectionCheck = { key: string; label: string; state: CheckState; detail: string }
 
 const OK_TUNNEL = new Set(['connected', 'running'])
 const OK_SSH = new Set(['healthy', 'ok', 'running'])
 
+/**
+ * How old a probe result may be and still count as "now". The hub probes every 30-45 s but,
+ * since the 2026-11 backend, only rewrites an unchanged row every 10 minutes
+ * (hubObservationRefresh), so anything under ~15 minutes is a live probe.
+ */
+export const PROBE_FRESH_MS = 15 * 60_000
+/** Agent detail fields (tunnel/sshd state) are as fresh as the observation they came in. */
+export const AGENT_REPORT_FRESH_MS = 10 * 60_000
+
+const NOT_ACTIVE_NOTE: Record<string, string> = {
+  disabled: 'Not checked: the machine is disabled',
+  retiring: 'Not checked: the machine is being removed',
+  retired: 'Not checked: the machine is retired',
+}
+
 /** Hub probe -> tunnel -> target sshd, each with its own verdict and reason. */
 export function connectionChecks(item: MachineWithTunnels, now = Date.now()): ConnectionCheck[] {
   const hub = item.hub_observation
   const agent = item.agent_observation
-  const hbAt = parseTime(agent?.heartbeat_at)
-  const agentStale = hbAt === null || now - hbAt > 10 * 60_000
-  const staleNote = hbAt === null ? 'no agent report yet' : `last agent report ${formatAge(now - hbAt)} ago`
+  const lifecycle = item.machine.desired_state
 
+  // The hub stops probing disabled/retiring/retired tunnels and the agent stops (or is told
+  // to stop) the tunnel, so whatever was stored last is history, not the current state.
+  if (lifecycle !== 'active') {
+    const note = NOT_ACTIVE_NOTE[lifecycle] || `Not checked: the machine is ${lifecycle}`
+    const last = (label: string, at?: string | null) => at ? `${note}. ${label} ${formatAge(now - (parseTime(at) ?? now))} ago.` : `${note}.`
+    return [
+      { key: 'probe', label: 'Hub probe', state: 'na', detail: last('Last probe', hub?.last_probe_at) },
+      { key: 'tunnel', label: 'Tunnel', state: 'na', detail: last('Last agent report', agent?.heartbeat_at) },
+      { key: 'sshd', label: 'Target sshd', state: 'na', detail: `${note}.` },
+    ]
+  }
+
+  const probeAt = parseTime(hub?.last_probe_at)
+  const probeStale = probeAt === null || now - probeAt > PROBE_FRESH_MS
   let probe: ConnectionCheck
   if (!hub || !hub.probe_state) probe = { key: 'probe', label: 'Hub probe', state: 'unknown', detail: 'No probe data yet' }
-  else if (hub.probe_state === 'reachable') probe = { key: 'probe', label: 'Hub probe', state: 'ok', detail: 'Hub reached the target sshd through the tunnel' }
+  else if (probeStale) {
+    const age = probeAt === null ? 'unknown time' : `${formatAge(now - probeAt)} ago`
+    probe = { key: 'probe', label: 'Hub probe', state: 'unknown', detail: `Unknown: last probe ${age} said ${hub.probe_state}` }
+  } else if (hub.probe_state === 'reachable') probe = { key: 'probe', label: 'Hub probe', state: 'ok', detail: 'Hub reached the target sshd through the tunnel' }
   else probe = { key: 'probe', label: 'Hub probe', state: 'fail', detail: hub.probe_error || `Probe says ${hub.probe_state}` }
+
+  // Judge tunnel/sshd by when THIS observation was reported, never by a later live heartbeat:
+  // a heartbeat proves the agent is alive, not that its old tunnel_state is still true.
+  const hbAt = parseTime(agent?.heartbeat_at)
+  const agentStale = hbAt === null || now - hbAt > AGENT_REPORT_FRESH_MS
+  const staleNote = hbAt === null ? 'no agent report yet' : `last agent report ${formatAge(now - hbAt)} ago`
 
   let tunnel: ConnectionCheck
   if (!agent?.tunnel_state) tunnel = { key: 'tunnel', label: 'Tunnel', state: 'unknown', detail: 'Agent has not reported' }

@@ -29,11 +29,11 @@
           <ol class="checks">
             <li v-for="c in checks" :key="c.key" class="check" :class="`check-${c.state}`">
               <span class="check-mark" aria-hidden="true">
-                <AppIcon :name="c.state === 'ok' ? 'check' : c.state === 'fail' ? 'x' : 'help'" :size="16" />
+                <AppIcon :name="c.state === 'ok' ? 'check' : c.state === 'fail' ? 'x' : c.state === 'na' ? 'pause' : 'help'" :size="16" />
               </span>
               <span class="check-body">
                 <span class="check-label">{{ c.label }}
-                  <span class="check-verdict">{{ c.state === 'ok' ? 'OK' : c.state === 'fail' ? 'Failed' : 'Unknown' }}</span>
+                  <span class="check-verdict">{{ CHECK_VERDICT[c.state] }}</span>
                 </span>
                 <span class="check-detail">{{ c.detail }}</span>
               </span>
@@ -160,7 +160,7 @@
         </div>
         <button type="button" class="btn btn-warn" @click="dialog = 'disable'">Disable</button>
       </div>
-      <div v-if="item.machine.desired_state === 'disabled' && status === 'failed'" class="dz-row dz-severe">
+      <div v-if="item.machine.desired_state === 'disabled' && status === 'disable_failed'" class="dz-row dz-severe">
         <div class="dz-text">
           <strong>Retry disable</strong>
           <p>The last disable did not finish on the hub, so the tunnel key may still work. Try again.</p>
@@ -183,7 +183,7 @@
         <button type="button" class="btn btn-danger" @click="dialog = 'remove'">Remove...</button>
       </div>
 
-      <div v-if="status === 'stuck' || item.machine.desired_state === 'retiring' || (status === 'failed' && item.machine.desired_state !== 'disabled')" class="dz-row dz-severe">
+      <div v-if="status === 'stuck' || status === 'failed' || item.machine.desired_state === 'retiring'" class="dz-row dz-severe">
         <div class="dz-text">
           <strong>Force retire</strong>
           <p>Finishes the removal on the hub without waiting for the agent. Use it when the machine is gone for good{{ status === 'failed' ? ', or to retry the failed cleanup' : '' }}.</p>
@@ -248,7 +248,9 @@
 </template>
 
 <script setup lang="ts">
-import { connectionChecks, lastSeenAt, statusSentence, uiStatus } from '~/utils/status'
+import { connectionChecks, lastSeenAt, statusSentence, uiStatus, type CheckState } from '~/utils/status'
+
+const CHECK_VERDICT: Record<CheckState, string> = { ok: 'OK', fail: 'Failed', unknown: 'Unknown', na: 'Not checked' }
 import { repairCommandFor, uninstallCommandFor } from '~/utils/commands'
 
 type Action = 'disable' | 'enable' | 'remove' | 'retire-now'

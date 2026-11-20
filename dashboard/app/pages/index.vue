@@ -376,6 +376,7 @@ const statCards = computed(() => {
     { status: 'disabled', count: c.disabled, label: STATUS_LABEL.disabled },
   ]
   if (c.stuck + c.failed > 0) list.push({ status: 'stuck', count: c.stuck + c.failed, label: 'Removal stuck' })
+  if (c.disable_failed > 0) list.push({ status: 'disable_failed', count: c.disable_failed, label: 'Disable failed' })
   return list
 })
 
@@ -390,6 +391,7 @@ const todoItems = computed(() => {
   const sections: Array<{ s: UiStatus[]; icon: UiStatus; one: string; many: string }> = [
     { s: ['offline'], icon: 'offline', one: 'machine dropped offline', many: 'machines dropped offline' },
     { s: ['degraded'], icon: 'degraded', one: 'machine degraded', many: 'machines degraded' },
+    { s: ['disable_failed'], icon: 'disable_failed', one: 'disable did not finish', many: 'disables did not finish' },
     { s: ['stuck', 'failed'], icon: 'stuck', one: 'removal stuck', many: 'removals stuck' },
   ]
   for (const sec of sections) {

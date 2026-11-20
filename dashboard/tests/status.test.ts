@@ -46,13 +46,13 @@ describe('uiStatus', () => {
   it('uses the server verdict for timed-out and failed cleanups', () => {
     expect(uiStatus(machine({ desired_state: 'retiring', cleanup_state: 'timed_out', desired_changed_at: ago(60_000) }), NOW)).toBe('stuck')
     expect(uiStatus(machine({ desired_state: 'retiring', status: 'cleanup_failed' }), NOW)).toBe('failed')
-    expect(uiStatus(machine({ desired_state: 'disabled', status: 'disable_failed' }), NOW)).toBe('failed')
+    expect(uiStatus(machine({ desired_state: 'disabled', status: 'disable_failed' }), NOW)).toBe('disable_failed')
   })
 
   it('tells the user to retry a failed disable, not to force retire', () => {
     const item = machine({ desired_state: 'disabled', status: 'disable_failed', cleanup_state: 'disable_failed' })
-    expect(uiStatus(item, NOW)).toBe('failed')
-    expect(statusSentence(item, 'failed', NOW)).toMatch(/Retry disable/)
+    expect(uiStatus(item, NOW)).toBe('disable_failed')
+    expect(statusSentence(item, 'disable_failed', NOW)).toMatch(/Retry disable/)
   })
 
   it('keeps disabled distinct from failure states (A10)', () => {

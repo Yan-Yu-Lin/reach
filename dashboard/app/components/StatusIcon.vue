@@ -25,7 +25,7 @@
       <path d="M13 8a5 5 0 1 1-1.6-3.7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
       <path d="M13.6 1.8v3.6H10" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
     </template>
-    <template v-else-if="status === 'failed'">
+    <template v-else-if="status === 'failed' || status === 'disable_failed'">
       <path d="M8 1.8L15 14H1z" fill="currentColor" />
       <path d="M8 6v3.6M8 11.6v.1" stroke="var(--panel)" stroke-width="1.8" stroke-linecap="round" />
     </template>

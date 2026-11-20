@@ -132,7 +132,7 @@
 .st-disabled { --st: var(--st-disabled); }
 .st-retiring { --st: var(--st-retiring); }
 .st-stuck { --st: var(--st-stuck); }
-.st-failed { --st: var(--st-failed); }
+.st-failed, .st-disable_failed { --st: var(--st-failed); }
 .st-unknown { --st: var(--st-unknown); }
 .st-retired { --st: var(--st-retired); }
 
@@ -249,7 +249,7 @@ textarea.input { min-height: 88px; resize: vertical; }
   background: color-mix(in srgb, var(--st) 14%, transparent);
   border: 1px solid color-mix(in srgb, var(--st) 30%, transparent);
 }
-.badge.st-stuck, .badge.st-failed { border: 1.5px solid var(--danger); }
+.badge.st-stuck, .badge.st-failed, .badge.st-disable_failed { border: 1.5px solid var(--danger); }
 .badge-lg { font-size: 15px; padding: 4px 12px 4px 10px; }
 
 /* ── Shell ──────────────────────────────────────────────────────── */
@@ -522,7 +522,7 @@ kbd {
   border-left: 3px solid transparent;
 }
 .mrow:last-child { border-bottom: 0; }
-.mrow.st-offline, .mrow.st-stuck, .mrow.st-failed, .mrow.st-degraded { border-left-color: var(--st); }
+.mrow.st-offline, .mrow.st-stuck, .mrow.st-failed, .mrow.st-disable_failed, .mrow.st-degraded { border-left-color: var(--st); }
 .mrow.active { background: var(--accent-soft); border-left-color: var(--accent); }
 .mrow.focused { box-shadow: inset 0 0 0 2px var(--focus); }
 .mrow-main {
@@ -625,13 +625,13 @@ kbd {
 }
 .check-ok .check-mark { background: var(--accent-soft); color: var(--st-online); }
 .check-fail .check-mark { background: var(--danger-soft); color: var(--st-offline); }
-.check-unknown .check-mark { background: var(--surface); color: var(--muted); }
+.check-unknown .check-mark, .check-na .check-mark { background: var(--surface); color: var(--muted); }
 .check-body { display: flex; flex-direction: column; min-width: 0; }
 .check-label { font-weight: 700; }
 .check-verdict { margin-left: 6px; font-size: 13px; font-weight: 700; }
 .check-ok .check-verdict { color: var(--st-online); }
 .check-fail .check-verdict { color: var(--st-offline); }
-.check-unknown .check-verdict { color: var(--muted); }
+.check-unknown .check-verdict, .check-na .check-verdict { color: var(--muted); }
 .check-detail { font-size: 14px; color: var(--text-2); overflow-wrap: anywhere; }
 
 .advanced { padding: 0; }
