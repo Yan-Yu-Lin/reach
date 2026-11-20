@@ -317,7 +317,7 @@ The script logs in, exchanges the temporary admin JWT for a `mac-agent` service 
 
 ### Long-running Mac agent
 
-`reach-mac-agent` does the same sync and also watches `/api/admin/events` so SSH config updates shortly after machines change state.
+`reach-mac-agent` does the same sync and also watches `/api/admin/events` (format: [`docs/EVENTS.md`](docs/EVENTS.md)) so SSH config updates shortly after machines change state. It reads `/api/admin/ssh-config.json`, keeps only allowlisted directives, and checks the result with `ssh -G` before writing. Put the `Include` line at the **end** of `~/.ssh/config` so hand-written aliases always win.
 
 ```bash
 reach-mac-agent sample-config > ~/.config/reach/mac-agent.yaml
@@ -413,7 +413,7 @@ Reach’s provisioner creates restricted Unix users and writes `Match User` bloc
 
 ### 4. Run `reachd` under systemd
 
-`reachd` must run with enough privilege to create tunnel users, write sshd config, and reload sshd when `provisioning_enabled: true`.
+`reachd` must run with enough privilege to create tunnel users, write sshd config, and reload sshd when `provisioning_enabled: true`. A sandboxed unit (root with a capability allowlist, `ProtectSystem=strict`, `MemoryMax=1G`) is in [`deploy/systemd/reachd.service`](deploy/systemd/reachd.service); test it once with a full provision/disable/retire cycle before relying on it. The minimal unit is:
 
 ```ini
 # /etc/systemd/system/reachd.service
@@ -543,8 +543,11 @@ The tunnel user is not a shell account. Its sshd config disables TTYs, shells, l
 Reach’s security relies on a few clear boundaries:
 
 - **Admin web auth:** username/password login returns an HS256 JWT. Passwords are Argon2id-hashed.
-- **God code / setup tokens:** auth codes, client secrets, and setup tokens are hashed server-side. Setup tokens are short-lived and consumed once.
-- **Agent auth:** each machine gets an agent bearer token stored in `agent.yaml`; it authenticates heartbeats and uninstall notifications.
+- **God code / setup tokens:** human-chosen codes (god code, invites) are Argon2id-hashed and checked under a two-slot concurrency gate. Server-generated secrets (client secrets, setup tokens, agent tokens, service tokens) are SHA-256 hashed; old Argon2 rows migrate on first use. Setup tokens are short-lived and consumed once; invites are claimed atomically.
+- **Agent auth:** each machine gets an agent bearer token stored in `agent.yaml`; it authenticates heartbeats and uninstall notifications and is revoked when the machine is retired.
+- **Approval binding:** the alias (slug), target user, mode and local port shown at approval are exactly what provisioning may use; reserved aliases (`jason*`, `*-public`, `pi`, `localhost`, plus `reserved_slugs`) are refused.
+- **Revocation fails closed:** if disabling or retiring cannot remove hub access, the machine is marked `disable_failed`/`cleanup_failed`, its port stays reserved, and the action returns 409.
+- **Operator SSH config:** reach-mac-agent renders `~/.ssh/reach-tunnels.conf` from structured data with a fixed template and validates it with `ssh -G` before replacing the old file; the hub cannot inject `Match`, `Include` or `*Command` directives.
 - **Tunnel auth:** each target generates its own SSH keypair. The private key stays on the target. The hub only gets the public key.
 - **Hub host key pinning:** targets receive `hub_host_keys` and write them to `known_hosts` before opening the tunnel.
 - **Hub sshd restrictions:** tunnel accounts can only create the assigned loopback reverse listener.
