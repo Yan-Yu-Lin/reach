@@ -332,33 +332,19 @@ func (d *Daemon) startWindowsLocalSSH(ctx context.Context) error {
 	return ensureWindowsOpenSSHServer(ctx)
 }
 
+// applyAuthorizedKeysPermissions is a no-op now: writeAuthorizedKeysFile
+// sets the DACL on the replacement file before it becomes visible.
 func applyAuthorizedKeysPermissions(authFile, user string, systemInstall bool) error {
-	abs, _ := filepath.Abs(authFile)
-	programData := os.Getenv("ProgramData")
-	if programData == "" {
-		programData = `C:\ProgramData`
-	}
-	adminFile, _ := filepath.Abs(filepath.Join(programData, "ssh", "administrators_authorized_keys"))
-	if strings.EqualFold(abs, adminFile) {
-		cmd := exec.Command("icacls.exe", authFile, "/inheritance:r", "/grant", "*S-1-5-32-544:F", "/grant", "*S-1-5-18:F")
-		if out, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("set administrators_authorized_keys ACL failed: %w: %s", err, strings.TrimSpace(string(out)))
-		}
-		return nil
-	}
-	grantUser := user
-	if grantUser == "" {
-		grantUser = windowsCurrentUsername()
-	}
-	cmd := exec.Command("icacls.exe", authFile, "/inheritance:r", "/grant", grantUser+":F", "/grant", "*S-1-5-18:F", "/grant", "*S-1-5-32-544:F")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		if !systemInstall {
-			// Per-user installs keep keys in the user's own profile; tightening the
-			// ACL is best effort there.
-			fmt.Printf("[reach warning] could not tighten %s ACL: %s\n", authFile, strings.TrimSpace(string(out)))
-			return nil
-		}
-		return fmt.Errorf("set authorized_keys ACL failed: %w: %s", err, strings.TrimSpace(string(out)))
+	return nil
+}
+
+// setAuthorizedKeysACL sets the DACL that applyAuthorizedKeysPermissions
+// used to apply after the fact, on path (the temp file), choosing the
+// principals from target (the final authorized_keys path).
+func setAuthorizedKeysACL(path, target, user string) error {
+	args := authorizedKeysICACLSArgs(path, target, user, os.Getenv("ProgramData"), windowsCurrentUsername())
+	if out, err := exec.Command("icacls.exe", args...).CombinedOutput(); err != nil {
+		return fmt.Errorf("icacls: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }

@@ -1290,16 +1290,16 @@ func (d *Daemon) syncKeys(keys []DesiredPubkey, enabled bool) error {
 			}
 		}
 	}
-	return writeAuthorizedKeysFile(auth, d.authKeysOwner(), []byte(strings.Join(kept, "\n")+"\n"))
+	return writeAuthorizedKeysFile(auth, d.authKeysAccount(), []byte(strings.Join(kept, "\n")+"\n"))
 }
 
-// authKeysOwner is the account that must own a rewritten authorized_keys
-// when a root agent manages another user's file.
-func (d *Daemon) authKeysOwner() string {
-	if os.Geteuid() != 0 || d.cfg.Install.Mode != "system" || d.cfg.LocalSSH.UserSSHD || d.cfg.LocalSSH.InternalSSHD {
-		return ""
-	}
-	return d.cfg.LocalSSH.TargetUser
+// authKeysAccount describes whose authorized_keys a sync rewrites: on Unix
+// root chowns it to the target user; on Windows the DACL is applied to the
+// replacement before it becomes visible.
+func (d *Daemon) authKeysAccount() keyFileAccount {
+	system := d.cfg.Install.Mode == "system"
+	chown := system && os.Geteuid() == 0 && !d.cfg.LocalSSH.UserSSHD && !d.cfg.LocalSSH.InternalSSHD
+	return keyFileAccount{User: d.cfg.LocalSSH.TargetUser, Chown: chown, Strict: system}
 }
 
 func (d *Daemon) installedKeyFingerprints() []string {

@@ -823,11 +823,7 @@ func installAdminKeys(authFile, user string, prov provisionResponse, chownFiles 
 		}
 		return fmt.Errorf("none of the admin public keys are supported by this %s; supported=%s. %s", serverName, strings.Join(supportedKeyTypes, ","), advice)
 	}
-	owner := ""
-	if chownFiles {
-		owner = user
-	}
-	if err := writeAuthorizedKeysFile(authFile, owner, []byte(b.String())); err != nil {
+	if err := writeAuthorizedKeysFile(authFile, keyFileAccount{User: user, Chown: chownFiles, Strict: chownFiles}, []byte(b.String())); err != nil {
 		return err
 	}
 	return applyAuthorizedKeysPermissions(authFile, user, chownFiles)
@@ -1727,16 +1723,15 @@ func removeAuthorizedKeyMarker(env map[string]string) {
 			kept = append(kept, line)
 		}
 	}
-	_ = writeAuthorizedKeysFile(authFile, authKeysOwnerFromEnv(env), []byte(strings.Join(kept, "\n")+"\n"))
+	_ = writeAuthorizedKeysFile(authFile, authKeysAccountFromEnv(env), []byte(strings.Join(kept, "\n")+"\n"))
 }
 
-// authKeysOwnerFromEnv returns the account to own a rewritten authorized_keys
-// when root edits another user's file in system mode.
-func authKeysOwnerFromEnv(env map[string]string) string {
-	if os.Geteuid() != 0 || env["INSTALL_MODE"] != "system" || env["LOCAL_SSH_MODE"] == "user-sshd" {
-		return ""
-	}
-	return env["TARGET_USER_NAME"]
+// authKeysAccountFromEnv describes the account whose authorized_keys an
+// uninstall rewrites (see Daemon.authKeysAccount).
+func authKeysAccountFromEnv(env map[string]string) keyFileAccount {
+	system := env["INSTALL_MODE"] == "system"
+	chown := system && os.Geteuid() == 0 && env["LOCAL_SSH_MODE"] != "user-sshd" && env["LOCAL_SSH_MODE"] != "internal-sshd"
+	return keyFileAccount{User: env["TARGET_USER_NAME"], Chown: chown, Strict: system}
 }
 
 func removePID(path string) {

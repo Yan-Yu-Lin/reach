@@ -74,7 +74,7 @@ func TestAuthorizedKeysWriterKeepsOtherLinesAndCreatesDir(t *testing.T) {
 		t.Fatal(err)
 	}
 	authFile := filepath.Join(home, ".ssh", "authorized_keys")
-	if err := writeAuthorizedKeysFile(authFile, "", []byte("ssh-ed25519 AAAA keep\n")); err != nil {
+	if err := writeAuthorizedKeysFile(authFile, keyFileAccount{}, []byte("ssh-ed25519 AAAA keep\n")); err != nil {
 		t.Fatal(err)
 	}
 	st, err := os.Stat(filepath.Dir(authFile))

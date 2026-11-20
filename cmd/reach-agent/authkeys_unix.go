@@ -31,8 +31,6 @@ import (
 //   - only inodes created here are chowned (no chown -R).
 const userControlledDepth = 3
 
-const maxAuthorizedKeysBytes = 4 << 20
-
 type keyDir struct {
 	fd      int
 	path    string
@@ -135,7 +133,11 @@ func readAuthorizedKeysFile(authFile string) ([]byte, error) {
 // writeAuthorizedKeysFile atomically replaces authFile. When owner is set
 // (root installing for another account) the new file, and a .ssh directory
 // created here, are chowned to owner.
-func writeAuthorizedKeysFile(authFile, owner string, content []byte) error {
+func writeAuthorizedKeysFile(authFile string, acct keyFileAccount, content []byte) error {
+	owner := ""
+	if acct.Chown {
+		owner = acct.User
+	}
 	dir, name, err := openKeyDir(authFile, true)
 	if err != nil {
 		return err
