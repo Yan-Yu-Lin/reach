@@ -1192,6 +1192,11 @@ func (p *Provisioner) ExpireOnce(ctx context.Context) error {
 	if _, err := p.store.db.ExecContext(ctx, `UPDATE requests SET status='expired' WHERE status='approved' AND setup_token_expires_at IS NOT NULL AND setup_token_expires_at < ?`, now); err != nil {
 		return err
 	}
+	// Release invite claims whose request expired or was denied without
+	// provisioning, so a legitimate invite is not burned by a failed attempt.
+	if _, err := p.store.db.ExecContext(ctx, `UPDATE invites SET claimed_by_request_id=NULL, claimed_at=NULL WHERE used_by IS NULL AND claimed_by_request_id IN (SELECT id FROM requests WHERE status IN ('expired','denied'))`); err != nil {
+		return err
+	}
 	if err := p.expireCommands(ctx, now); err != nil {
 		return err
 	}

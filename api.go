@@ -337,12 +337,15 @@ func (s *Server) handleClientRegister(w http.ResponseWriter, r *http.Request) {
 		setupHash = HashToken(setupToken)
 		setupExpires = now.Add(s.cfg.SetupTokenTTL).Format(time.RFC3339)
 		approvedAt = now.Format(time.RFC3339)
-		if kind == "friend" {
+		if kind != "god" && matchedHash != "" {
 			inviteHash = matchedHash
 		}
 	}
-	_, err = s.store.db.ExecContext(r.Context(), `INSERT INTO requests (id,name,client_secret_hash,status,invite_code_hash,setup_token_hash,setup_token_expires_at,metadata_json,observed_ip,created_at,expires_at,approved_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`, requestID, name, clientHash, status, inviteHash, setupHash, setupExpires, string(metaJSON), ip, now.Format(time.RFC3339), expires, approvedAt)
-	if err != nil {
+	if err := s.insertRequestClaimingInvite(r.Context(), requestID, name, clientHash, status, inviteHash, setupHash, setupExpires, string(metaJSON), ip, now, expires, approvedAt); err != nil {
+		if errors.Is(err, errInviteAlreadyClaimed) {
+			writeClientAuthErr(w)
+			return
+		}
 		log.Printf("register insert: %v", err)
 		writeErr(w, 500, "registration failed")
 		return
@@ -361,6 +364,33 @@ func (s *Server) handleClientRegister(w http.ResponseWriter, r *http.Request) {
 
 // validateClientAuth checks a god code or invite code. Both are human-handled
 // secrets stored as Argon2id, so every check runs under the Argon2 gate.
+var errInviteAlreadyClaimed = errors.New("invite already claimed")
+
+// insertRequestClaimingInvite creates the request and, for invite codes,
+// claims the invite in the same transaction. The conditional UPDATE makes the
+// claim atomic: of N concurrent registrations with one invite exactly one
+// gets RowsAffected=1 (daybreak P1-4).
+func (s *Server) insertRequestClaimingInvite(ctx context.Context, requestID, name, clientHash, status string, inviteHash, setupHash, setupExpires any, metaJSON, ip string, now time.Time, expires string, approvedAt any) error {
+	tx, err := s.store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if inviteHash != nil {
+		res, err := tx.ExecContext(ctx, `UPDATE invites SET claimed_by_request_id=?, claimed_at=? WHERE code_hash=? AND used_by IS NULL AND claimed_by_request_id IS NULL AND expires_at>?`, requestID, now.Format(time.RFC3339), inviteHash, now.Format(time.RFC3339))
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return errInviteAlreadyClaimed
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO requests (id,name,client_secret_hash,status,invite_code_hash,setup_token_hash,setup_token_expires_at,metadata_json,observed_ip,created_at,expires_at,approved_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`, requestID, name, clientHash, status, inviteHash, setupHash, setupExpires, metaJSON, ip, now.Format(time.RFC3339), expires, approvedAt); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (s *Server) validateClientAuth(ctx context.Context, code string) (bool, string, string, error) {
 	if s.cfg.GodCodeHash != "" {
 		ok, err := s.argon.VerifySecret(ctx, code, s.cfg.GodCodeHash)
@@ -373,7 +403,7 @@ func (s *Server) validateClientAuth(ctx context.Context, code string) (bool, str
 	}
 	type invite struct{ hash, typ string }
 	var candidates []invite
-	rows, err := s.store.db.QueryContext(ctx, `SELECT code_hash,type,expires_at FROM invites WHERE used_by IS NULL`)
+	rows, err := s.store.db.QueryContext(ctx, `SELECT code_hash,type,expires_at FROM invites WHERE used_by IS NULL AND claimed_by_request_id IS NULL`)
 	if err != nil {
 		return false, "", "", nil
 	}
@@ -566,7 +596,10 @@ func (s *Server) handleClientProvision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, _ = s.store.db.ExecContext(r.Context(), `UPDATE requests SET status='provisioned' WHERE id=?`, requestID)
-	_, _ = s.store.db.ExecContext(r.Context(), `UPDATE invites SET used_by=? WHERE code_hash=(SELECT invite_code_hash FROM requests WHERE id=? AND invite_code_hash IS NOT NULL)`, res.Machine.ID, requestID)
+	// Consume only the claim this request holds; never overwrite used_by.
+	if _, err := s.store.db.ExecContext(r.Context(), `UPDATE invites SET used_by=?, consumed_at=? WHERE claimed_by_request_id=? AND used_by IS NULL`, res.Machine.ID, nowUTC(), requestID); err != nil {
+		log.Printf("consume invite for %s: %v", requestID, err)
+	}
 	keys, err := s.activeAccessKeys(r.Context())
 	if err != nil {
 		writeErr(w, 500, "could not load admin public keys")
