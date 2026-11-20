@@ -21,6 +21,9 @@
 #      (daybreak P1-A / astra R2-02) -> the journal blocks the restore.
 #   G. carrier rollback restores /etc/reach/ws-carrier.env, or moves away
 #      the one this deploy added (astra R2-06).
+#   H. the restored carrier fails to start -> rollback_incomplete, never
+#      reported as success (daybreak round 4 P1-04); H2: the env file
+#      cannot be restored -> carrier stays stopped (astra R3-04).
 #   I. fuser is missing -> cannot prove nobody holds the DB -> stopped,
 #      DB untouched (astra R3-03).
 #   J. another SQLite client holds the DB -> stopped, DB untouched.
@@ -34,6 +37,7 @@ base="${REACH_ROLLBACK_BASE:-8c74086}"
 git -C "$repo" archive "$base" | (mkdir -p "$work/old" && tar -x -C "$work/old")
 (cd "$work/old" && GOOS=linux GOARCH="$(go env GOARCH)" CGO_ENABLED=0 go build -o "$work/reachd-old" .)
 (cd "$repo" && GOOS=linux GOARCH="$(go env GOARCH)" CGO_ENABLED=0 go build -o "$work/reachd-new" .)
+(cd "$repo" && GOOS=linux GOARCH="$(go env GOARCH)" CGO_ENABLED=0 go build -o "$work/carrier" ./cmd/reach-ws-carrier)
 cp -R "$repo/scripts" "$work/scripts"
 [ -n "${REACH_RBTEST_TRACE:-}" ] && sed -i "" "s/^set -Eeuo pipefail$/set -Eeuxo pipefail/" "$work/scripts/rehearse-rollback.sh"
 
@@ -56,6 +60,15 @@ case "$*" in
     for i in $(seq 1 50); do curl -s -o /dev/null http://127.0.0.1:9300/ && break; sleep 0.1; done ;;
   "is-active --quiet reachd") pgrep -f "$pat" >/dev/null ;;
   "show -p MainPID --value reachd") p="$(pgrep -f "$pat" | head -1)"; echo "${p:-0}" ;;
+  "show -p LoadState --value reachd") echo loaded ;;
+  "start reach-ws-carrier.service"|"enable --now reach-ws-carrier.service")
+    [ -e /tmp/fail-carrier-start ] && exit 1
+    set -a; [ -f /etc/reach/ws-carrier.env ] && . /etc/reach/ws-carrier.env; set +a
+    setsid /opt/reach/reach-ws-carrier server --listen 127.0.0.1:9401 --target 127.0.0.1:9302 >>/var/log/carrier.log 2>&1 < /dev/null &
+    sleep 0.5 ;;
+  "stop reach-ws-carrier.service"|"disable --now reach-ws-carrier.service")
+    pkill -f '/opt/reach/reach-ws-carrier server'; sleep 0.2 ;;
+  "is-active --quiet reach-ws-carrier.service") pgrep -f '/opt/reach/reach-ws-carrier server' >/dev/null ;;
   *) exit 0 ;;
 esac
 EOF
@@ -66,6 +79,9 @@ cat > /usr/local/bin/sudo <<'EOF'
 #!/bin/bash
 if [ -e /tmp/fail-forensic ] && [ "$1" = cp ]; then
   case "$*" in */backups/failed.*) echo forced-forensic-copy-failure >&2; exit 70 ;; esac
+fi
+if [ -e /tmp/fail-env-restore ] && [ "$1" = install ]; then
+  case "$*" in *ws-carrier.env.rollback-candidate*) echo forced-env-restore-failure >&2; exit 70 ;; esac
 fi
 exec /usr/bin/sudo "$@"
 EOF
@@ -190,30 +206,53 @@ scenario() { # name kind
   fi
 }
 
-carrier_env() { # existed(0/1)
+carrier_case() { # name existed(0/1) fault(none|start|env)
   local f=/etc/reach/ws-carrier.env
-  /usr/bin/rm -f $f /etc/reach/ws-carrier.env.failed.*
+  # Stand-in for sshd on the carrier's target port.
+  pgrep -f 'reach-fake-sshd' >/dev/null || { setsid python3 -c "import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(('127.0.0.1',9302)); s.listen(64)
+while True: c,_=s.accept()" reach-fake-sshd >/dev/null 2>&1 < /dev/null & sleep 0.3; }
+  systemctl stop reach-ws-carrier.service || true
+  /usr/bin/rm -f $f /etc/reach/ws-carrier.env.failed.* /tmp/fail-carrier-start /tmp/fail-env-restore
   mkdir -p /var/lib/reach/deploy-backups /etc/systemd/system
   printf old-unit > /var/lib/reach/deploy-backups/reach-ws-carrier.service.envtest
-  printf old-binary > /opt/reach/reach-ws-carrier.rollback.envtest
+  install -m 0755 $W/carrier /opt/reach/reach-ws-carrier.rollback.envtest
   printf new-unit > /etc/systemd/system/reach-ws-carrier.service
   printf new-binary > /opt/reach/reach-ws-carrier
-  DEPLOY_TS=envtest CARRIER_ENV_EXISTED=$1 CARRIER_ENV_BACKUP=/var/lib/reach/deploy-backups/ws-carrier.env.envtest
+  DEPLOY_TS=envtest CARRIER_ENV_EXISTED=$2 CARRIER_ENV_BACKUP=/var/lib/reach/deploy-backups/ws-carrier.env.envtest
   /usr/bin/rm -f $CARRIER_ENV_BACKUP
-  [ "$1" = 1 ] && printf 'REACH_WS_PATH_PREFIX=/ws/tunnel/old/\n' > $CARRIER_ENV_BACKUP
+  [ "$2" = 1 ] && printf 'REACH_WS_PATH_PREFIX=/ws/tunnel/old/\n' > $CARRIER_ENV_BACKUP
   printf 'REACH_WS_PATH_PREFIX=/ws/tunnel/new/\n' > $f
-  ( DEPLOY_COMMITTED=0 PUBLICATION_ARMED=0 DASHBOARD_SWAP_ARMED=0 CARRIER_STATE_SNAPSHOTTED=1 \
+  case "$3" in start) touch /tmp/fail-carrier-start ;; env) touch /tmp/fail-env-restore ;; esac
+  local out
+  out="$( ( DEPLOY_COMMITTED=0 PUBLICATION_ARMED=0 DASHBOARD_SWAP_ARMED=0 CARRIER_STATE_SNAPSHOTTED=1 \
     CARRIER_UNIT_EXISTED=1 CARRIER_UNIT_BACKUP=/var/lib/reach/deploy-backups/reach-ws-carrier.service.envtest \
     CARRIER_EXISTED=1 CARRIER_ROLLBACK=/opt/reach/reach-ws-carrier.rollback.envtest \
-    CARRIER_WAS_ENABLED=1 CARRIER_WAS_ACTIVE=1 LEGACY_WAS_ENABLED=0 LEGACY_WAS_ACTIVE=0 \
-    LIMITS_MUTATED=0 REACHD_UNIT_MUTATED=0 ROLLBACK_ARMED=0 SERVICE_STOPPED=0 ROLLBACK_EXIT_CODE=1 rollback_reachd ) >/dev/null 2>&1 || true
-  if [ "$1" = 1 ]; then
-    grep -q /ws/tunnel/old/ $f || fail "G: old env not restored"
-  else
-    [ ! -e $f ] || fail "G: env added by the deploy was left in place"
-  fi
-  grep -q old-binary /opt/reach/reach-ws-carrier || fail "G: carrier binary not restored"
-  echo "carrier env rollback (existed=$1): ok"
+    CARRIER_WAS_ENABLED=1 CARRIER_WAS_ACTIVE=$2 LEGACY_WAS_ENABLED=0 LEGACY_WAS_ACTIVE=0 \
+    LIMITS_MUTATED=0 REACHD_UNIT_MUTATED=0 ROLLBACK_ARMED=0 SERVICE_STOPPED=0 ROLLBACK_EXIT_CODE=1 rollback_reachd ) 2>&1 || true)"
+  /usr/bin/rm -f /tmp/fail-carrier-start /tmp/fail-env-restore
+  cmp -s $W/carrier /opt/reach/reach-ws-carrier || fail "$1: carrier binary not restored"
+  case "$3" in
+    none)
+      if [ "$2" = 1 ]; then
+        grep -q /ws/tunnel/old/ $f || fail "$1: old env not restored"
+        systemctl is-active --quiet reach-ws-carrier.service || fail "$1: carrier not running"
+        bash scripts/check-carrier-ready.sh $f || fail "$1: carrier does not answer 101 on the old path"
+      else
+        [ ! -e $f ] || fail "$1: env added by the deploy was left in place"
+      fi
+      printf '%s' "$out" | grep -q rollback_incomplete && fail "$1: clean carrier rollback reported incomplete"
+      echo "$1: carrier restored (existed=$2)" ;;
+    start)
+      printf '%s' "$out" | grep -q 'rollback_incomplete' || fail "$1: failed carrier start not reported"
+      printf '%s' "$out" | grep -q 'rollback is INCOMPLETE' || fail "$1: no incomplete summary"
+      echo "$1: failed carrier start -> rollback_incomplete" ;;
+    env)
+      grep -q /ws/tunnel/new/ $f || true
+      systemctl is-active --quiet reach-ws-carrier.service && fail "$1: carrier started although its env could not be restored"
+      printf '%s' "$out" | grep -q 'rollback_incomplete' || fail "$1: env restore failure not reported"
+      echo "$1: env restore failure -> carrier left stopped, rollback_incomplete" ;;
+  esac
+  systemctl stop reach-ws-carrier.service || true
 }
 
 echo "== A: failure after lazy token migration ==";  scenario A lazy
@@ -224,8 +263,10 @@ echo "== E: forensic copy fails ==";                 scenario E forensic
 echo "== F: revoke-all while audit inserts fail =="; scenario F auditfail
 echo "== I: fuser missing ==";                       scenario I nofuser
 echo "== J: another process holds the DB ==";        scenario J holder
-echo "== G: carrier env rollback ==";                carrier_env 1; carrier_env 0
-echo "PASS: rollback scenarios A-J"
+echo "== G: carrier rollback ==";                   carrier_case G 1 none; carrier_case G0 0 none
+echo "== H: previous carrier fails to start ==";      carrier_case H 1 start
+echo "== H2: carrier env restore fails ==";          carrier_case H2 1 env
+echo "PASS: rollback scenarios A-K"
 EOS
 chmod +x "$work/run.sh"
 docker run --rm -v "$work:/w" ubuntu:24.04 bash /w/run.sh

@@ -372,6 +372,141 @@ reachd_ready() {
     && sudo bash scripts/check-reachd-ready.sh "$PROBE_BIN" /etc/reach/config.yaml "$LISTEN_ADDR"
 }
 
+# ROLLBACK_INCOMPLETE collects every rollback step that failed (daybreak
+# round 4 P1-04, astra R3-04). Any entry means the rollback never reports
+# success, whatever reachd's own state.
+ROLLBACK_INCOMPLETE=""
+rollback_incomplete() {
+  ROLLBACK_INCOMPLETE="${ROLLBACK_INCOMPLETE:+$ROLLBACK_INCOMPLETE; }$1"
+  echo "[deploy] ERROR: rollback step failed: $1" >&2
+}
+report_incomplete() {
+  if [ -n "$ROLLBACK_INCOMPLETE" ]; then
+    echo "[deploy] ERROR: rollback_incomplete: $ROLLBACK_INCOMPLETE" >&2
+  fi
+}
+# rollback_finish MESSAGE EXIT: print MESSAGE only if every step succeeded.
+rollback_finish() {
+  if [ -n "$ROLLBACK_INCOMPLETE" ]; then
+    report_incomplete
+    echo "[deploy] ERROR: rollback is INCOMPLETE; check the components above by hand" >&2
+  elif [ -n "$1" ]; then
+    echo "[deploy] $1" >&2
+  fi
+  exit "$2"
+}
+
+# restore_file_checked BACKUP DEST MODE: copy BACKUP over DEST atomically
+# and verify the content.
+restore_file_checked() {
+  local backup="$1" dest="$2" mode="$3"
+  sudo test -f "$backup" || { echo "[deploy] ERROR: backup $backup is missing" >&2; return 1; }
+  sudo install -m "$mode" "$backup" "$dest.rollback-candidate" || return 1
+  sudo mv -f "$dest.rollback-candidate" "$dest" || return 1
+  sudo cmp -s "$backup" "$dest"
+}
+# move_away_checked PATH: move a file this deploy added out of the way.
+move_away_checked() {
+  if sudo test -e "$1"; then
+    sudo mv "$1" "$1.failed.$DEPLOY_TS" || return 1
+  fi
+  ! sudo test -e "$1"
+}
+
+# restore_carrier_state: stop the carrier, restore unit, env and binary
+# (each checked), and only then bring back the previous enabled/active
+# state and verify it, including a WebSocket upgrade on the configured
+# path. Any failure leaves the carrier stopped and returns non-zero.
+restore_carrier_state() {
+  local ok=1
+  sudo systemctl disable --now reach-ws-carrier.service 2>/dev/null || true
+  if [ "$CARRIER_UNIT_EXISTED" = 1 ]; then
+    restore_file_checked "$CARRIER_UNIT_BACKUP" /etc/systemd/system/reach-ws-carrier.service 0644 || ok=0
+  else
+    move_away_checked /etc/systemd/system/reach-ws-carrier.service || ok=0
+  fi
+  if [ "${CARRIER_ENV_EXISTED:-0}" = 1 ]; then
+    restore_file_checked "$CARRIER_ENV_BACKUP" /etc/reach/ws-carrier.env 0640 || ok=0
+  else
+    move_away_checked /etc/reach/ws-carrier.env || ok=0
+  fi
+  if [ "$CARRIER_EXISTED" = 1 ]; then
+    restore_file_checked "$CARRIER_ROLLBACK" /opt/reach/reach-ws-carrier 0755 || ok=0
+  else
+    move_away_checked /opt/reach/reach-ws-carrier || ok=0
+  fi
+  sudo systemctl daemon-reload || ok=0
+  if [ "$ok" != 1 ]; then
+    echo "[deploy] ERROR: carrier files could not be restored; leaving the carrier stopped" >&2
+    sudo systemctl stop reach-ws-carrier.service 2>/dev/null || true
+    return 1
+  fi
+  if [ "$CARRIER_WAS_ENABLED" = 1 ]; then
+    sudo systemctl enable reach-ws-carrier.service || ok=0
+  else
+    sudo systemctl disable reach-ws-carrier.service 2>/dev/null || true
+  fi
+  if [ "$CARRIER_WAS_ACTIVE" = 1 ]; then
+    sudo systemctl start reach-ws-carrier.service || ok=0
+    local ready=0 i
+    for i in $(seq 1 10); do
+      if systemctl is-active --quiet reach-ws-carrier.service; then
+        if ! sudo test -f /etc/reach/ws-carrier.env; then
+          ready=1   # older carrier without a path file: unit state only
+          break
+        fi
+        if sudo bash scripts/check-carrier-ready.sh /etc/reach/ws-carrier.env >/dev/null 2>&1; then
+          ready=1
+          break
+        fi
+      fi
+      sleep 1
+    done
+    [ "$ready" = 1 ] || { echo "[deploy] ERROR: previous carrier is not active/answering" >&2; ok=0; }
+  else
+    sudo systemctl stop reach-ws-carrier.service 2>/dev/null || true
+    if systemctl is-active --quiet reach-ws-carrier.service; then ok=0; fi
+  fi
+  if [ "$LEGACY_WAS_ENABLED" = 1 ]; then sudo systemctl enable reach-wstunnel.service || ok=0; else sudo systemctl disable reach-wstunnel.service 2>/dev/null || true; fi
+  if [ "$LEGACY_WAS_ACTIVE" = 1 ]; then
+    sudo systemctl start reach-wstunnel.service || ok=0
+    systemctl is-active --quiet reach-wstunnel.service || ok=0
+  else
+    sudo systemctl stop reach-wstunnel.service 2>/dev/null || true
+  fi
+  [ "$ok" = 1 ]
+}
+
+# restore_reachd_units: put the resource drop-in and an opt-in reachd unit
+# back (or move ours away), reload, and verify systemd loaded the unit.
+restore_reachd_units() {
+  local ok=1
+  if [ "${LIMITS_MUTATED:-0}" = 1 ]; then
+    if [ -n "${LIMITS_BACKUP:-}" ]; then
+      restore_file_checked "$LIMITS_BACKUP" "$LIMITS_DROPIN" 0644 || ok=0
+    else
+      move_away_checked "$LIMITS_DROPIN" || ok=0
+    fi
+  fi
+  if [ "${REACHD_UNIT_MUTATED:-0}" = 1 ]; then
+    if [ -n "${REACHD_UNIT_BACKUP:-}" ]; then
+      echo "[deploy] restoring previous reachd.service" >&2
+      restore_file_checked "$REACHD_UNIT_BACKUP" /etc/systemd/system/reachd.service 0644 || ok=0
+    else
+      # There was no /etc override before (vendor unit or fresh host):
+      # move ours away instead of leaving it active (astra P2-12).
+      echo "[deploy] removing reachd.service override added by this deploy" >&2
+      move_away_checked /etc/systemd/system/reachd.service || ok=0
+    fi
+  fi
+  sudo systemctl daemon-reload || ok=0
+  if [ "$(systemctl show -p LoadState --value reachd 2>/dev/null)" != "loaded" ]; then
+    echo "[deploy] ERROR: reachd.service is not loaded after restoring units" >&2
+    ok=0
+  fi
+  [ "$ok" = 1 ]
+}
+
 rollback_reachd() {
   local exit_code="${ROLLBACK_EXIT_CODE:-$?}"
   if [ "$DEPLOY_COMMITTED" = 1 ]; then
@@ -432,51 +567,10 @@ rollback_reachd() {
   fi
   if [ "$CARRIER_STATE_SNAPSHOTTED" = 1 ]; then
     echo "[deploy] restoring previous WebSocket carrier state" >&2
-    sudo systemctl disable --now reach-ws-carrier.service 2>/dev/null || true
-    if [ "$CARRIER_UNIT_EXISTED" = 1 ] && sudo test -f "$CARRIER_UNIT_BACKUP"; then
-      sudo cp -a "$CARRIER_UNIT_BACKUP" /etc/systemd/system/reach-ws-carrier.service.rollback-candidate
-      sudo mv -f /etc/systemd/system/reach-ws-carrier.service.rollback-candidate /etc/systemd/system/reach-ws-carrier.service
-    elif sudo test -e /etc/systemd/system/reach-ws-carrier.service; then
-      sudo mv /etc/systemd/system/reach-ws-carrier.service "/etc/systemd/system/reach-ws-carrier.service.failed.$DEPLOY_TS"
-    fi
-    # The path env file is part of the carrier state too (astra R2-06).
-    if [ "${CARRIER_ENV_EXISTED:-0}" = 1 ] && [ -n "${CARRIER_ENV_BACKUP:-}" ] && sudo test -f "$CARRIER_ENV_BACKUP"; then
-      sudo cp -a "$CARRIER_ENV_BACKUP" /etc/reach/ws-carrier.env.rollback-candidate
-      sudo mv -f /etc/reach/ws-carrier.env.rollback-candidate /etc/reach/ws-carrier.env
-    elif [ "${CARRIER_ENV_EXISTED:-0}" != 1 ] && sudo test -e /etc/reach/ws-carrier.env; then
-      sudo mv /etc/reach/ws-carrier.env "/etc/reach/ws-carrier.env.failed.$DEPLOY_TS"
-    fi
-    if [ "$CARRIER_EXISTED" = 1 ] && sudo test -f "$CARRIER_ROLLBACK"; then
-      sudo install -m 0755 "$CARRIER_ROLLBACK" /opt/reach/reach-ws-carrier.rollback-candidate
-      sudo mv -f /opt/reach/reach-ws-carrier.rollback-candidate /opt/reach/reach-ws-carrier
-    elif sudo test -e /opt/reach/reach-ws-carrier; then
-      sudo mv /opt/reach/reach-ws-carrier "/opt/reach/reach-ws-carrier.failed.$DEPLOY_TS"
-    fi
-    sudo systemctl daemon-reload
-    if [ "$CARRIER_WAS_ENABLED" = 1 ]; then sudo systemctl enable reach-ws-carrier.service; else sudo systemctl disable reach-ws-carrier.service 2>/dev/null || true; fi
-    if [ "$CARRIER_WAS_ACTIVE" = 1 ]; then sudo systemctl start reach-ws-carrier.service; else sudo systemctl stop reach-ws-carrier.service 2>/dev/null || true; fi
-    if [ "$LEGACY_WAS_ENABLED" = 1 ]; then sudo systemctl enable reach-wstunnel.service; else sudo systemctl disable reach-wstunnel.service 2>/dev/null || true; fi
-    if [ "$LEGACY_WAS_ACTIVE" = 1 ]; then sudo systemctl start reach-wstunnel.service; else sudo systemctl stop reach-wstunnel.service 2>/dev/null || true; fi
+    restore_carrier_state || rollback_incomplete "WebSocket carrier"
   fi
-  if [ "${LIMITS_MUTATED:-0}" = 1 ]; then
-    if [ -n "${LIMITS_BACKUP:-}" ] && sudo test -f "$LIMITS_BACKUP"; then
-      sudo cp -a "$LIMITS_BACKUP" "$LIMITS_DROPIN"
-    else
-      sudo mv "$LIMITS_DROPIN" "$LIMITS_DROPIN.failed.$DEPLOY_TS" 2>/dev/null || true
-    fi
-    sudo systemctl daemon-reload
-  fi
-  if [ "${REACHD_UNIT_MUTATED:-0}" = 1 ]; then
-    if [ -n "${REACHD_UNIT_BACKUP:-}" ] && sudo test -f "$REACHD_UNIT_BACKUP"; then
-      echo "[deploy] restoring previous reachd.service" >&2
-      sudo cp -a "$REACHD_UNIT_BACKUP" /etc/systemd/system/reachd.service
-    elif sudo test -e /etc/systemd/system/reachd.service; then
-      # There was no /etc override before (vendor unit or fresh host):
-      # move ours away instead of leaving it active (astra P2-12).
-      echo "[deploy] removing reachd.service override added by this deploy" >&2
-      sudo mv /etc/systemd/system/reachd.service "/etc/systemd/system/reachd.service.failed.$DEPLOY_TS"
-    fi
-    sudo systemctl daemon-reload
+  if [ "${LIMITS_MUTATED:-0}" = 1 ] || [ "${REACHD_UNIT_MUTATED:-0}" = 1 ]; then
+    restore_reachd_units || rollback_incomplete "reachd unit / resource drop-in"
   fi
   if [ "$ROLLBACK_ARMED" = 1 ]; then
     echo "[deploy] ERROR: deployment failed; rolling back reachd (binary + database)" >&2
@@ -484,6 +578,7 @@ rollback_reachd() {
     # Nothing below may touch the database or the binary unless reachd is
     # provably stopped (astra R2-03).
     if ! stop_reachd_verified; then
+      report_incomplete
       echo "[deploy] ERROR: could not prove reachd stopped; NOT touching the database or binary" >&2
       echo "[deploy] ERROR: manual action required: stop reachd, then decide between the new binary and snapshot $DB_BACKUP_PATH + $REACHD_ROLLBACK" >&2
       exit "$exit_code"
@@ -512,6 +607,7 @@ rollback_reachd() {
       fi
     fi
     if [ "$db_restore_ok" != 1 ]; then
+      report_incomplete
       echo "[deploy] ERROR: leaving reachd stopped; operator decision required" >&2
       echo "[deploy] ERROR: on disk now: new reachd at /opt/reach/reachd, live DB as the new binary left it (unless the restore step above failed part-way)" >&2
       echo "[deploy] ERROR: predeploy snapshot: $DB_BACKUP_PATH; failed set: ${failed_db_dir:-none}; old binary: $REACHD_ROLLBACK" >&2
@@ -540,6 +636,7 @@ rollback_reachd() {
     fi
     if [ "$rollback_ready" != 1 ]; then
       sudo systemctl stop reachd
+      report_incomplete
       echo "[deploy] ERROR: previous reachd did not become ready; leaving reachd stopped" >&2
       echo "[deploy] ERROR: predeploy database backup: $DB_BACKUP_PATH" >&2
       if [ -n "$failed_db_dir" ]; then
@@ -549,16 +646,28 @@ rollback_reachd() {
       sudo journalctl -u reachd -n 80 --no-pager >&2 || true
       exit "$exit_code"
     fi
-    echo "[deploy] previous reachd restored and ready" >&2
+    rollback_finish "previous reachd restored and ready" "$exit_code"
   elif [ "$SERVICE_STOPPED" = 1 ]; then
     if [ "$REACHD_EXISTED" = 1 ]; then
       echo "[deploy] ERROR: deployment failed while reachd was stopped; restarting previous service" >&2
-      sudo systemctl start reachd
+      local ok=0
+      if sudo systemctl start reachd; then
+        for attempt in $(seq 1 30); do
+          if systemctl is-active --quiet reachd && "$UV_BIN" run --script scripts/check-local-service.py "$LISTEN_ADDR" >/dev/null 2>&1; then
+            ok=1
+            break
+          fi
+          sleep 1
+        done
+      fi
+      [ "$ok" = 1 ] || rollback_incomplete "previous reachd did not come back after restart"
+      rollback_finish "previous reachd running again" "$exit_code"
     else
       sudo systemctl stop reachd 2>/dev/null || true
+      if systemctl is-active --quiet reachd; then rollback_incomplete "partial fresh reachd still active"; fi
     fi
   fi
-  exit "$exit_code"
+  rollback_finish "" "$exit_code"
 }
 # END reachd transaction steps
 
