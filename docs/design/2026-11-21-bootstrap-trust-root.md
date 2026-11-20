@@ -35,3 +35,13 @@ compromised script origin.
 
 Option 1, with option 2 printed alongside for people who prefer the hub
 URL. The dashboard "Setup" card should show the GitHub-hosted line.
+
+## Round 3 status (daybreak P2-F, 2026-11-21)
+
+Unchanged: still design only. The binary and manifest are verified, but the
+script that does the verifying comes from the hub. Suggested order: after
+Stage 5 (agent release), publish `setup.sh`/`setup.ps1` as GitHub release
+assets in the same release workflow, switch the dashboard Setup card and
+README to the GitHub URL with `--api-url`, and keep the hub copy only as a
+fallback with a printed sha256 (option 2). The hub-served copy cannot be
+removed until every documented install line has moved.

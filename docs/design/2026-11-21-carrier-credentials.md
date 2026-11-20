@@ -45,3 +45,21 @@ WebSocket target.
 reachd (issue tokens, revoked list) ~80 lines; carrier verify ~60 lines;
 agent handshake header ~20 lines; tests. Needs an agent release on every
 WebSocket target before enforcement.
+
+## Round 3 status (daybreak P2-C, 2026-11-21)
+
+Still the open item: exact path, mandatory path on every entry point
+(`reach-ws-carrier server` and `reachd ws-server` share
+`wscarrier.RunServerCLI`, astra R2-13), caps and idle timeout are in place,
+but the path is a fleet-wide shared secret. Until the per-machine
+credential ships, the interim rules are operational:
+
+- Before Stage 4, count the WebSocket targets (read-only):
+  `sqlite3 -readonly <db> "SELECT machine_id FROM agent_observations WHERE transport='websocket'"`.
+- Use the repo nginx route (`deploy/nginx/reach-tunnels.conf`: exact
+  location, no URI on `proxy_pass`, per-IP `limit_conn`), not only the
+  README snippet.
+- When a WebSocket target is compromised or retired for cause, rotate the
+  path (`websocket_tunnel.path_prefix` + nginx + redeploy, which rewrites
+  `/etc/reach/ws-carrier.env`) and re-provision the other WebSocket
+  targets; Disable alone does not revoke the path.
