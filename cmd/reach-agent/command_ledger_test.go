@@ -18,6 +18,13 @@ import (
 func TestHeartbeatRetainsResultsUntilSuccess(t *testing.T) {
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Only count real heartbeats. Local tools (port scanners, dev servers
+		// probing new listeners) can hit a fresh httptest port with GET /;
+		// counting those made this test fail nondeterministically.
+		if r.Method != http.MethodPost || r.URL.Path != "/api/client/agent/heartbeat" {
+			http.NotFound(w, r)
+			return
+		}
 		body, _ := io.ReadAll(r.Body)
 		if !bytes.Contains(body, []byte(`"command_id":"cmd_one"`)) {
 			t.Errorf("heartbeat missing pending command result: %s", body)
