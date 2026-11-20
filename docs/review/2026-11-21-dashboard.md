@@ -4,7 +4,13 @@
 - 依據：`~/30-39-Research/34-tech-research/2026-11-20-reach-dashboard-frontend.md` 的 A 表和 B 部分、兩份安全報告裡跟前端有關的項目（Opus P2-4、P2-7、P3-5；daybreak P2-1、P3-1），以及後端的 `docs/EVENTS.md`（`fix/hardening-2026-11` 的 41fbbff）。
 - 新截圖：`~/30-39-Research/34-tech-research/2026-11-21-reach-dashboard-v2-shots/`
 - 量測原始資料：同一個資料夾下的 `measurements/`（`before-all.json`、`after-all.json`、`after-oldsrv-all.json`、`summary.md`）
-- 驗證：`npm run build` 通過，`nuxt typecheck` 0 個錯誤，`vitest` 57/57 通過（原本是 21 個，全部保留，另外新增 36 個）。
+- 驗證（第 2 輪後）：
+  - `npm run build`、`npm run generate` 都通過。
+  - `nuxt typecheck` 0 個錯誤。
+  - `vitest` 62/62 通過。
+  - 瀏覽器回歸測試 `test-harness/regress.mjs` 19/19 通過。
+  - 對真實 reachd 的 revoke e2e 通過。
+  - 審查意見的處理見「astra round 1／daybreak」一節。
 
 ---
 
@@ -178,6 +184,97 @@
 
 ---
 
+## astra round 1／daybreak
+
+- **審查報告：**
+  - `~/30-39-Research/34-tech-research/2026-11-21-reach-dashboard-astra-review.md`：判定 FIX，審的是 `ec9ca8a`。
+  - `~/30-39-Research/34-tech-research/2026-11-21-reach-hardening-security-recheck-daybreak.md`：其中 P3-5～P3-7 是 dashboard 的問題。
+- **F01**（revoke-all 沒有關掉既有的 SSE）是後端的問題，已在 hardening `2ef1460` 修好。前端這邊只驗證「被撤銷的分頁會回到登入頁」，見下面的 e2e。
+- **commit：**
+  - `8d2f659`：mock 加上回歸測試
+  - `ec24c88`：F02～F06
+  - `4214388`：F08、F09
+  - `b2784f5`：F07、F10、P3-5、P3-7
+  - `1b295f3`：用真實 reachd 跑的 e2e
+  - `208f92d`：截圖腳本
+- **注意：** `ec24c88` 和 `4214388` 單獨 checkout 時，`nuxt typecheck` 會失敗。原因是 `useReachApi.ts` 引用了 `b2784f5` 才加進來的 `loginLocation`/`currentAppPath`，但 vitest 這兩個 commit 都能通過。這段歷史已經 push，所以沒有改寫。要 bisect 的話，請以 `b2784f5` 之後的 commit 為準。
+
+### 測試怎麼證明修好了
+
+照 astra 的要求，新增的測試會讓真正的 bundle 在瀏覽器裡跑，驗證**畫面上看到的東西**和 **mock 實際收到的 API**，不只驗證 planner。
+
+- **`test-harness/regress.mjs`**：用 Chromium 跑 generate 出來的 bundle，搭配 `mock.mjs`，共 19 個案例。
+  - **審查版 `ec9ca8a`：3/19 通過**。也就是說，這些案例在舊程式上確實會失敗，能重現審查發現的問題。
+  - **現在：19/19 通過**。
+  - 紀錄存在 `measurements/regress-ec9ca8a.txt` 和 `measurements/regress-round2.txt`。
+- **`test-harness/real-backend-revoke.mjs`**：不用 mock，直接用 `fix/hardening-2026-11`（`3646d23`）build 出來的 reachd。reachd 跑在 `/tmp`，設定 `provisioning_enabled: false`，只聽 loopback。
+  - 裝置 A 打開 `?tab=requests` 並連上 Live。
+  - 裝置 B 按「Sign out everywhere」。
+  - 結果：A 的 SSE 被伺服器關掉，重連時拿到 `GET /api/admin/events 401`，**1.6 秒後**回到 `/login?reason=session-expired&next=/?tab=requests`，兩種 storage 都已清空。B 顯示「Signed out everywhere」。
+  - 紀錄存在 `measurements/real-reachd-revoke.json`。這個腳本會拒絕連到非本機的 reachd。
+- **vitest**：62 個測試，比上一輪多 5 個，新增的是 F03 交錯情境的 store 測試。
+- **typecheck 和 generate**：都通過。
+
+### mock 的修正
+
+astra 指出，原本的 mock 會把問題蓋掉。改了以下幾點：
+
+| 原本的問題 | 現在 |
+|---|---|
+| 重連時沒有 durable replay | 有真正的事件 log。帶 `Last-Event-ID` 重連時，只重播 cursor 之後的 durable event。舊格式（HBFMT=old）的 heartbeat 也會進 log，上限 500 筆。新格式的 heartbeat 不進 log，也不重播。超出範圍時回 `resync_required`，並帶空的 `id:`。 |
+| 等完 latency 才讀資料 | 請求一到就把回應內容複製一份存起來，等 latency 過了再送出。所以回應有可能比這段時間內推送的事件還舊，跟真的 DB 讀取一樣。順帶一提，第一次修的時候 clone 還放在 latency 之後，用 `dbg-f03` 抓出來後才改到請求到達時。 |
+| POST 一律回成功 | disable、enable、remove、retire-now 會真的改機器狀態，並推送跟 reachd 一樣的事件。`/__fail` 可以注入 409 或 500，`/__latency` 可以注入延遲。 |
+| 沒有登入和撤銷 | 有登入（`AUTH=1`）、session version、revoke-all。revoke-all 會關掉既有的 SSE，跟 `2ef1460` 一樣。也可以用 `/__revoke?close=0` 模擬「token 失效，但連線還沒被關掉」的情況。 |
+
+### 逐項處理
+
+| # | 問題 | 怎麼修 | 證明 |
+|---|---|---|---|
+| F02 / daybreak P3-6 | 首次 hello 的 3 秒去重有空窗 | `useFleet.start()` 改成**先訂閱，等收到 hello 才抓快照**。不再判斷「3 秒內」，每次 hello 都抓。如果 2.5 秒內還沒收到 hello（SSE 連不上），也會先載一次快照，讓畫面有資料。 | regress「F02 a machine disabled between the snapshot read and the subscribe」：mock 讓 SSE 延遲訂閱、快照延遲回應，並在兩者之間把 omarchy 停用。舊版顯示 Online，新版顯示 Disabled。 |
+| F03 | 舊的 HTTP 回應蓋掉比它新的 SSE 資料 | `fleetStore.createPatchLog()`：<br>- 有 HTTP 請求還沒回來時，每個機器事件都依序記錄。<br>- 回應套用之後，把「請求開始之後」收到的 patch 再套一次。<br>- 快照裡沒有、但被事件提到的機器，不會因為快照就刪掉，而是改成單台重抓。<br>- 快照和 pending 分開套用，pending 回應慢不會拖住機器快照。<br>- 同一筆 heartbeat 重播時會再套一次它帶的狀態。 | regress 兩個 F03 案例（全量快照、單台 GET，都延遲 1.2 秒）；vitest `fleetStore.test.ts` 的「HTTP response vs newer SSE patch」五個案例。 |
+| F04 | heartbeat 後，詳細頁的診斷不會更新；舊的 observation 被當成剛回報 | - heartbeat 只寫 `live_heartbeat_at`，不改 `agent_observation.heartbeat_at`。<br>- Connection check 的 Tunnel 和 sshd 用 observation 本身的時間判斷新舊。<br>- 打開詳細頁一定會抓一次單台資料。<br>- 已打開的那台收到 heartbeat 時重抓，最多每 15 秒一次。<br>- 沒打開的機器收到 heartbeat 仍然是 0 個 GET。<br>- 首次快照之前收到的 patch 不再觸發 GET，因為快照馬上就會來。 | regress「F04 the open machine shows new diagnostics…」：版本、傳輸、persistence 都更新了，而且沒打開的機器 GET 數為 0。regress「F04 a heartbeat does not make an old tunnel report look current」：12 小時前的 connected/healthy 現在顯示 Unknown。 |
+| F05 | 有 cursor 的重連被當成資料已補齊 | 拿掉 `wasResumed()` 的短路判斷，續接後的 hello 一樣會抓快照。 | regress「F05 reconnecting with a cursor…」：SSE 被拒 1.5 秒期間 jack 恢復上線，而且只有 live heartbeat，沒有 durable event。重連後畫面顯示 Online，也有快照 GET。 |
+| F06 | requests lane 失敗後不會 retry | 每個 lane 有自己的錯誤狀態和 backoff：pending 失敗時用 `requestsRetry` 重試，成功後只清掉 pending 自己的錯誤。 | regress「F06 a pending-requests failure is retried」：注入一次 500 之後，請求出現在畫面上，錯誤橫幅也消失。 |
+| F07 | Disable all 確認時沒有重新檢查名單 | - 確認框只存 id，顯示的清單和實際送出的清單都從最新資料重算。<br>- 已經不是 dormant 的機器會被移出清單，並顯示「No longer dormant, left out」。<br>- 按下確認時再篩選一次。<br>- 有失敗時列出機器名稱和伺服器回的原因。<br>- 確認之後在網路上才發生的競態，要等後端提供條件式 bulk API，這裡沒有處理。 | regress「F07 Disable all leaves out a machine…」：標題的數字少 1，`ntut-vdi-win` 不在清單裡，送出的 disable 是 n-1 個，該機器仍然是 active。截圖 46。 |
+| F08 | probe 沒有判斷新舊，也沒看機器是否已停用 | - 機器不是 active 時，三格都顯示「Not checked」，並附上最後一次結果的時間。<br>- active 的機器，probe 超過 15 分鐘就顯示 Unknown。後端沒變化的列每 10 分鐘才寫一次，所以門檻用 15 分鐘，留一些餘裕。<br>- `health_changed` 帶來的 probe 會更新 `last_probe_at`。 | regress 兩個 F08 案例；截圖 44（停用）、45（probe 是 1 天前的）。 |
+| F09 | disable_failed 被說成 removal stuck | 新增獨立的 `disable_failed` 狀態：標籤是「Disable failed」，用紅色和三角形圖示，放在 Needs attention。橫幅寫「disable did not finish」，有自己的統計卡，詳細頁提供 Retry disable。cleanup_failed 和 stuck 才算 removal 的問題。 | regress「F09 …」；截圖 42、43。 |
+| F10 | 登入後沒有回到原本的網址 | - middleware 和 API、SSE 收到 401 時，都導到 `/login?next=<目前路徑>`。<br>- `safeReturnPath` 只接受同站的 app 路徑，`//host`、`/\host`、帶 scheme 的、有控制字元的，以及 `/login` 本身，一律退回 `/`。 | regress「F10 deep link survives the login detour」；「F10 ?next cannot send you to another site」試了四種惡意寫法，結果都停在本站。 |
+| daybreak P3-5 | revoke-all 收到 401 時顯示成功 | - 只有 2xx 才算成功，並顯示「Signed out everywhere」。<br>- 收到 401 時：登出本機，登入頁寫「Sign out everywhere did NOT happen」；重新登入後回到 Settings，**再跳一次確認框**，不會自動重試。<br>- 其他錯誤顯示「Nothing was revoked」。<br>- 這個 endpoint 的 401 不走全域的自動導向，由頁面自己處理。 | regress「P3-5 …」：在 401 之後 session version 沒有變；使用者再確認一次後才 +1，並顯示成功訊息。截圖 41。 |
+| daybreak P3-7 | 登入預設存在 localStorage | 「Keep me signed in」預設不勾，token 存在 sessionStorage。說明文字改成「Off: you are signed out when this tab closes」。 | regress「P3-7 …」：預設 local 是空的、session 有值。截圖 40。 |
+| 加分項 | 跨分頁登出 | 登出、revoke-all，或任何 401 都會寫入 `reach-signout`，同一個瀏覽器的其他分頁收到 `storage` 事件後一起回到登入頁。 | regress「sign-out in one tab signs out the other tabs」。 |
+
+astra 要求補的回歸案例，除了「後端 revoke-all 關掉既有 stream」由後端 builder 自己的 Go 測試負責，其他都已經補上：
+
+- snapshot/subscription 空窗 → F02
+- HTTP 和 SSE 交錯 → F03 ×2
+- 已打開詳細頁收到心跳後更新 → F04 ×2
+- 帶 durable cursor 重連後補齊資料 → F05
+- requests 單次失敗後恢復 → F06
+- bulk 確認框打開期間機器重新上線 → F07
+
+前端在撤銷之後的行為由 regress 的「revoked session…」和 `real-backend-revoke.mjs` 兩邊驗證。另外也補了危險操作完成後的狀態檢查：Remove 打錯名字按 Enter 時不會送出，打對之後送 1 個 POST，畫面變成 Retiring；409 會顯示錯誤，機器維持 Online。
+
+### 修正後重新量測（新 bundle 搭配新版 mock）
+
+| 項目 | 上一輪 after | 這一輪 |
+|---|---|---|
+| 首次載入的 API 請求 | 4（machines ×1、pending ×2、events） | **3**（machines、pending、events 各 1 次） |
+| 4G 手機／桌面：機器列表出現 | 2689／2665 ms | 2674／2675 ms |
+| 心跳風暴（桌面、手機）的 API 請求 | 0／0 | 0／0 |
+| 真實節奏心跳的 API 請求 | 0 | 0 |
+| 跳動風暴：請求數，同時最多幾個 | 193，3 | 196，3 |
+| 所有情境的 long task | 0 | 0 |
+
+先訂閱、收到 hello 才抓快照，反而少了一次 pending 抓取，載入時間持平。原始資料在 `measurements/round2-load.json` 和 `measurements/round2-storm.json`。
+
+### 已知的限制
+
+- 「確認之後才發生的網路競態」（F07）要等後端提供帶條件的 bulk API。
+- revoke 的 e2e 用的是本機 reachd 和自己寫的 proxy，不是 jason 上的 nginx。
+- 手機畫面一樣是用 Chromium 調成手機尺寸量的，沒有用真的 iPhone Safari。
+
+---
+
 ## 刻意沒做的事，以及原因
 
 - **nginx 的 gzip 和 cache**（A2）：要改 jason，這一輪禁止部署。量測顯示開了之後首次載入大約 −40%。
@@ -207,6 +304,11 @@ BEFORE_SITE=... AFTER_SITE=.output/public OUTDIR=/tmp/out \
 uv run test-harness/summarize.py /tmp/out
 # 截圖：先開 mock（SCENARIO=arthur HBFMT=new V2=1），再跑
 SHOTS=/tmp/shots CHROME=... node test-harness/shots.mjs
+SITE=.output/public SHOTS=/tmp/shots CHROME=... node test-harness/shots-round2.mjs
+# 瀏覽器回歸測試（自己會開 mock）
+SITE=.output/public CHROME=... node test-harness/regress.mjs
+# 對真實 reachd 的 revoke e2e（reachd 要在 /tmp 用測試設定、provisioning_enabled: false）
+SITE=.output/public REACHD=http://127.0.0.1:19310 USER_NAME=... PASS=... CHROME=... node test-harness/real-backend-revoke.mjs
 ```
 
 `measure.mjs`／`shots.mjs` 預設從 `instagram-chat-export/node_modules` 載入 `playwright-core` 1.64.1，可以用 `PLAYWRIGHT=` 換掉。
