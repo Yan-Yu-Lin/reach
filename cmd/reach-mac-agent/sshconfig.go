@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"reach/internal/reserved"
 )
 
 // The Mac agent never writes server-supplied text into ~/.ssh. It accepts a
@@ -59,28 +61,22 @@ var allowedOptionNames = map[string]bool{
 	"MACs":                     true,
 }
 
-// reservedHostPatterns mirrors the server-side slug blacklist. Even if the hub
-// is compromised it cannot claim these aliases in the Reach include file.
-var reservedHostPatterns = []string{"jason*", "*-public", "pi", "pi-*", "localhost", "reach-hub", "hub", "github*", "gitlab*"}
-
-func reservedHost(name string) bool {
-	for _, p := range reservedHostPatterns {
-		if ok, _ := filepath.Match(p, name); ok {
-			return true
-		}
-	}
-	return false
+// reservedHost uses the exact list reachd enforces (internal/reserved), so
+// even a compromised hub cannot claim those aliases in the include file.
+// Extra local reservations come from mac-agent.yaml (reserved_hosts).
+func reservedHost(name string, extra []string) bool {
+	return reserved.Match(name, extra)
 }
 
 func validToken(s string) bool {
 	return s != "" && len(s) <= 128 && sshTokenRE.MatchString(s) && !strings.HasPrefix(s, "-")
 }
 
-func validateHost(h sshHost) error {
+func validateHost(h sshHost, extraReserved ...string) error {
 	if !hostAliasRE.MatchString(h.Host) {
 		return fmt.Errorf("invalid host alias %q", h.Host)
 	}
-	if reservedHost(h.Host) {
+	if reservedHost(h.Host, extraReserved) {
 		return fmt.Errorf("host alias %q is reserved", h.Host)
 	}
 	if h.HostName != "localhost" && h.HostName != "127.0.0.1" {
@@ -94,6 +90,9 @@ func validateHost(h sshHost) error {
 	}
 	if !validToken(h.ProxyJump) || strings.ContainsAny(h.ProxyJump, "%") {
 		return fmt.Errorf("host %s: invalid proxy jump", h.Host)
+	}
+	if strings.EqualFold(h.ProxyJump, h.Host) {
+		return fmt.Errorf("host %s: proxy jump must not be the host itself", h.Host)
 	}
 	if !hostKeyAliasRE.MatchString(h.HostKeyAlias) {
 		return fmt.Errorf("host %s: invalid host key alias", h.Host)
@@ -116,12 +115,12 @@ func validateHost(h sshHost) error {
 
 // sanitizeHosts drops invalid or duplicate hosts so one bad row cannot remove
 // every alias; dropped hosts are reported to the caller for logging.
-func sanitizeHosts(in []sshHost) ([]sshHost, []error) {
+func sanitizeHosts(in []sshHost, extraReserved ...string) ([]sshHost, []error) {
 	var out []sshHost
 	var errs []error
 	seen := map[string]bool{}
 	for _, h := range in {
-		if err := validateHost(h); err != nil {
+		if err := validateHost(h, extraReserved...); err != nil {
 			errs = append(errs, err)
 			continue
 		}

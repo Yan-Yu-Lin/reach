@@ -163,3 +163,28 @@ func TestSyncFallsBackToStrictLegacyParser(t *testing.T) {
 		t.Fatalf("evil config reached disk:\n%s", after)
 	}
 }
+
+// Astra P2-10: the Mac must reject exactly what the server reserves, plus a
+// host that jumps through itself.
+func TestMacRejectsEveryServerReservedAlias(t *testing.T) {
+	for _, name := range []string{"jason", "jason-ts", "home-public", "pi", "pi-lab", "localhost", "localhost-dev", "reach", "reach-hub", "hub", "hub-node", "github", "gitlab-ci", "bitbucket-work"} {
+		h := goodHost()
+		h.Host = name
+		if err := validateHost(h); err == nil {
+			t.Fatalf("reserved alias %q accepted", name)
+		}
+	}
+	h := goodHost()
+	h.Host, h.ProxyJump = "jumpbox", "jumpbox"
+	if err := validateHost(h); err == nil {
+		t.Fatal("host that proxy-jumps through itself accepted")
+	}
+	h = goodHost()
+	h.Host = "my-box"
+	if err := validateHost(h, "my-*"); err == nil {
+		t.Fatal("locally reserved alias accepted")
+	}
+	if err := validateHost(goodHost()); err != nil {
+		t.Fatal(err)
+	}
+}

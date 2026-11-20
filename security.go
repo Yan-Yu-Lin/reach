@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
-	"path"
 	"regexp"
 	"strings"
 	"time"
@@ -16,6 +15,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"golang.org/x/crypto/argon2"
 	"golang.org/x/crypto/ssh"
+	"reach/internal/reserved"
 )
 
 var (
@@ -264,27 +264,10 @@ func TokenHash(token string) string {
 	return base64.RawURLEncoding.EncodeToString(h[:])
 }
 
-// defaultReservedSlugPatterns are aliases a target may never claim. A Reach
-// alias that shadows a hand-written Host in the operator's ~/.ssh/config can
-// redirect `ssh jason-ts` to an attacker's machine (Opus P1-2). Patterns use
-// path.Match syntax.
-var defaultReservedSlugPatterns = []string{
-	"jason*", "*-public", "pi", "pi-*", "localhost", "localhost-*",
-	"reach", "reach-hub", "hub", "hub-*", "github*", "gitlab*", "bitbucket*",
-}
-
-// SlugReserved reports whether slug matches a reserved pattern.
+// SlugReserved reports whether slug is a reserved alias (built-in list in
+// internal/reserved, shared with reach-mac-agent, plus config extras). A
+// Reach alias that shadows a hand-written Host in the operator's
+// ~/.ssh/config can redirect `ssh jason-ts` (Opus P1-2).
 func SlugReserved(slug string, extra []string) bool {
-	for _, list := range [][]string{defaultReservedSlugPatterns, extra} {
-		for _, p := range list {
-			p = strings.ToLower(strings.TrimSpace(p))
-			if p == "" {
-				continue
-			}
-			if ok, _ := path.Match(p, slug); ok {
-				return true
-			}
-		}
-	}
-	return false
+	return reserved.Match(slug, extra)
 }

@@ -32,6 +32,9 @@ type Config struct {
 	InstallInclude bool   `yaml:"install_include"`
 	// SSHBinary is the ssh used to validate generated config (ssh -G).
 	SSHBinary string `yaml:"ssh_binary,omitempty"`
+	// ReservedHosts adds local aliases (path.Match patterns) Reach may never
+	// write, e.g. every hand-written Host in ~/.ssh/config.
+	ReservedHosts []string `yaml:"reserved_hosts,omitempty"`
 }
 
 type Event struct {
@@ -369,7 +372,7 @@ func (a Agent) Sync(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	valid, rejected := sanitizeHosts(hosts)
+	valid, rejected := sanitizeHosts(hosts, a.cfg.ReservedHosts...)
 	for _, e := range rejected {
 		a.log.Printf("skipping host from server: %v", e)
 	}
