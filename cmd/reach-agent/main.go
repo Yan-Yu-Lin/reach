@@ -1110,34 +1110,9 @@ func (d *Daemon) startLocalSSH(ctx context.Context) error {
 	if runtime.GOOS == "darwin" {
 		return startDarwinSystemSSHD(ctx)
 	}
-	// Restart an sshd the host already uses, but never enable one at boot
-	// that the host did not have (daybreak P1-5).
-	if _, err := exec.LookPath("systemctl"); err == nil {
-		for _, svc := range d.cfg.LocalSSH.ServiceNames {
-			if svc == "" {
-				continue
-			}
-			if exec.CommandContext(ctx, "systemctl", "is-enabled", "--quiet", svc).Run() != nil {
-				continue
-			}
-			cmd := exec.CommandContext(ctx, "systemctl", "start", svc)
-			if out, err := cmd.CombinedOutput(); err == nil {
-				d.logger.Printf("started ssh service %s", svc)
-				return nil
-			} else {
-				d.logger.Printf("systemctl start %s failed: %s", svc, strings.TrimSpace(string(out)))
-			}
-		}
-	}
-	for _, svc := range d.cfg.LocalSSH.ServiceNames {
-		cmd := exec.CommandContext(ctx, "service", svc, "start")
-		if out, err := cmd.CombinedOutput(); err == nil {
-			return nil
-		} else if len(out) > 0 {
-			d.logger.Printf("service %s start failed: %s", svc, strings.TrimSpace(string(out)))
-		}
-	}
-	return errors.New("could not start local ssh service")
+	// Restart an sshd the host already enabled; never enable or start a
+	// disabled one (daybreak P1-5, round 3 P1-D). Policy in sshd_policy.go.
+	return startUnixSSHDService(ctx, defaultUnixSSHDProbe(), d.cfg.LocalSSH.ServiceNames, d.logger.Printf)
 }
 func (d *Daemon) startInternalSSHD(ctx context.Context) error {
 	self := d.cfg.Install.AgentPath

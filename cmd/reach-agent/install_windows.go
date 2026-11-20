@@ -152,8 +152,9 @@ func prepareWindowsLocalSSH(ctx context.Context, opt installOptions, targetHome 
 	return localSSHPlan{Mode: mode, LocalPort: 22, AuthFile: authFile, ClientOptions: clientOptionsForServerBanner(banner, "")}, nil
 }
 
-// ensureWindowsOpenSSHServer starts an installed Windows OpenSSH Server.
-// It installs the capability only when allowInstall is set: the Windows
+// ensureWindowsOpenSSHServer starts an installed Windows OpenSSH Server whose
+// StartupType is already Automatic. With allowInstall it may also install
+// the capability and set Automatic: the Windows
 // sshd listens on every interface, which Reach does not need (daybreak
 // P1-5). Without it, a system install on a machine with no OpenSSH Server
 // stops with instructions instead of silently opening port 22.
@@ -174,13 +175,9 @@ func ensureWindowsOpenSSHServer(ctx context.Context, allowInstall bool) error {
 		}
 	}
 	ensureWindowsOpenSSHPath()
-	if out, err := powershellOutput(ctx, `
-$svc = Get-Service -Name sshd -ErrorAction SilentlyContinue
-if (-not $svc) { throw 'sshd service is not installed after OpenSSH setup' }
-Set-Service -Name sshd -StartupType Automatic
-if ($svc.Status -ne 'Running') { Start-Service -Name sshd }
-(Get-Service -Name sshd).Status
-`); err != nil {
+	// A Disabled or Manual sshd stays that way unless the operator opted in
+	// (round 3 P1-D); same policy as setup.ps1 and the Unix daemon.
+	if out, err := powershellOutput(ctx, windowsSSHDScript(allowInstall)); err != nil {
 		return fmt.Errorf("start/configure Windows sshd service failed: %w: %s", err, strings.TrimSpace(out))
 	}
 	return nil

@@ -712,51 +712,6 @@ func keyTypeFileStem(keyType string) string {
 	}
 }
 
-func ensureSystemSSHD(ctx context.Context) error {
-	if runtime.GOOS == "darwin" {
-		return startDarwinSystemSSHD(ctx)
-	}
-	if err := startSSHServices(ctx); err == nil {
-		return nil
-	}
-	if _, err := exec.LookPath("apt-get"); err == nil {
-		cmd := exec.CommandContext(ctx, "apt-get", "update")
-		_ = cmd.Run()
-		cmd = exec.CommandContext(ctx, "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y", "openssh-server")
-		if out, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("install openssh-server failed: %w: %s", err, strings.TrimSpace(string(out)))
-		}
-		return startSSHServices(ctx)
-	}
-	return startSSHServices(ctx)
-}
-
-func startSSHServices(ctx context.Context) error {
-	if runtime.GOOS == "darwin" {
-		return startDarwinSystemSSHD(ctx)
-	}
-	services := []string{"ssh", "sshd"}
-	if _, err := exec.LookPath("systemctl"); err == nil {
-		for _, svc := range services {
-			cmd := exec.CommandContext(ctx, "systemctl", "enable", "--now", svc)
-			if out, err := cmd.CombinedOutput(); err == nil {
-				return nil
-			} else if len(out) > 0 {
-				fmt.Printf("[reach warning] systemctl enable --now %s failed: %s\n", svc, strings.TrimSpace(string(out)))
-			}
-		}
-	}
-	for _, svc := range services {
-		cmd := exec.CommandContext(ctx, "service", svc, "start")
-		if out, err := cmd.CombinedOutput(); err == nil {
-			return nil
-		} else if len(out) > 0 {
-			fmt.Printf("[reach warning] service %s start failed: %s\n", svc, strings.TrimSpace(string(out)))
-		}
-	}
-	return fmt.Errorf("could not start ssh/sshd service")
-}
-
 func writeKnownHosts(path string, keys []string, compat SSHCompatConfig) error {
 	if len(keys) == 0 {
 		return fmt.Errorf("API returned no hub_host_keys; refusing to install without host key pinning")
@@ -1102,27 +1057,39 @@ func startDarwinSystemSSHD(ctx context.Context) error {
 	if err := probeSSH(ctx, "127.0.0.1", 22, 3*time.Second); err == nil {
 		return nil
 	}
-	var attempts []string
-	if _, err := exec.LookPath("systemsetup"); err == nil {
-		if out, err := exec.CommandContext(ctx, "systemsetup", "-setremotelogin", "on").CombinedOutput(); err != nil {
-			attempts = append(attempts, fmt.Sprintf("systemsetup: %s", strings.TrimSpace(string(out))))
+	// Restart Remote Login only if the administrator left it enabled; never
+	// turn it on (systemsetup -setremotelogin / launchctl enable): that is
+	// the host-wide sshd policy (sshd_policy.go, round 3 P1-D).
+	if _, err := exec.LookPath("launchctl"); err != nil {
+		return errors.New("launchctl not found; cannot check macOS Remote Login")
+	}
+	out, _ := exec.CommandContext(ctx, "launchctl", "print-disabled", "system").CombinedOutput()
+	st := sshdServiceState{Manager: "launchd", Name: "com.openssh.sshd", BootEnabled: darwinRemoteLoginEnabled(string(out))}
+	if action, why := decideSSHDAction(st, false); action == sshdLeaveAlone {
+		return fmt.Errorf("%w: %s (macOS Remote Login is off)", errSSHDNotPermitted, why)
+	}
+	if out, err := exec.CommandContext(ctx, "launchctl", "kickstart", "-k", "system/com.openssh.sshd").CombinedOutput(); err != nil {
+		return fmt.Errorf("launchctl kickstart sshd: %s", strings.TrimSpace(string(out)))
+	}
+	if err := probeSSH(ctx, "127.0.0.1", 22, 5*time.Second); err != nil {
+		return fmt.Errorf("macOS sshd did not answer on 127.0.0.1:22 after kickstart: %w", err)
+	}
+	return nil
+}
+
+// darwinRemoteLoginEnabled parses `launchctl print-disabled system`: the
+// sshd job is enabled when listed as "=> enabled" / "=> false" (older
+// macOS). Missing or anything else counts as disabled (fail closed).
+func darwinRemoteLoginEnabled(out string) bool {
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, `"com.openssh.sshd"`) {
+			continue
 		}
+		v := strings.TrimSpace(line[strings.Index(line, "=>")+2:])
+		return v == "enabled" || v == "false"
 	}
-	if _, err := exec.LookPath("launchctl"); err == nil {
-		if out, err := exec.CommandContext(ctx, "launchctl", "enable", "system/com.openssh.sshd").CombinedOutput(); err != nil {
-			attempts = append(attempts, fmt.Sprintf("launchctl enable: %s", strings.TrimSpace(string(out))))
-		}
-		if out, err := exec.CommandContext(ctx, "launchctl", "kickstart", "-k", "system/com.openssh.sshd").CombinedOutput(); err != nil {
-			attempts = append(attempts, fmt.Sprintf("launchctl kickstart: %s", strings.TrimSpace(string(out))))
-		}
-	}
-	if err := probeSSH(ctx, "127.0.0.1", 22, 5*time.Second); err == nil {
-		return nil
-	}
-	if len(attempts) == 0 {
-		attempts = append(attempts, "no systemsetup/launchctl attempt output")
-	}
-	return fmt.Errorf("could not enable macOS Remote Login on 127.0.0.1:22; admin/root and Full Disk Access may be required: %s", strings.Join(attempts, "; "))
+	return false
 }
 
 // chownPathToUser is only used for directories Reach itself owns; target

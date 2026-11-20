@@ -7,8 +7,9 @@ param(
   [ValidateSet('auto','direct','websocket')][string]$Transport = $(if ($env:REACH_TRANSPORT) { $env:REACH_TRANSPORT } else { "auto" }),
   [string]$Version = $(if ($env:REACH_AGENT_VERSION) { $env:REACH_AGENT_VERSION } else { "0.1.0-alpha" }),
   [switch]$Yes,
-  # Install/enable Windows OpenSSH Server if missing. It listens on all
-  # interfaces; Reach only needs loopback, so this is opt-in (daybreak P1-5).
+  # Install Windows OpenSSH Server if missing, or enable it if it is set to
+  # Disabled/Manual. It listens on all interfaces; Reach only needs
+  # loopback, so this is opt-in (daybreak P1-5, round 3 P1-D).
   [switch]$InstallOpenSSH,
   [switch]$Repair,
   [switch]$UpdateAgent,
@@ -92,7 +93,17 @@ function Ensure-ReachOpenSSHServer {
   if (-not $svc) { Die "sshd service was not found after OpenSSH Server installation" }
   Add-ReachOpenSSHPath
 
-  Set-Service -Name sshd -StartupType Automatic
+  # Same policy as reach-agent (cmd/reach-agent/sshd_policy.go, daybreak
+  # round 3 P1-D): a Disabled or Manual sshd is the administrator's choice
+  # and is only changed with -InstallOpenSSH.
+  $mode = (Get-CimInstance Win32_Service -Filter "Name='sshd'").StartMode
+  if ($mode -ne 'Auto') {
+    if (-not $InstallOpenSSH) {
+      Die "Windows OpenSSH Server is installed but its StartupType is $mode. Reach will not enable it (it listens on all interfaces). Rerun with -InstallOpenSSH to enable it, or run setup.ps1 without Administrator to use Reach's loopback-only built-in SSH server."
+    }
+    Warn "Setting Windows OpenSSH Server (StartupType $mode) to Automatic because -InstallOpenSSH was given; it listens on all interfaces."
+    Set-Service -Name sshd -StartupType Automatic
+  }
   if ((Get-Service -Name sshd).Status -ne 'Running') {
     Start-Service -Name sshd
   }
