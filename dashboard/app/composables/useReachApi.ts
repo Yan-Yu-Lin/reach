@@ -143,8 +143,14 @@ export const SIGNOUT_KEY = 'reach-signout'
  */
 export async function tokenFingerprint(t: string | null | undefined): Promise<string> {
   if (!t || typeof crypto === 'undefined' || !crypto.subtle) return ''
-  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(t))
-  return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('')
+  try {
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(t))
+    return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('')
+  } catch {
+    // Same degradation as no WebCrypto at all (daybreak round 4 P3-03): no fingerprint, so
+    // targeted broadcasts are skipped instead of throwing an unhandled rejection.
+    return ''
+  }
 }
 
 /**
