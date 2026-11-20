@@ -272,3 +272,69 @@ func TestLoginUnknownUserStillRunsArgon(t *testing.T) {
 		t.Fatalf("unknown user login ran Argon2 %d times, want 1", server.argon.runs.Load())
 	}
 }
+
+// Daybreak round 3 P2-H PoC: from the SAME IP (a shared NAT), wrong
+// secrets exhaust the (IP, request) bucket. The real installer behind that
+// NAT must still get through with the right secret; wrong ones stay 429.
+func TestSameIPBadAuthDoesNotBlockRightSecret(t *testing.T) {
+	server, _, _ := newReliabilityTestServer(t)
+	id, secret := registerPending(t, server)
+	for i := 0; i < badAuthPerIPObjectPerMinute+5; i++ {
+		pollFrom(t, server, "203.0.113.70", id, "wrong")
+	}
+	if code := pollFrom(t, server, "203.0.113.70", id, "wrong"); code != http.StatusTooManyRequests {
+		t.Fatalf("wrong secret after exhaustion = %d", code)
+	}
+	if code := pollFrom(t, server, "203.0.113.70", id, secret); code != 200 {
+		t.Fatalf("right secret from the same NAT = %d", code)
+	}
+}
+
+func TestSameIPBadAgentTokensDoNotBlockRightToken(t *testing.T) {
+	server, store, _ := newReliabilityTestServer(t)
+	if _, err := store.db.Exec(`INSERT INTO machines (id,slug,original_slug,status,desired_state,observed_state,desired_generation,agent_token_hash,created_at) VALUES ('m_nat','nat-box','nat-box','offline','active','offline',1,?,?)`, HashToken("at_nat"), nowUTC()); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"machine_id":"m_nat","agent_version":"t","applied_generation":1,"observed":{"local_ssh":{},"tunnel":{},"persistence":{},"keys":{}}}`
+	hb := func(tok string) int {
+		req := httptest.NewRequest(http.MethodPost, "/api/client/agent/heartbeat", strings.NewReader(body))
+		req.RemoteAddr = "127.0.0.1:1"
+		req.Header.Set("X-Real-IP", "203.0.113.71")
+		req.Header.Set("Authorization", "Bearer "+tok)
+		rec := httptest.NewRecorder()
+		server.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	for i := 0; i < badAuthPerIPObjectPerMinute+5; i++ {
+		hb("at_wrong")
+	}
+	if code := hb("at_wrong"); code != http.StatusTooManyRequests {
+		t.Fatalf("wrong token after exhaustion = %d", code)
+	}
+	if code := hb("at_nat"); code != 200 {
+		t.Fatalf("right token from the same NAT = %d", code)
+	}
+}
+
+// A blocked bucket never runs Argon2 for a legacy hash, right or wrong.
+func TestBlockedBucketSkipsArgonForLegacyHashes(t *testing.T) {
+	server, store, _ := newReliabilityTestServer(t)
+	server.argon = newArgonGate(2, time.Second)
+	legacy, _ := HashSecret("at_legacy_nat")
+	if _, err := store.db.Exec(`INSERT INTO machines (id,slug,original_slug,status,desired_state,observed_state,desired_generation,agent_token_hash,created_at) VALUES ('m_ln','ln-box','ln-box','offline','active','offline',1,?,?)`, legacy, nowUTC()); err != nil {
+		t.Fatal(err)
+	}
+	server.badAuthL = newRateLimiter(1, time.Minute)
+	server.badAuthL.allow("hb|203.0.113.72|m_ln")
+	before := server.argon.runs.Load()
+	body := `{"machine_id":"m_ln","agent_version":"t","applied_generation":1,"observed":{"local_ssh":{},"tunnel":{},"persistence":{},"keys":{}}}`
+	req := httptest.NewRequest(http.MethodPost, "/api/client/agent/heartbeat", strings.NewReader(body))
+	req.RemoteAddr = "127.0.0.1:1"
+	req.Header.Set("X-Real-IP", "203.0.113.72")
+	req.Header.Set("Authorization", "Bearer at_legacy_nat")
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusTooManyRequests || server.argon.runs.Load() != before {
+		t.Fatalf("blocked legacy verify: code=%d argon runs %d->%d", rec.Code, before, server.argon.runs.Load())
+	}
+}

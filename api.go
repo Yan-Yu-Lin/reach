@@ -514,10 +514,12 @@ func (s *Server) handleClientPoll(w http.ResponseWriter, r *http.Request) {
 	}
 	// Rate limits come before any DB or hash work (daybreak P1-1, Opus P0-1).
 	ip := clientIP(r)
-	if !s.pollIPL.allow(ip) || s.badAuthL.blocked("poll|"+ip+"|"+id) {
+	if !s.pollIPL.allow(ip) {
 		writeRateLimited(w)
 		return
 	}
+	badKey := "poll|" + ip + "|" + id
+	blocked := s.badAuthL.blocked(badKey)
 	var req struct {
 		ClientSecret string `json:"client_secret"`
 	}
@@ -556,12 +558,24 @@ func (s *Server) handleClientPoll(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"request_id": id, "status": status})
 		return
 	}
+	// While this (IP, request) is blocked, only cheap SHA-256 secrets are
+	// still checked: the right secret gets through, so a neighbour behind
+	// the same NAT cannot lock the real client out (daybreak round 3
+	// P2-H). Legacy Argon2 secrets stay blocked to protect the CPU.
+	if blocked && isLegacyArgonHash(secretHash) {
+		writeRateLimited(w)
+		return
+	}
 	ok, upgraded, err := s.argon.VerifyStoredToken(r.Context(), req.ClientSecret, secretHash)
 	if writeAuthBackendErr(w, err) {
 		return
 	}
 	if !ok {
-		s.badAuthL.allow("poll|" + ip + "|" + id)
+		if blocked {
+			writeRateLimited(w)
+			return
+		}
+		s.badAuthL.allow(badKey)
 		writeClientAuthErr(w)
 		return
 	}
@@ -1021,16 +1035,8 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	badKey := "hb|" + ip + "|" + hb.MachineID
-	if s.badAuthL.blocked(badKey) {
-		writeRateLimited(w)
-		return
-	}
-	if err := s.verifyAgentToken(r.Context(), hb.MachineID, token, true); err != nil {
-		if !errors.Is(err, errAgentTokenInvalid) && writeAuthBackendErr(w, err) {
-			return
-		}
-		s.badAuthL.allow(badKey)
-		writeClientAuthErr(w)
+	if err := s.verifyAgentTokenLimited(r.Context(), hb.MachineID, token, badKey); err != nil {
+		s.writeAgentAuthErr(w, err)
 		return
 	}
 	if !s.agentMachL.allow(hb.MachineID) {
@@ -1148,7 +1154,47 @@ var errAgentTokenInvalid = errors.New("invalid token")
 // hashes are verified under the Argon2 gate and replaced with a SHA-256 hash
 // on first success (lazy migration). Retired machines have their token hash
 // cleared, so they always fail here.
+// errBadAuthBlocked: the (IP, object) bad-credential bucket is exhausted
+// and this request did not present the right credential (HTTP 429).
+var errBadAuthBlocked = errors.New("too many failed attempts")
+
+// verifyAgentTokenLimited checks an agent token under the (IP, machine)
+// bad-credential bucket. While the bucket is exhausted a SHA-256 stored
+// token is still checked (cheap): the right token passes, a wrong one gets
+// 429 and is not counted again. A legacy Argon2 token is refused before
+// hashing, protecting the CPU (daybreak round 3 P2-H).
+func (s *Server) verifyAgentTokenLimited(ctx context.Context, machineID, token, badKey string) error {
+	blocked := s.badAuthL.blocked(badKey)
+	err := s.verifyAgentTokenOpt(ctx, machineID, token, true, blocked)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, errAgentTokenInvalid):
+		if blocked {
+			return errBadAuthBlocked
+		}
+		s.badAuthL.allow(badKey)
+		return err
+	}
+	return err
+}
+
+func (s *Server) writeAgentAuthErr(w http.ResponseWriter, err error) {
+	if errors.Is(err, errBadAuthBlocked) {
+		writeRateLimited(w)
+		return
+	}
+	if !errors.Is(err, errAgentTokenInvalid) && writeAuthBackendErr(w, err) {
+		return
+	}
+	writeClientAuthErr(w)
+}
+
 func (s *Server) verifyAgentToken(ctx context.Context, machineID, token string, allowRetired bool) error {
+	return s.verifyAgentTokenOpt(ctx, machineID, token, allowRetired, false)
+}
+
+func (s *Server) verifyAgentTokenOpt(ctx context.Context, machineID, token string, allowRetired, cheapOnly bool) error {
 	q := `SELECT agent_token_hash FROM machines WHERE id=?`
 	if !allowRetired {
 		q += ` AND desired_state NOT IN ('retired')`
@@ -1163,6 +1209,9 @@ func (s *Server) verifyAgentToken(ctx context.Context, machineID, token string, 
 	}
 	if !hash.Valid {
 		return errAgentTokenInvalid
+	}
+	if cheapOnly && isLegacyArgonHash(hash.String) {
+		return errBadAuthBlocked
 	}
 	ok, upgraded, err := s.argon.VerifyStoredToken(ctx, token, hash.String)
 	if err != nil {
@@ -1331,16 +1380,12 @@ func (s *Server) handleAgentUninstall(w http.ResponseWriter, r *http.Request, co
 	}
 	ip := clientIP(r)
 	badKey := "un|" + ip + "|" + req.MachineID
-	if !s.uninstallIPL.allow(ip) || s.badAuthL.blocked(badKey) {
+	if !s.uninstallIPL.allow(ip) {
 		writeRateLimited(w)
 		return
 	}
-	if err := s.verifyAgentToken(r.Context(), req.MachineID, strings.TrimPrefix(auth, "Bearer "), true); err != nil {
-		if !errors.Is(err, errAgentTokenInvalid) && writeAuthBackendErr(w, err) {
-			return
-		}
-		s.badAuthL.allow(badKey)
-		writeClientAuthErr(w)
+	if err := s.verifyAgentTokenLimited(r.Context(), req.MachineID, strings.TrimPrefix(auth, "Bearer "), badKey); err != nil {
+		s.writeAgentAuthErr(w, err)
 		return
 	}
 	// Separate bucket from heartbeats so heartbeats cannot starve uninstall.
