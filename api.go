@@ -210,8 +210,13 @@ func writeAuthBackendErr(w http.ResponseWriter, err error) bool {
 	if err == nil {
 		return false
 	}
-	w.Header().Set("Retry-After", "5")
-	writeErr(w, http.StatusServiceUnavailable, "authentication busy; retry later")
+	if errors.Is(err, errArgonBusy) || errors.Is(err, context.DeadlineExceeded) {
+		w.Header().Set("Retry-After", "5")
+		writeErr(w, http.StatusServiceUnavailable, "authentication busy; retry later")
+		return true
+	}
+	log.Printf("authentication backend error: %v", err)
+	writeErr(w, http.StatusInternalServerError, "authentication failed")
 	return true
 }
 func decodeJSON(r *http.Request, v any) error {
@@ -588,10 +593,19 @@ func (s *Server) handleClientProvision(w http.ResponseWriter, r *http.Request) {
 	}
 	requestID, name, err := s.consumeSetupToken(r.Context(), req.RequestID, req.SetupToken)
 	if err != nil {
-		if !errors.Is(err, errInvalidSetupToken) && writeAuthBackendErr(w, err) {
-			return
+		// Only a saturated Argon2 gate is retryable; terminal token states
+		// and database errors are not "busy" (astra P2-09).
+		switch {
+		case errors.Is(err, errArgonBusy):
+			writeAuthBackendErr(w, err)
+		case errors.Is(err, errSetupTokenExpired):
+			writeErr(w, http.StatusGone, "setup token expired; rerun setup to request a new one")
+		case errors.Is(err, errInvalidSetupToken), errors.Is(err, sql.ErrNoRows):
+			writeClientAuthErr(w)
+		default:
+			log.Printf("consume setup token for %s: %v", req.RequestID, err)
+			writeErr(w, 500, "provisioning failed")
 		}
-		writeClientAuthErr(w)
 		return
 	}
 	_ = name
@@ -718,7 +732,10 @@ func isUniqueSlugErr(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "UNIQUE constraint failed: machines.slug")
 }
 
-var errInvalidSetupToken = errors.New("invalid setup token")
+var (
+	errInvalidSetupToken = errors.New("invalid setup token")
+	errSetupTokenExpired = errors.New("setup token expired")
+)
 
 func (s *Server) consumeSetupToken(ctx context.Context, requestID, token string) (string, string, error) {
 	var id, name, status string
@@ -742,7 +759,7 @@ func (s *Server) consumeSetupToken(ctx context.Context, requestID, token string)
 	}
 	if exp.Valid {
 		if t, err := time.Parse(time.RFC3339, exp.String); err == nil && time.Now().UTC().After(t) {
-			return "", "", errors.New("setup token expired")
+			return "", "", errSetupTokenExpired
 		}
 	}
 	res, err := s.store.db.ExecContext(ctx, `UPDATE requests SET status='provisioning', setup_token_hash=NULL WHERE id=? AND status='approved' AND setup_token_hash=?`, requestID, hash.String)
@@ -751,7 +768,7 @@ func (s *Server) consumeSetupToken(ctx context.Context, requestID, token string)
 	}
 	n, _ := res.RowsAffected()
 	if n != 1 {
-		return "", "", errors.New("setup token already used")
+		return "", "", errInvalidSetupToken
 	}
 	return id, name, nil
 }
@@ -1025,7 +1042,11 @@ func (s *Server) storeCommandResults(ctx context.Context, hb AgentHeartbeat) {
 			status = "failed"
 		}
 		msg := truncateUTF8(res.Message, maxCommandResultMessage)
-		r, err := s.store.db.ExecContext(ctx, `UPDATE agent_commands SET status=?, acked_at=?, last_error=? WHERE id=? AND machine_id=? AND status IN ('pending','sent')`, status, nowUTC(), nullable(msg), res.CommandID, hb.MachineID)
+		// expires_at is a completion deadline: once it has passed the command
+		// is terminal whether or not maintenance has marked it yet, so the
+		// outcome no longer depends on goroutine order (astra P2-08).
+		now := nowUTC()
+		r, err := s.store.db.ExecContext(ctx, `UPDATE agent_commands SET status=?, acked_at=?, last_error=? WHERE id=? AND machine_id=? AND status IN ('pending','sent') AND (expires_at IS NULL OR expires_at>?)`, status, now, nullable(msg), res.CommandID, hb.MachineID, now)
 		if err != nil {
 			continue
 		}
