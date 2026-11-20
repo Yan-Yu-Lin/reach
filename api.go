@@ -24,10 +24,40 @@ type Server struct {
 	events    *eventBroker
 	registerL *rateLimiter
 	loginL    *rateLimiter
+	// Unauthenticated/agent endpoints get in-memory limiters: a persistent
+	// (SQLite) limiter would turn every rejected request into a DB write.
+	pollIPL      *rateLimiter
+	pollReqL     *rateLimiter
+	agentIPL     *rateLimiter
+	agentMachL   *rateLimiter
+	uninstallIPL *rateLimiter
+	argon        *argonGate
 }
 
+const (
+	pollPerIPPerMinute         = 60
+	pollPerRequestPerMinute    = 30
+	agentPerIPPerMinute        = 240
+	agentPerMachinePerMinute   = 60
+	uninstallPerIPPerMinute    = 20
+	maxHeartbeatCommandResults = 32
+	maxCommandResultMessage    = 1024
+)
+
 func NewServer(cfg Config, store *Store, prov *Provisioner) *Server {
-	s := &Server{cfg: cfg, store: store, prov: prov, mux: http.NewServeMux(), events: newEventBroker(store), registerL: newPersistentRateLimiter(store.db, "client_register", 3, time.Minute), loginL: newPersistentRateLimiter(store.db, "admin_login", 8, time.Minute)}
+	s := &Server{cfg: cfg, store: store, prov: prov, mux: http.NewServeMux(), events: newEventBroker(store),
+		registerL:    newPersistentRateLimiter(store.db, "client_register", 3, time.Minute),
+		loginL:       newPersistentRateLimiter(store.db, "admin_login", 8, time.Minute),
+		pollIPL:      newRateLimiter(pollPerIPPerMinute, time.Minute),
+		pollReqL:     newRateLimiter(pollPerRequestPerMinute, time.Minute),
+		agentIPL:     newRateLimiter(agentPerIPPerMinute, time.Minute),
+		agentMachL:   newRateLimiter(agentPerMachinePerMinute, time.Minute),
+		uninstallIPL: newRateLimiter(uninstallPerIPPerMinute, time.Minute),
+		argon:        defaultArgonGate,
+	}
+	if prov != nil {
+		prov.argon = s.argon
+	}
 	if prov != nil {
 		prov.publishEvent = func(typ, machineID string, data map[string]any) {
 			s.publishEvent(context.Background(), typ, machineID, data)
@@ -161,6 +191,21 @@ func writeErr(w http.ResponseWriter, status int, msg string) {
 func writeClientAuthErr(w http.ResponseWriter) {
 	writeErr(w, http.StatusUnauthorized, "unauthorized")
 }
+func writeRateLimited(w http.ResponseWriter) {
+	w.Header().Set("Retry-After", "10")
+	writeErr(w, http.StatusTooManyRequests, "rate limit exceeded")
+}
+
+// writeAuthBackendErr maps an Argon2 gate failure to a retryable 503 instead
+// of pretending the credentials were wrong.
+func writeAuthBackendErr(w http.ResponseWriter, err error) bool {
+	if err == nil {
+		return false
+	}
+	w.Header().Set("Retry-After", "5")
+	writeErr(w, http.StatusServiceUnavailable, "authentication busy; retry later")
+	return true
+}
 func decodeJSON(r *http.Request, v any) error {
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
@@ -229,11 +274,7 @@ func (s *Server) handleClientRegister(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "could not generate client secret")
 		return
 	}
-	clientHash, err := HashSecret(clientSecret)
-	if err != nil {
-		writeErr(w, 500, "could not hash client secret")
-		return
-	}
+	clientHash := HashToken(clientSecret)
 	requestID, err := RandomID("r")
 	if err != nil {
 		writeErr(w, 500, "could not generate request id")
@@ -254,7 +295,10 @@ func (s *Server) handleClientRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.AuthCode != "" {
-		ok, kind, matchedHash := s.validateClientAuth(r.Context(), req.AuthCode)
+		ok, kind, matchedHash, authErr := s.validateClientAuth(r.Context(), req.AuthCode)
+		if writeAuthBackendErr(w, authErr) {
+			return
+		}
 		if !ok {
 			writeClientAuthErr(w)
 			return
@@ -265,12 +309,7 @@ func (s *Server) handleClientRegister(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 500, "could not generate setup token")
 			return
 		}
-		h, err := HashSecret(setupToken)
-		if err != nil {
-			writeErr(w, 500, "could not hash setup token")
-			return
-		}
-		setupHash = h
+		setupHash = HashToken(setupToken)
 		setupExpires = now.Add(s.cfg.SetupTokenTTL).Format(time.RFC3339)
 		approvedAt = now.Format(time.RFC3339)
 		if kind == "friend" {
@@ -295,37 +334,58 @@ func (s *Server) handleClientRegister(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, resp)
 }
 
-func (s *Server) validateClientAuth(ctx context.Context, code string) (bool, string, string) {
-	if s.cfg.GodCodeHash != "" && VerifySecret(code, s.cfg.GodCodeHash) {
-		return true, "god", ""
+// validateClientAuth checks a god code or invite code. Both are human-handled
+// secrets stored as Argon2id, so every check runs under the Argon2 gate.
+func (s *Server) validateClientAuth(ctx context.Context, code string) (bool, string, string, error) {
+	if s.cfg.GodCodeHash != "" {
+		ok, err := s.argon.VerifySecret(ctx, code, s.cfg.GodCodeHash)
+		if err != nil {
+			return false, "", "", err
+		}
+		if ok {
+			return true, "god", "", nil
+		}
 	}
-	rows, err := s.store.db.QueryContext(ctx, `SELECT code_hash,type,expires_at,used_by FROM invites WHERE used_by IS NULL`)
+	type invite struct{ hash, typ string }
+	var candidates []invite
+	rows, err := s.store.db.QueryContext(ctx, `SELECT code_hash,type,expires_at FROM invites WHERE used_by IS NULL`)
 	if err != nil {
-		return false, "", ""
+		return false, "", "", nil
 	}
-	defer rows.Close()
 	now := time.Now().UTC()
 	for rows.Next() {
 		var hash, typ, exp string
-		var used sql.NullString
-		if rows.Scan(&hash, &typ, &exp, &used) != nil {
+		if rows.Scan(&hash, &typ, &exp) != nil {
 			continue
 		}
 		et, err := time.Parse(time.RFC3339, exp)
 		if err != nil || now.After(et) {
 			continue
 		}
-		if VerifySecret(code, hash) {
-			return true, typ, hash
+		candidates = append(candidates, invite{hash, typ})
+	}
+	_ = rows.Close()
+	for _, c := range candidates {
+		ok, err := s.argon.VerifySecret(ctx, code, c.hash)
+		if err != nil {
+			return false, "", "", err
+		}
+		if ok {
+			return true, c.typ, c.hash, nil
 		}
 	}
-	return false, "", ""
+	return false, "", "", nil
 }
 
 func (s *Server) handleClientPoll(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathAction(r.URL.Path, "/api/client/register/", "/poll")
 	if !ok {
 		writeErr(w, 404, "not found")
+		return
+	}
+	// Rate limits come before any DB or hash work (daybreak P1-1, Opus P0-1).
+	if !s.pollIPL.allow(clientIP(r)) || !s.pollReqL.allow(id) {
+		writeRateLimited(w)
 		return
 	}
 	var req struct {
@@ -346,14 +406,34 @@ func (s *Server) handleClientPoll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "poll failed")
 		return
 	}
-	if !VerifySecret(req.ClientSecret, secretHash) {
+	// Cheap state checks first. Terminal states carry no secret material, so
+	// they are answered without verifying the client secret at all.
+	if status == "pending" {
+		if t, err := time.Parse(time.RFC3339, expiresAt); err == nil && time.Now().UTC().After(t) {
+			if res, err := s.store.db.ExecContext(r.Context(), `UPDATE requests SET status='expired' WHERE id=? AND status='pending'`, id); err == nil {
+				if n, _ := res.RowsAffected(); n == 1 {
+					s.publishEvent(r.Context(), "request.expired", "", map[string]any{"request_id": id})
+				}
+			}
+			status = "expired"
+		}
+	}
+	switch status {
+	case "pending", "approved":
+	default:
+		writeJSON(w, 200, map[string]any{"request_id": id, "status": status})
+		return
+	}
+	ok, upgraded, err := s.argon.VerifyStoredToken(r.Context(), req.ClientSecret, secretHash)
+	if writeAuthBackendErr(w, err) {
+		return
+	}
+	if !ok {
 		writeClientAuthErr(w)
 		return
 	}
-	if t, err := time.Parse(time.RFC3339, expiresAt); err == nil && time.Now().UTC().After(t) && status == "pending" {
-		status = "expired"
-		_, _ = s.store.db.ExecContext(r.Context(), `UPDATE requests SET status='expired' WHERE id=?`, id)
-		s.publishEvent(r.Context(), "request.expired", "", map[string]any{"request_id": id})
+	if upgraded != "" {
+		_, _ = s.store.db.ExecContext(r.Context(), `UPDATE requests SET client_secret_hash=? WHERE id=? AND client_secret_hash=?`, upgraded, id, secretHash)
 	}
 	resp := map[string]any{"request_id": id, "status": status}
 	if status == "approved" {
@@ -365,14 +445,17 @@ func (s *Server) handleClientPoll(w http.ResponseWriter, r *http.Request) {
 				writeErr(w, 500, "could not generate setup token")
 				return
 			}
-			h, err := HashSecret(setupToken)
+			exp := time.Now().UTC().Add(s.cfg.SetupTokenTTL).Format(time.RFC3339)
+			res, err := s.store.db.ExecContext(r.Context(), `UPDATE requests SET setup_token_hash=?, setup_token_expires_at=? WHERE id=? AND status='approved' AND setup_token_hash IS NULL`, HashToken(setupToken), exp, id)
 			if err != nil {
-				writeErr(w, 500, "could not hash setup token")
+				writeErr(w, 500, "could not persist setup token")
 				return
 			}
-			exp := time.Now().UTC().Add(s.cfg.SetupTokenTTL).Format(time.RFC3339)
-			if _, err := s.store.db.ExecContext(r.Context(), `UPDATE requests SET setup_token_hash=?, setup_token_expires_at=? WHERE id=? AND status='approved' AND setup_token_hash IS NULL`, h, exp, id); err != nil {
-				writeErr(w, 500, "could not persist setup token")
+			// A concurrent poll may have minted the token first; only the
+			// request that actually stored its hash may reveal a token.
+			if n, _ := res.RowsAffected(); n != 1 {
+				resp["setup_token_expires_at"] = exp
+				writeJSON(w, 200, resp)
 				return
 			}
 			resp["setup_token"] = setupToken
@@ -499,7 +582,14 @@ func (s *Server) consumeSetupToken(ctx context.Context, requestID, token string)
 	if err != nil {
 		return "", "", err
 	}
-	if status != "approved" || !hash.Valid || !VerifySecret(token, hash.String) {
+	if status != "approved" || !hash.Valid {
+		return "", "", errors.New("invalid setup token")
+	}
+	ok, _, verr := s.argon.VerifyStoredToken(ctx, token, hash.String)
+	if verr != nil {
+		return "", "", verr
+	}
+	if !ok {
 		return "", "", errors.New("invalid setup token")
 	}
 	if exp.Valid {
@@ -592,17 +682,27 @@ func (s *Server) handleAdminEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
+	if !s.agentIPL.allow(clientIP(r)) {
+		writeRateLimited(w)
+		return
+	}
 	token, hb, raw, ok := s.authAgentHeartbeat(w, r)
 	if !ok {
-		_ = token
+		return
+	}
+	if !s.agentMachL.allow(hb.MachineID) {
+		writeRateLimited(w)
+		return
+	}
+	if err := s.verifyAgentToken(r.Context(), hb.MachineID, token, true); err != nil {
+		if !errors.Is(err, errAgentTokenInvalid) && writeAuthBackendErr(w, err) {
+			return
+		}
+		writeClientAuthErr(w)
 		return
 	}
 	m, tunnels, err := s.prov.getMachineAndTunnels(r.Context(), hb.MachineID)
 	if err != nil {
-		writeClientAuthErr(w)
-		return
-	}
-	if err := s.verifyAgentToken(r.Context(), hb.MachineID, token, true); err != nil {
 		writeClientAuthErr(w)
 		return
 	}
@@ -692,6 +792,12 @@ func (s *Server) authAgentHeartbeat(w http.ResponseWriter, r *http.Request) (str
 	return strings.TrimPrefix(auth, "Bearer "), hb, raw, true
 }
 
+var errAgentTokenInvalid = errors.New("invalid token")
+
+// verifyAgentToken checks a per-machine agent bearer token. Legacy Argon2id
+// hashes are verified under the Argon2 gate and replaced with a SHA-256 hash
+// on first success (lazy migration). Retired machines have their token hash
+// cleared, so they always fail here.
 func (s *Server) verifyAgentToken(ctx context.Context, machineID, token string, allowRetired bool) error {
 	q := `SELECT agent_token_hash FROM machines WHERE id=?`
 	if !allowRetired {
@@ -700,13 +806,23 @@ func (s *Server) verifyAgentToken(ctx context.Context, machineID, token string, 
 	var hash sql.NullString
 	err := s.store.db.QueryRowContext(ctx, q, machineID).Scan(&hash)
 	if errors.Is(err, sql.ErrNoRows) {
-		return errors.New("machine not found")
+		return errAgentTokenInvalid
 	}
 	if err != nil {
 		return err
 	}
-	if !hash.Valid || !VerifySecret(token, hash.String) {
-		return errors.New("invalid token")
+	if !hash.Valid {
+		return errAgentTokenInvalid
+	}
+	ok, upgraded, err := s.argon.VerifyStoredToken(ctx, token, hash.String)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errAgentTokenInvalid
+	}
+	if upgraded != "" {
+		_, _ = s.store.db.ExecContext(ctx, `UPDATE machines SET agent_token_hash=? WHERE id=? AND agent_token_hash=?`, upgraded, machineID, hash.String)
 	}
 	return nil
 }
@@ -839,7 +955,14 @@ func (s *Server) handleAgentUninstall(w http.ResponseWriter, r *http.Request, co
 		writeClientAuthErr(w)
 		return
 	}
+	if !s.uninstallIPL.allow(clientIP(r)) || !s.agentMachL.allow(req.MachineID) {
+		writeRateLimited(w)
+		return
+	}
 	if err := s.verifyAgentToken(r.Context(), req.MachineID, strings.TrimPrefix(auth, "Bearer "), true); err != nil {
+		if !errors.Is(err, errAgentTokenInvalid) && writeAuthBackendErr(w, err) {
+			return
+		}
 		writeClientAuthErr(w)
 		return
 	}
@@ -883,7 +1006,17 @@ func (s *Server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	var id, username, hash, role string
 	err := s.store.db.QueryRowContext(r.Context(), `SELECT id,username,password_hash,role FROM users WHERE username=?`, req.Username).Scan(&id, &username, &hash, &role)
-	if err != nil || !VerifySecret(req.Password, hash) {
+	known := err == nil
+	if !known {
+		// Unknown account: still pay for one Argon2 run so response timing
+		// does not reveal which usernames exist (Opus P3-1).
+		hash = dummyArgonHash()
+	}
+	ok, verr := s.argon.VerifySecret(r.Context(), req.Password, hash)
+	if writeAuthBackendErr(w, verr) {
+		return
+	}
+	if !known || !ok {
 		writeErr(w, 401, "invalid username or password")
 		return
 	}

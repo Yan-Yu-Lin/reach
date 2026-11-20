@@ -34,6 +34,7 @@ type Provisioner struct {
 	observedMu   sync.Mutex
 	healthMu     sync.RWMutex
 	healthReport []map[string]any
+	argon        *argonGate
 }
 
 type CreateMachineInput struct {
@@ -102,10 +103,7 @@ func (p *Provisioner) CreateMachine(ctx context.Context, in CreateMachineInput) 
 	if err != nil {
 		return res, err
 	}
-	agentHash, err := HashSecret(agentToken)
-	if err != nil {
-		return res, err
-	}
+	agentHash := HashToken(agentToken)
 	unixUser := "rt-" + short
 	now := nowUTC()
 
