@@ -1292,6 +1292,7 @@ func (d *Daemon) syncKeys(keys []DesiredPubkey, enabled bool) error {
 	}
 	return writeAuthorizedKeysFile(auth, d.authKeysOwner(), []byte(strings.Join(kept, "\n")+"\n"))
 }
+
 // authKeysOwner is the account that must own a rewritten authorized_keys
 // when a root agent manages another user's file.
 func (d *Daemon) authKeysOwner() string {
