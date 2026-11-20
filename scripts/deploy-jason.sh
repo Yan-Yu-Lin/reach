@@ -825,6 +825,11 @@ if sudo test -f /etc/reach/ws-carrier.env; then
   CARRIER_ENV_EXISTED=1
   sudo cp -a /etc/reach/ws-carrier.env "$CARRIER_ENV_BACKUP"
 fi
+# Every backup the carrier rollback needs must exist and match before the
+# deploy changes anything of the carrier (astra R3-04).
+[ "$CARRIER_EXISTED" != 1 ] || sudo cmp -s /opt/reach/reach-ws-carrier "$CARRIER_ROLLBACK"
+[ "$CARRIER_UNIT_EXISTED" != 1 ] || sudo cmp -s /etc/systemd/system/reach-ws-carrier.service "$CARRIER_UNIT_BACKUP"
+[ "$CARRIER_ENV_EXISTED" != 1 ] || sudo cmp -s /etc/reach/ws-carrier.env "$CARRIER_ENV_BACKUP"
 if systemctl is-enabled --quiet reach-ws-carrier.service 2>/dev/null; then CARRIER_WAS_ENABLED=1; fi
 if systemctl is-active --quiet reach-ws-carrier.service 2>/dev/null; then CARRIER_WAS_ACTIVE=1; fi
 if systemctl is-enabled --quiet reach-wstunnel.service 2>/dev/null; then LEGACY_WAS_ENABLED=1; fi
@@ -1013,7 +1018,19 @@ sudo /opt/reach/reachd db-check --config /etc/reach/config.yaml
 if [ "$CARRIER_ENABLED" = 1 ]; then
   echo "[deploy] restarting WebSocket carrier..."
   sudo systemctl restart reach-ws-carrier.service
-  systemctl is-active reach-ws-carrier.service
+  carrier_ok=0
+  for attempt in $(seq 1 10); do
+    if systemctl is-active --quiet reach-ws-carrier.service \
+      && sudo bash scripts/check-carrier-ready.sh /etc/reach/ws-carrier.env; then
+      carrier_ok=1
+      break
+    fi
+    sleep 1
+  done
+  if [ "$carrier_ok" != 1 ]; then
+    echo "[deploy] ERROR: carrier is not active or does not answer a WebSocket upgrade on its path" >&2
+    false
+  fi
 fi
 
 if [ "$PUBLISH_AGENT_RELEASE" = 1 ]; then
