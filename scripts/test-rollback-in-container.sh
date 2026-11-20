@@ -64,6 +64,7 @@ scenario() { # name, durable_action(0/1)
   rm -f /var/lib/reach/reach.db* /var/log/reachd.log
   install -m 0755 $W/reachd-old /opt/reach/reachd
   systemctl start reachd; systemctl stop reachd   # old version creates schema
+  echo "procs after stop: $(pgrep -af reachd || echo none)"; tail -3 /var/log/reachd.log || true
   h="$(printf '%s' "$token" | $W/reachd-old hash-secret)"
   sqlite3 /var/lib/reach/reach.db "INSERT INTO machines (id,slug,original_slug,status,desired_state,observed_state,desired_generation,agent_token_hash,created_at) VALUES ('m_legacy','legacy-box','legacy-box','offline','active','offline',1,'$h','2026-01-01T00:00:00Z');"
 
