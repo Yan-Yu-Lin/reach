@@ -83,12 +83,31 @@ func sshConfigClientOptions(raw string) [][2]string {
 	return filterSSHClientOptions(hb.Capabilities.SSH.ClientOptions)
 }
 
+// sshCompatProfile is the closed set of client options a target may ask the
+// operator's ssh to use. These are exactly the legacy-OpenSSH compatibility
+// values the official agent emits (cmd/reach-agent/ssh_compat.go). Anything
+// else, even a well-formed algorithm name, is dropped, so a compromised
+// target cannot inject an unknown algorithm that makes OpenSSH reject the
+// operator's whole config (daybreak P1-4).
+var sshCompatProfile = map[string]bool{
+	"KexAlgorithms=diffie-hellman-group14-sha1":                                      true,
+	"KexAlgorithms=diffie-hellman-group-exchange-sha256,diffie-hellman-group14-sha1": true,
+	"HostKeyAlgorithms=ssh-rsa":                                                      true,
+	"HostKeyAlgorithms=+ssh-rsa":                                                     true,
+	"PubkeyAcceptedAlgorithms=+ssh-rsa":                                              true,
+	"PubkeyAcceptedKeyTypes=+ssh-rsa":                                                true,
+	"Ciphers=aes128-ctr":                                                             true,
+	"Ciphers=aes128-ctr,aes192-ctr,aes256-ctr":                                       true,
+	"MACs=hmac-sha1":                                                                 true,
+}
+
 func filterSSHClientOptions(opts []string) [][2]string {
 	var out [][2]string
 	seen := map[string]bool{}
 	for _, opt := range opts {
-		name, value, ok := strings.Cut(strings.TrimSpace(opt), "=")
-		if !ok || !sshClientOptionAllowlist[name] || seen[name] || !validSSHClientOptionValue(value) {
+		opt = strings.TrimSpace(opt)
+		name, value, ok := strings.Cut(opt, "=")
+		if !ok || !sshClientOptionAllowlist[name] || seen[name] || !validSSHClientOptionValue(value) || !sshCompatProfile[opt] {
 			continue
 		}
 		seen[name] = true

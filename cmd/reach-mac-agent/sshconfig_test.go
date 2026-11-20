@@ -80,10 +80,43 @@ func requireSSH(t *testing.T) string {
 	return p
 }
 
-// PoC from Opus P1-1: a well-formed but unknown cipher name makes OpenSSH
-// reject the whole config. ssh -G must catch it and the previous file must
-// survive.
-func TestInstallKeepsPreviousFileWhenSSHRejectsConfig(t *testing.T) {
+// PoC from Opus P1-1 / daybreak P1-4: one host carries a well-formed but
+// unknown cipher. ssh -G rejects the candidate; the agent must still install
+// the fleet (without the bad per-host options) rather than freeze every
+// later update.
+func TestBadHostOptionsDoNotFreezeFleet(t *testing.T) {
+	sshBin := requireSSH(t)
+	dir := t.TempDir()
+	out := filepath.Join(dir, "reach-tunnels.conf")
+	if err := installSSHConfig(context.Background(), sshBin, out, []sshHost{goodHost()}); err != nil {
+		t.Fatal(err)
+	}
+	bad := goodHost()
+	bad.Host = "evil-box"
+	bad.HostKeyAlias = "reach-m_evil01"
+	bad.Options = [][2]string{{"Ciphers", "bogus-cipher-xyz"}}
+	if err := validateHost(bad); err != nil {
+		t.Fatalf("grammar should accept well-formed name: %v", err)
+	}
+	added := goodHost()
+	added.Host = "new-box"
+	added.HostKeyAlias = "reach-m_new001"
+	if err := installSSHConfig(context.Background(), sshBin, out, []sshHost{goodHost(), bad, added}); err != nil {
+		t.Fatalf("one bad host froze the fleet: %v", err)
+	}
+	b, _ := os.ReadFile(out)
+	if !strings.Contains(string(b), "Host new-box") || strings.Contains(string(b), "bogus-cipher") {
+		t.Fatalf("unexpected config:\n%s", b)
+	}
+	if !optionsDropped {
+		t.Fatal("dropping options was not reported")
+	}
+	if matches, _ := filepath.Glob(filepath.Join(dir, ".reach-validate-*")); len(matches) != 0 {
+		t.Fatalf("validation temp file left behind: %v", matches)
+	}
+}
+
+func TestInstallKeepsPreviousFileWhenConfigStillInvalid(t *testing.T) {
 	sshBin := requireSSH(t)
 	dir := t.TempDir()
 	out := filepath.Join(dir, "reach-tunnels.conf")
@@ -91,20 +124,19 @@ func TestInstallKeepsPreviousFileWhenSSHRejectsConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	before, _ := os.ReadFile(out)
-	bad := goodHost()
-	bad.Options = [][2]string{{"Ciphers", "bogus-cipher-xyz"}}
-	if err := validateHost(bad); err != nil {
-		t.Fatalf("grammar should accept well-formed name: %v", err)
+	// A fake ssh that rejects everything stands in for an invalid file
+	// that stripping options cannot fix.
+	fake := filepath.Join(dir, "ssh")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\necho bad >&2\nexit 255\n"), 0o755); err != nil {
+		t.Fatal(err)
 	}
-	if err := installSSHConfig(context.Background(), sshBin, out, []sshHost{bad}); err == nil {
-		t.Fatal("ssh -G accepted bogus cipher")
+	h := goodHost()
+	h.Port = 9999
+	if err := installSSHConfig(context.Background(), fake, out, []sshHost{h}); err == nil {
+		t.Fatal("install succeeded although ssh -G rejected it")
 	}
-	after, _ := os.ReadFile(out)
-	if string(after) != string(before) {
-		t.Fatal("previous config was replaced after validation failure")
-	}
-	if matches, _ := filepath.Glob(filepath.Join(dir, ".reach-validate-*")); len(matches) != 0 {
-		t.Fatalf("validation temp file left behind: %v", matches)
+	if after, _ := os.ReadFile(out); string(after) != string(before) {
+		t.Fatal("previous config replaced after validation failure")
 	}
 }
 

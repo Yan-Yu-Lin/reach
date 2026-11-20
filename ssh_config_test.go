@@ -27,10 +27,18 @@ func TestSSHConfigClientOptionsRejectMalformedValues(t *testing.T) {
 			t.Fatalf("value %q accepted: %#v", v, got)
 		}
 	}
-	for _, v := range []string{"+ssh-rsa", "aes128-ctr,aes256-ctr", "hmac-sha2-256-etm@openssh.com", "^curve25519-sha256"} {
-		raw, _ := json.Marshal(map[string]any{"capabilities": map[string]any{"ssh": map[string]any{"client_options": []string{"Ciphers=" + v}}}})
+	// Daybreak P1-4: only the closed compatibility profile passes; a
+	// well-formed but unknown algorithm is dropped too.
+	for _, opt := range []string{"Ciphers=bogus-cipher-xyz", "Ciphers=aes256-gcm@openssh.com", "KexAlgorithms=+curve25519-sha256"} {
+		raw, _ := json.Marshal(map[string]any{"capabilities": map[string]any{"ssh": map[string]any{"client_options": []string{opt}}}})
+		if got := sshConfigClientOptions(string(raw)); len(got) != 0 {
+			t.Fatalf("option %q outside the profile accepted", opt)
+		}
+	}
+	for opt := range sshCompatProfile {
+		raw, _ := json.Marshal(map[string]any{"capabilities": map[string]any{"ssh": map[string]any{"client_options": []string{opt}}}})
 		if got := sshConfigClientOptions(string(raw)); len(got) != 1 {
-			t.Fatalf("valid value %q rejected", v)
+			t.Fatalf("profile option %q rejected", opt)
 		}
 	}
 }

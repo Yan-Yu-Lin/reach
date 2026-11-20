@@ -384,6 +384,9 @@ func (a Agent) Sync(ctx context.Context) error {
 			return err
 		}
 	}
+	if optionsDropped {
+		a.log.Printf("warning: ssh rejected per-host algorithm options from the server; installed config without them")
+	}
 	a.log.Printf("synced %s (%d hosts)", a.cfg.OutFile, len(valid))
 	return nil
 }

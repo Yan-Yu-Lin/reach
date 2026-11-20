@@ -262,7 +262,12 @@ func validateWithSSH(ctx context.Context, sshBinary, path string, hosts []sshHos
 
 // installSSHConfig renders hosts, validates the candidate with ssh -G in the
 // destination directory, then atomically replaces the previous file.
+// optionsDropped is set when the last install had to remove per-host
+// options to pass ssh -G (logged by the caller).
+var optionsDropped bool
+
 func installSSHConfig(ctx context.Context, sshBinary, outFile string, hosts []sshHost) error {
+	optionsDropped = false
 	outFile = expandHome(outFile)
 	content := []byte(renderSSHConfig(hosts))
 	if prev, err := os.ReadFile(outFile); err == nil && string(prev) == string(content) {
@@ -286,7 +291,35 @@ func installSSHConfig(ctx context.Context, sshBinary, outFile string, hosts []ss
 		return err
 	}
 	if err := validateWithSSH(ctx, sshBinary, tmpName, hosts); err != nil {
-		return err
+		// One host's options must not freeze the whole fleet (daybreak
+		// P1-4): retry with every host's target-supplied options removed.
+		// If that validates, install it; hosts lose only their legacy
+		// algorithm overrides until the server sends valid ones.
+		stripped := make([]sshHost, len(hosts))
+		for i, h := range hosts {
+			h.Options = nil
+			stripped[i] = h
+		}
+		if !hostsHaveOptions(hosts) {
+			return err
+		}
+		content = []byte(renderSSHConfig(stripped))
+		if werr := os.WriteFile(tmpName, content, 0o600); werr != nil {
+			return werr
+		}
+		if err2 := validateWithSSH(ctx, sshBinary, tmpName, stripped); err2 != nil {
+			return fmt.Errorf("%v; and without per-host options: %w", err, err2)
+		}
+		optionsDropped = true
 	}
 	return writeAtomic(outFile, content, 0o600)
+}
+
+func hostsHaveOptions(hosts []sshHost) bool {
+	for _, h := range hosts {
+		if len(h.Options) > 0 {
+			return true
+		}
+	}
+	return false
 }
