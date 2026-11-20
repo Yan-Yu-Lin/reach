@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -76,5 +77,56 @@ func TestCORSRejectsArbitraryLocalhost(t *testing.T) {
 	}
 	if !check("https://tunnels.example.com") || !check("http://localhost:3000") {
 		t.Fatal("configured origin rejected")
+	}
+}
+
+// Daybreak P1-3: a JWT issued before session versions existed (no "sv"
+// claim) must stop working after the migration; service tokens keep working.
+func TestMigrationInvalidatesPreUpgradeJWTs(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "reach.db")
+	store, err := OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Pre-hardening schema subset: users without session_version.
+	for _, q := range []string{
+		`CREATE TABLE users (id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, role TEXT DEFAULT 'admin', created_at TEXT NOT NULL)`,
+		`INSERT INTO users (id,username,password_hash,role,created_at) VALUES ('u_old','arthur','x','owner','2026-01-01T00:00:00Z')`,
+	} {
+		if _, err := store.db.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := DefaultConfig()
+	cfg.JWTSecret = "test-jwt-secret-with-sufficient-length"
+	cfg.ProvisioningEnabled = false
+	old, err := SignJWT(cfg.JWTSecret, "u_old", "arthur", "owner", 365*24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Migrate(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`INSERT INTO service_tokens (id,label,token_hash,role,created_at) VALUES ('stkn_mac','mac',?,'mac-agent','2026-01-01T00:00:00Z')`, TokenHash("sat_mac")); err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(cfg, store, NewProvisioner(store, cfg))
+	t.Cleanup(func() { _ = store.Close() })
+	if rec := doJSON(t, server, http.MethodGet, "/api/admin/machines", "", old); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("pre-upgrade JWT after migration = %d, want 401", rec.Code)
+	}
+	if rec := doJSON(t, server, http.MethodGet, "/api/admin/ssh-config.json", "", "sat_mac"); rec.Code != 200 {
+		t.Fatalf("mac-agent service token after migration = %d", rec.Code)
+	}
+	fresh, _ := adminTestToken(t, store, cfg)
+	if rec := doJSON(t, server, http.MethodGet, "/api/admin/machines", "", fresh); rec.Code != 200 {
+		t.Fatalf("new login after migration = %d", rec.Code)
+	}
+	// Running migrations again must not log everyone out again.
+	if err := store.Migrate(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if rec := doJSON(t, server, http.MethodGet, "/api/admin/machines", "", fresh); rec.Code != 200 {
+		t.Fatalf("second migration revoked current sessions: %d", rec.Code)
 	}
 }

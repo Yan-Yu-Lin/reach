@@ -302,6 +302,7 @@ func (s *Store) Migrate(ctx context.Context, cfg Config) error {
 			return err
 		}
 	}
+	hadSessionVersion := s.columnPresent(ctx, "users", "session_version")
 	for _, col := range []struct{ table, name, decl string }{
 		{"machines", "agent_token_hash", "TEXT"},
 		{"machines", "original_slug", "TEXT"},
@@ -339,7 +340,16 @@ func (s *Store) Migrate(ctx context.Context, cfg Config) error {
 	if _, err := s.db.ExecContext(ctx, `UPDATE machines SET update_policy='manual' WHERE update_policy IS NULL OR update_policy=''`); err != nil {
 		return err
 	}
-	// Retired machines must not keep a working agent token (daybreak P2-5).
+	// Tokens issued before session versions existed carry no "sv" claim
+	// (decoded as 0) and may be valid for up to a year. Bump every account
+	// once when the column is introduced so they all stop working
+	// (daybreak P1-3). Service tokens are separate and unaffected.
+	if !hadSessionVersion {
+		if _, err := s.db.ExecContext(ctx, `UPDATE users SET session_version=session_version+1`); err != nil {
+			return err
+		}
+	}
+		// Retired machines must not keep a working agent token (daybreak P2-5).
 	if _, err := s.db.ExecContext(ctx, `UPDATE machines SET agent_token_hash=NULL WHERE desired_state='retired' AND agent_token_hash IS NOT NULL`); err != nil {
 		return err
 	}
@@ -468,6 +478,23 @@ func (s *Store) releaseRetiredTunnels(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func (s *Store) columnPresent(ctx context.Context, table, column string) bool {
+	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, typ string
+		var dflt any
+		if rows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk) == nil && name == column {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Store) ensureColumn(ctx context.Context, table, column, decl string) error {
