@@ -302,6 +302,13 @@ func (s *Server) handleClientRegister(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
+	if used, err := s.slugInUse(r.Context(), slug); err != nil {
+		writeErr(w, 500, "registration failed")
+		return
+	} else if used {
+		writeErr(w, 409, fmt.Sprintf("machine name %q is already in use; choose another name", slug))
+		return
+	}
 	if err := ValidateTargetUser(strings.TrimSpace(req.TargetUser)); err != nil {
 		writeErr(w, 400, "invalid target_user")
 		return
@@ -570,6 +577,10 @@ func (s *Server) handleClientProvision(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "invalid tunnel public key")
 		return
 	}
+	if used, err := s.slugInUse(r.Context(), req.Slug); err != nil || used {
+		writeErr(w, 409, "slug already in use")
+		return
+	}
 	requestID, name, err := s.consumeSetupToken(r.Context(), req.RequestID, req.SetupToken)
 	if err != nil {
 		if !errors.Is(err, errInvalidSetupToken) && writeAuthBackendErr(w, err) {
@@ -684,6 +695,18 @@ func (s *Server) checkSlugAllowed(slug string) error {
 		return fmt.Errorf("slug %q is reserved; choose another machine name", slug)
 	}
 	return nil
+}
+
+// slugInUse reports whether a non-retired machine already holds slug.
+// Checked at registration and before the setup token is consumed, so a
+// collision does not burn the token.
+func (s *Server) slugInUse(ctx context.Context, slug string) (bool, error) {
+	var id string
+	err := s.store.db.QueryRowContext(ctx, `SELECT id FROM machines WHERE slug=?`, slug).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 func isUniqueSlugErr(err error) bool {

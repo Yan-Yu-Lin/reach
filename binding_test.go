@@ -146,3 +146,12 @@ func TestRequestsListExposesObservedIPAndFilter(t *testing.T) {
 		t.Fatalf("pending filter rows = %#v", rows)
 	}
 }
+
+func TestDuplicateSlugRejectedBeforeTokenIsSpent(t *testing.T) {
+	server, store, _ := newReliabilityTestServer(t)
+	insertTestMachine(t, store, "m_taken", "taken-box")
+	rec := doJSON(t, server, http.MethodPost, "/api/client/register", `{"name":"taken-box"}`, "")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("register duplicate = %d %s", rec.Code, rec.Body.String())
+	}
+}
