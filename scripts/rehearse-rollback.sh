@@ -48,11 +48,15 @@ EOF
 chmod 0600 "$work/config.yaml"
 
 canary_token="at_rehearsal$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+# Random ids so the canary can never collide with a real machine row.
+canary_suffix="$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+canary_id="m_rehearsal_${canary_suffix}"
+canary_slug="rehearsal-canary-${canary_suffix}"
 canary_hash="$(printf '%s' "$canary_token" | "$old_bin" hash-secret)"
 cp "$snapshot" "$work/snapshot.db"
 cp "$snapshot" "$work/reach.db"
 now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-sqlite3 "$work/snapshot.db" "INSERT INTO machines (id,slug,original_slug,status,desired_state,observed_state,desired_generation,agent_token_hash,created_at) VALUES ('m_rehearsal','rehearsal-canary','rehearsal-canary','offline','active','offline',1,'$canary_hash','$now');"
+sqlite3 "$work/snapshot.db" "INSERT INTO machines (id,slug,original_slug,status,desired_state,observed_state,desired_generation,agent_token_hash,created_at) VALUES ('$canary_id','$canary_slug','$canary_slug','offline','active','offline',1,'$canary_hash','$now');"
 cp "$work/snapshot.db" "$work/reach.db"
 
 # start BIN: launch reachd on the private copy and set SERVER_PID. Must not
@@ -80,14 +84,14 @@ stop() {
 heartbeat() {
   curl -s -o /dev/null -w '%{http_code}' -X POST "http://$listen/api/client/agent/heartbeat" \
     -H "Authorization: Bearer $canary_token" -H 'Content-Type: application/json' \
-    -d '{"machine_id":"m_rehearsal","agent_version":"rehearsal","applied_generation":1,"observed":{"local_ssh":{"state":"healthy"},"tunnel":{"state":"stopped"},"persistence":{},"keys":{}}}'
+    -d '{"machine_id":"'"$canary_id"'","agent_version":"rehearsal","applied_generation":1,"observed":{"local_ssh":{"state":"healthy"},"tunnel":{"state":"stopped"},"persistence":{},"keys":{}}}'
 }
 restore_copy() { rm -f "$work/reach.db-wal" "$work/reach.db-shm"; cp "$work/snapshot.db" "$work/reach.db.tmp"; mv -f "$work/reach.db.tmp" "$work/reach.db"; }
 
 start "$new_bin"
 code="$(heartbeat)"; stop
 [ "$code" = 200 ] || { echo "rehearsal: new reachd rejected the canary heartbeat ($code)" >&2; exit 1; }
-migrated="$(sqlite3 "$work/reach.db" "SELECT substr(agent_token_hash,1,7) FROM machines WHERE id='m_rehearsal'")"
+migrated="$(sqlite3 "$work/reach.db" "SELECT substr(agent_token_hash,1,7) FROM machines WHERE id='$canary_id'")"
 
 start "$old_bin"
 without_restore="$(heartbeat)"; stop
