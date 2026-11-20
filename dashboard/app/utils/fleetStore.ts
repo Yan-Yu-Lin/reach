@@ -37,6 +37,9 @@ export function knownHeartbeat(item: MachineWithTunnels): string | undefined {
  * already contains it; this only matters when events and responses interleave).
  */
 function fromServer(current: MachineWithTunnels | undefined, incoming: MachineWithTunnels): MachineWithTunnels {
+  // Client-only marks (probe_unverified, state_at) are not carried over: the server row is
+  // the authority. Events that arrived while this response was in flight are replayed on
+  // top of it by the caller.
   const live = current?.live_heartbeat_at
   if (live && time(live) > time(incoming.agent_observation?.heartbeat_at)) {
     return { ...incoming, live_heartbeat_at: live }
@@ -83,12 +86,34 @@ export function upsertMachine(store: Store, raw: MachineWithTunnels): boolean {
 }
 
 /**
+ * Server time up to which the held aggregate state (observed_state/status) is known to be
+ * valid: the newest of the last event_at applied, the row's updated_at (reachd bumps it on
+ * every observed change) and the newest heartbeat (reachd recomputes state on each one).
+ */
+export function stateClock(item: MachineWithTunnels): number {
+  return Math.max(time(item.state_at), time(item.machine.updated_at), time(knownHeartbeat(item)))
+}
+
+/**
  * Apply an SSE patch copy-on-write: the changed machine gets a new object (so a
  * shallowReactive Map re-renders exactly that row) and untouched machines keep theirs.
+ *
+ * The event is judged FIRST and then applied as a whole or not at all (astra R3-04):
+ * its state clock (event_at, else heartbeat_at) older than stateClock(item) means the
+ * event is history - its state AND its probe are dropped; only a newer heartbeat time
+ * (liveness) still counts. Inside an accepted event the machine state and the hub
+ * observation are each ordered by their own clock (daybreak: an older machine state must
+ * not replace a newer probe or the other way round).
  *
  * A heartbeat only says "alive at T" (plus aggregate state on newer servers). It is stored
  * as live_heartbeat_at and does NOT touch agent_observation, whose fields (tunnel state,
  * version, errors) are only as fresh as agent_observation.heartbeat_at.
+ *
+ * Probe results (astra R3-03) are one observation: state, time and error together.
+ *  - with a time: replaces the observation if not older than the one held;
+ *  - with an explicit empty time: "no observation" (never probed) -> no time, no error;
+ *  - without a time (older reachd): the held observation stays as it is but is marked
+ *    unverified, so the UI says Unknown until the server confirms (the caller fetches it).
  *
  * Returns 'missing' when the machine is not in the store (the caller should fetch it),
  * 'applied' or 'noop'.
@@ -96,41 +121,56 @@ export function upsertMachine(store: Store, raw: MachineWithTunnels): boolean {
 export function applyPatch(store: Store, id: string, patch: MachinePatch): 'missing' | 'applied' | 'noop' {
   const item = store.get(id)
   if (!item) return 'missing'
-  let next: MachineWithTunnels = item
 
-  if (patch.heartbeat_at) {
-    const incoming = time(patch.heartbeat_at)
-    const known = time(knownHeartbeat(item))
-    // An out-of-order (older) heartbeat must not roll observed state back either. An equal
-    // one is the same heartbeat again (replayed after an HTTP response): re-apply its state.
-    if (incoming < known) return 'noop'
-    if (incoming > known) next = { ...next, live_heartbeat_at: patch.heartbeat_at }
-  }
-  const machineChanges: Partial<MachineWithTunnels['machine']> = {}
-  if (patch.observed_state && item.machine.observed_state !== patch.observed_state) {
-    machineChanges.observed_state = patch.observed_state
-  }
-  if (patch.status && item.machine.status !== patch.status) {
-    machineChanges.status = patch.status
-  }
-  if (Object.keys(machineChanges).length > 0) {
-    next = { ...next, machine: { ...item.machine, ...machineChanges } }
-  }
-  if (patch.probe_state) {
-    // A durable health_changed can be a replay from up to 72 h ago, so the time it ARRIVED
-    // says nothing about when the probe ran (astra R2-03). Newer servers send the stored
-    // probe time; without it the existing time is kept, so an old result never looks fresh
-    // (the caller then asks the server). A probe time older than what we hold is history:
-    // it must not overwrite a newer result either.
-    const current = item.hub_observation
-    const probeAt = patch.last_probe_at
-    if (probeAt && time(probeAt) >= time(current?.last_probe_at)) {
-      next = { ...next, hub_observation: { ...(current || {}), probe_state: patch.probe_state, last_probe_at: probeAt } }
-    } else if (!probeAt && current?.probe_state !== patch.probe_state) {
-      next = { ...next, hub_observation: { ...(current || { last_probe_at: '' }), probe_state: patch.probe_state } }
+  let next: MachineWithTunnels = item
+  const known = time(knownHeartbeat(item))
+  const hb = patch.heartbeat_at ? time(patch.heartbeat_at) : null
+  if (hb !== null && hb > known) next = { ...next, live_heartbeat_at: patch.heartbeat_at }
+
+  // ---- 1. accept or reject the rest of the event as a whole
+  const clockRaw = patch.state_at ?? patch.heartbeat_at
+  const historical = clockRaw !== undefined && time(clockRaw) < stateClock(item)
+  if (!historical) {
+    // ---- 2. apply every part of the accepted event
+    if (patch.state_at && time(patch.state_at) > time(item.state_at)) next = { ...next, state_at: patch.state_at }
+    const machineChanges: Partial<MachineWithTunnels['machine']> = {}
+    if (patch.observed_state && item.machine.observed_state !== patch.observed_state) {
+      machineChanges.observed_state = patch.observed_state
+    }
+    if (patch.status && item.machine.status !== patch.status) {
+      machineChanges.status = patch.status
+    }
+    if (Object.keys(machineChanges).length > 0) {
+      next = { ...next, machine: { ...item.machine, ...machineChanges } }
+    }
+
+    const probe = patch.probe
+    if (probe) {
+      const held = item.hub_observation
+      if (probe.at === undefined) {
+        // Undated (older reachd): it may be newer or days old. Keep the held observation
+        // intact and mark it unverified until the server is asked.
+        if (held?.probe_state !== probe.state) next = { ...next, probe_unverified: true }
+      } else if (probe.at === '') {
+        // The server says: no observation. Nothing of an earlier observation may be borrowed.
+        next = { ...next, hub_observation: { probe_state: probe.state, last_probe_at: '' }, probe_unverified: false }
+      } else if (time(probe.at) >= time(held?.last_probe_at)) {
+        // A dated observation at least as new as ours replaces it as a whole. The event has
+        // no error text: keep the held one only if it is this very observation.
+        const same = !!held && held.last_probe_at === probe.at && held.probe_state === probe.state
+        next = {
+          ...next,
+          hub_observation: same
+            ? { ...held! }
+            : { probe_state: probe.state, last_probe_at: probe.at, ...(probe.state === 'reachable' ? { last_success_at: probe.at } : held?.last_success_at ? { last_success_at: held.last_success_at } : {}) },
+          probe_unverified: false,
+        }
+      }
+      // else: an older dated observation is history and leaves the newer one alone.
     }
   }
-  if (next === item) return 'noop'
+
+  if (next === item || sameJSON(next, item)) return 'noop'
   store.set(id, next)
   return 'applied'
 }

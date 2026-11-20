@@ -45,7 +45,7 @@ describe('planFleetEvent', () => {
     expect(planFleetEvent('machine.health_changed', { machine_id: 'm-1', observed_state: 'degraded', status: 'degraded', probe_state: 'unreachable', last_probe_at: '2026-11-21T00:00:00Z', event_at: '2026-11-21T00:00:00Z' })).toEqual({
       kind: 'patch',
       machineId: 'm-1',
-      patch: { observed_state: 'degraded', status: 'degraded', probe_state: 'unreachable', last_probe_at: '2026-11-21T00:00:00Z' },
+      patch: { observed_state: 'degraded', status: 'degraded', state_at: '2026-11-21T00:00:00Z', probe: { state: 'unreachable', at: '2026-11-21T00:00:00Z' } },
       refetchIfSelected: 'now',
     })
   })
@@ -58,14 +58,29 @@ describe('planFleetEvent', () => {
   })
 
   it('asks the server when a probe result has no server time (R2-03, older reachd)', () => {
-    for (const lastProbeAt of [undefined, '']) {
-      expect(planFleetEvent('machine.health_changed', { machine_id: 'm-1', observed_state: 'online', status: 'online', probe_state: 'reachable', last_probe_at: lastProbeAt })).toMatchObject({
-        kind: 'patch',
-        needsAuthoritative: true,
-      })
-    }
-    // observed_changed carries no probe result: nothing to date, no extra fetch
+    expect(planFleetEvent('machine.health_changed', { machine_id: 'm-1', observed_state: 'online', status: 'online', probe_state: 'reachable' })).toMatchObject({
+      kind: 'patch',
+      patch: { probe: { state: 'reachable' } },
+      needsAuthoritative: true,
+    })
+    // a LIVE undated state change (older reachd) is the newest the server has: no fetch
     expect(planFleetEvent('machine.observed_changed', { machine_id: 'm-1', observed_state: 'online', status: 'online' })).not.toHaveProperty('needsAuthoritative')
+  })
+
+  it('keeps "no time" and "explicitly empty time" apart (R3-03)', () => {
+    const absent = planFleetEvent('machine.health_changed', { machine_id: 'm-1', observed_state: 'online', status: 'online', probe_state: 'reachable', event_at: '2026-11-21T00:00:00Z' })
+    const empty = planFleetEvent('machine.health_changed', { machine_id: 'm-1', observed_state: 'online', status: 'online', probe_state: 'unknown', last_probe_at: '', event_at: '2026-11-21T00:00:00Z' })
+    expect(absent).toMatchObject({ patch: { probe: { state: 'reachable' } }, needsAuthoritative: true })
+    expect((absent as any).patch.probe).not.toHaveProperty('at')
+    expect(empty).toMatchObject({ patch: { probe: { state: 'unknown', at: '' } } })
+    expect(empty).not.toHaveProperty('needsAuthoritative')
+  })
+
+  it('drops the state of undated REPLAYED history and asks the server (R3-04, older reachd)', () => {
+    const plan = planFleetEvent('machine.health_changed', { machine_id: 'm-1', observed_state: 'offline', status: 'offline', probe_state: 'unreachable' }, { replay: true })
+    expect(plan).toMatchObject({ kind: 'patch', needsAuthoritative: true })
+    expect((plan as any).patch).not.toHaveProperty('observed_state')
+    expect((plan as any).patch).not.toHaveProperty('status')
   })
 
   it('ignores machine.<state> aliases that duplicate observed_changed', () => {

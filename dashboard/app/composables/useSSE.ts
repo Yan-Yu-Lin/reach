@@ -2,7 +2,12 @@ import { goToLoginOnce } from '~/composables/useReachApi'
 import { createSSEParser, reconnectDelay } from '~/utils/sse'
 
 export type SSEStatus = 'connecting' | 'live' | 'reconnecting' | 'stale'
-export type SSEHandler = (event: string, data: unknown, id: string) => void
+/**
+ * `beforeHello`: the event arrived on this connection before its `hello`, i.e. it is durable
+ * history replayed for our Last-Event-ID (docs/EVENTS.md: hello marks the end of replay).
+ * This is about the position in the stream, not the event id: live events have ids too.
+ */
+export type SSEHandler = (event: string, data: unknown, id: string, ctx: { beforeHello: boolean }) => void
 
 const sseStatus = ref<SSEStatus>('connecting')
 const handlers = new Set<SSEHandler>()
@@ -65,10 +70,13 @@ async function connect(token: string, apiBase: string, connectionGeneration: num
     markActive(connectionGeneration)
     const reader = res.body.getReader()
     const decoder = new TextDecoder()
+    let helloSeen = false
     const parser = createSSEParser((message) => {
       try {
         const parsed: unknown = JSON.parse(message.data)
-        handlers.forEach(handler => handler(message.event, parsed, message.id))
+        const ctx = { beforeHello: !helloSeen }
+        if (message.event === 'hello') helloSeen = true
+        handlers.forEach(handler => handler(message.event, parsed, message.id, ctx))
       } catch {
         // Ignore malformed application payloads without losing stream framing.
       }

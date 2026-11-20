@@ -226,8 +226,8 @@ export function useFleet() {
     patchLog.record(id, patch)
   }
 
-  function handleEvent(event: string, rawData: unknown) {
-    const plan = planFleetEvent(event, rawData)
+  function handleEvent(event: string, rawData: unknown, _id = '', ctx: { beforeHello?: boolean } = {}) {
+    const plan = planFleetEvent(event, rawData, { replay: !!ctx.beforeHello })
     switch (plan.kind) {
       case 'hello':
         // Subscribed now: a snapshot read from here on cannot miss anything (rule 1).

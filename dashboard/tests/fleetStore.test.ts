@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { MachineWithTunnels, RequestRow } from '../app/composables/useReachApi'
 import { applyPatch, applySnapshot, createPatchLog, knownHeartbeat, pendingOnly, upsertMachine } from '../app/utils/fleetStore'
+import { connectionChecks } from '../app/utils/status'
 
 function item(id: string, heartbeat = '2026-11-21T00:00:00Z'): MachineWithTunnels {
   return {
@@ -55,7 +56,7 @@ describe('applyPatch', () => {
 
   it('applies observed state and probe changes', () => {
     const store = new Map([['a', item('a')]])
-    expect(applyPatch(store, 'a', { observed_state: 'degraded', status: 'degraded', probe_state: 'unreachable' })).toBe('applied')
+    expect(applyPatch(store, 'a', { observed_state: 'degraded', status: 'degraded', probe: { state: 'unreachable', at: '2026-11-21T00:00:05Z' } })).toBe('applied')
     expect(store.get('a')!.machine.observed_state).toBe('degraded')
     expect(store.get('a')!.hub_observation!.probe_state).toBe('unreachable')
     expect(applyPatch(store, 'a', { observed_state: 'degraded' })).toBe('noop')
@@ -142,30 +143,99 @@ describe('HTTP response vs newer SSE patch (astra F03)', () => {
   })
 })
 
-describe('probe time (astra R2-03)', () => {
+describe('probe observation as one unit (astra R2-03, R3-03)', () => {
   const dayAgo = '2026-11-20T00:00:00Z'
-  function withProbe(at: string, state = 'reachable') {
+  const fresh = '2026-11-21T00:00:00Z'
+  function withProbe(at: string, state = 'reachable', error?: string) {
     const store = new Map([['a', item('a')]])
-    store.get('a')!.hub_observation = { probe_state: state, last_probe_at: at }
+    store.get('a')!.hub_observation = { probe_state: state, last_probe_at: at, ...(error ? { probe_error: error } : {}) }
     return store
   }
 
-  it('a replayed health event without a server time does not make an old probe look fresh', () => {
-    const store = withProbe(dayAgo, 'unreachable')
-    applyPatch(store, 'a', { observed_state: 'online', status: 'online', probe_state: 'reachable' })
-    expect(store.get('a')!.hub_observation).toEqual({ probe_state: 'reachable', last_probe_at: dayAgo })
+  it('an undated result keeps the held observation whole and marks it unverified', () => {
+    const store = withProbe(dayAgo, 'unreachable', 'connection refused')
+    applyPatch(store, 'a', { probe: { state: 'reachable' } })
+    expect(store.get('a')!.hub_observation).toEqual({ probe_state: 'unreachable', last_probe_at: dayAgo, probe_error: 'connection refused' })
+    expect(store.get('a')!.probe_unverified).toBe(true)
   })
 
-  it('uses the server probe time when the event carries one', () => {
-    const store = withProbe(dayAgo, 'unreachable')
-    applyPatch(store, 'a', { probe_state: 'reachable', last_probe_at: '2026-11-21T00:00:00Z' })
-    expect(store.get('a')!.hub_observation).toEqual({ probe_state: 'reachable', last_probe_at: '2026-11-21T00:00:00Z' })
+  it('an undated reachable replayed over a FRESH failure does not borrow its time (R3-03)', () => {
+    const store = withProbe(fresh, 'unreachable', 'connection refused')
+    applyPatch(store, 'a', { probe: { state: 'reachable' } })
+    const a = store.get('a')!
+    expect(a.hub_observation!.probe_state).toBe('unreachable')
+    expect(a.probe_unverified).toBe(true)
+    const [probe] = connectionChecks(a, Date.parse(fresh) + 60_000)
+    expect(probe!.state).toBe('unknown')
   })
 
-  it('an older probe result (replayed history) does not overwrite a newer one', () => {
-    const store = withProbe('2026-11-21T00:00:00Z', 'reachable')
-    applyPatch(store, 'a', { probe_state: 'unreachable', last_probe_at: dayAgo })
-    expect(store.get('a')!.hub_observation).toEqual({ probe_state: 'reachable', last_probe_at: '2026-11-21T00:00:00Z' })
+  it('an explicitly empty time means "no observation": no borrowed time or error (R3-03)', () => {
+    const store = withProbe(fresh, 'unreachable', 'frozen timestamp fixture')
+    applyPatch(store, 'a', { probe: { state: 'unknown', at: '' } })
+    expect(store.get('a')!.hub_observation).toEqual({ probe_state: 'unknown', last_probe_at: '' })
+    const [probe] = connectionChecks(store.get('a')!, Date.parse(fresh) + 60_000)
+    expect(probe!.state).toBe('unknown')
+    expect(probe!.detail).not.toContain('frozen')
+  })
+
+  it('a dated newer result replaces the observation, error included', () => {
+    const store = withProbe(dayAgo, 'unreachable', 'connection refused')
+    applyPatch(store, 'a', { probe: { state: 'reachable', at: fresh } })
+    expect(store.get('a')!.hub_observation).toEqual({ probe_state: 'reachable', last_probe_at: fresh, last_success_at: fresh })
+  })
+
+  it('a dated older result (replayed history) does not overwrite a newer one', () => {
+    const store = withProbe(fresh, 'reachable')
+    applyPatch(store, 'a', { probe: { state: 'unreachable', at: dayAgo } })
+    expect(store.get('a')!.hub_observation).toEqual({ probe_state: 'reachable', last_probe_at: fresh })
+  })
+
+  it('a server response clears the unverified mark', () => {
+    const store = withProbe(fresh, 'unreachable')
+    applyPatch(store, 'a', { probe: { state: 'reachable' } })
+    const server = item('a')
+    server.hub_observation = { probe_state: 'reachable', last_probe_at: fresh }
+    upsertMachine(store, server)
+    expect(store.get('a')!.probe_unverified).toBeFalsy()
+  })
+})
+
+describe('a historical event is accepted or rejected as a whole (astra R3-04, daybreak)', () => {
+  const now = '2026-11-21T00:00:00Z'
+  const dayAgo = '2026-11-20T00:00:00Z'
+  function fresh() {
+    const store = new Map([['a', item('a', now)]])
+    store.get('a')!.machine.updated_at = now
+    store.get('a')!.hub_observation = { probe_state: 'reachable', last_probe_at: now }
+    return store
+  }
+
+  it('an old dated health event changes neither the machine state nor the probe', () => {
+    const store = fresh()
+    expect(applyPatch(store, 'a', { observed_state: 'offline', status: 'offline', state_at: dayAgo, probe: { state: 'unreachable', at: dayAgo } })).toBe('noop')
+    expect(store.get('a')!.machine.observed_state).toBe('online')
+    expect(store.get('a')!.hub_observation!.probe_state).toBe('reachable')
+  })
+
+  it('a newer dated state with an older probe applies the state and keeps the newer probe', () => {
+    const store = fresh()
+    applyPatch(store, 'a', { observed_state: 'degraded', status: 'degraded', state_at: '2026-11-21T00:05:00Z', probe: { state: 'unreachable', at: dayAgo } })
+    expect(store.get('a')!.machine.observed_state).toBe('degraded')
+    expect(store.get('a')!.hub_observation).toEqual({ probe_state: 'reachable', last_probe_at: now })
+  })
+
+  it('an older machine state does not replace a newer probe, and a newer probe is kept by a later older state', () => {
+    const store = fresh()
+    applyPatch(store, 'a', { probe: { state: 'unreachable', at: '2026-11-21T00:10:00Z' }, state_at: '2026-11-21T00:10:00Z', observed_state: 'degraded', status: 'degraded' })
+    applyPatch(store, 'a', { observed_state: 'online', status: 'online', state_at: '2026-11-21T00:01:00Z' })
+    expect(store.get('a')!.machine.observed_state).toBe('degraded')
+    expect(store.get('a')!.hub_observation!.probe_state).toBe('unreachable')
+  })
+
+  it('compares times across time zones by instant, not by string', () => {
+    const store = fresh()
+    expect(applyPatch(store, 'a', { observed_state: 'offline', status: 'offline', state_at: '2026-11-21T07:59:59+08:00' })).toBe('noop')
+    expect(applyPatch(store, 'a', { observed_state: 'offline', status: 'offline', state_at: '2026-11-21T08:00:01+08:00' })).toBe('applied')
   })
 })
 

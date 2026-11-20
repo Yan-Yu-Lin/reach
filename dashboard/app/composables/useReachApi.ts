@@ -103,6 +103,13 @@ export type MachineWithTunnels = {
    * agent_observation.heartbeat_at.
    */
   live_heartbeat_at?: string
+  /** Client-only: server time (event_at) of the newest aggregate state applied from an event. */
+  state_at?: string
+  /**
+   * Client-only: an event reported a probe result without its time (older reachd). The stored
+   * observation is kept as a whole but cannot be trusted as current until the server confirms.
+   */
+  probe_unverified?: boolean
 }
 export type RequestRow = {
   id: string

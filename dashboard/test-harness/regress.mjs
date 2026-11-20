@@ -328,6 +328,80 @@ await test('R2-03 a health event with the server probe time is judged by that ti
   await ctx.close()
 })
 
+await test('R3-03 an undated reachable replayed over a FRESH failure does not show OK (refresh failing)', async () => {
+  await reset('v2=0') // older reachd: no last_probe_at, no event_at
+  const id = (await ctl('/__mutate', { slug: 'omarchy', hub: { probe_state: 'unreachable', last_probe_at: new Date().toISOString(), probe_error: 'connection refused' } })).machine.id
+  const { ctx, page } = await open(undefined, { path: `/?m=${id}` })
+  await waitFor(async () => /Failed/.test(await page.locator('.check').first().innerText()), 5000, 'Failed before')
+  await ctl('/__emit', { type: 'machine.process_title_changed', data: { machine_id: id } })
+  await sleep(300)
+  await ctl('/__fail?key=GET /api/admin/machines&status=500&times=20')
+  await ctl('/__fail?key=GET /api/admin/machines/:id&status=500&times=20')
+  await ctl('/__ssepause?ms=1500')
+  await ctl('/__emit', { type: 'machine.health_changed', data: { machine_id: id, observed_state: 'online', status: 'online', probe_state: 'reachable' } })
+  await page.locator('.notice-error').waitFor({ timeout: 10000 })
+  await sleep(1000)
+  const probe = await page.locator('.check').first().innerText()
+  expect(!/\bOK\b/.test(probe), `undated replay borrowed the fresh time: ${probe}`)
+  expect(/Unknown/.test(probe), `expected Unknown: ${probe}`)
+  await ctx.close()
+})
+
+await test('R3-03 an explicit empty probe time (never probed) does not borrow the old error', async () => {
+  await reset()
+  const id = (await ctl('/__mutate', { slug: 'omarchy', hub: { probe_state: 'unreachable', last_probe_at: new Date().toISOString(), probe_error: 'frozen timestamp fixture' } })).machine.id
+  const { ctx, page } = await open(undefined, { path: `/?m=${id}` })
+  await waitFor(async () => /frozen/.test(await page.locator('.check').first().innerText()), 5000, 'old error shown')
+  // like astra's real-reachd run: every authoritative read fails, the event is all we get
+  await ctl('/__fail?key=GET /api/admin/machines&status=503&times=20')
+  await ctl('/__fail?key=GET /api/admin/machines/:id&status=503&times=20')
+  await ctl('/__mutate', { slug: 'omarchy', hub: { probe_state: 'unknown', last_probe_at: '', probe_error: '' } })
+  const at = new Date().toISOString()
+  await ctl('/__emit', { type: 'machine.health_changed', data: { machine_id: id, observed_state: 'online', status: 'online', probe_state: 'unknown', last_probe_at: '', event_at: at } })
+  await sleep(800)
+  const probe = await page.locator('.check').first().innerText()
+  expect(!/frozen|Failed/.test(probe), `borrowed the earlier observation: ${probe}`)
+  await ctx.close()
+})
+
+await test('R3-04 an old dated health event with a DIFFERENT state changes neither badge nor probe', async () => {
+  await reset()
+  const id = (await ctl('/__mutate', { slug: 'omarchy', hub: { probe_state: 'reachable', last_probe_at: new Date().toISOString() } })).machine.id
+  const { ctx, page } = await open(undefined, { path: `/?m=${id}` })
+  await waitFor(async () => /Online/.test(await page.locator('.detail .badge').innerText()), 5000, 'Online before')
+  await ctl('/__emit', { type: 'machine.process_title_changed', data: { machine_id: id } })
+  await sleep(300)
+  await ctl('/__fail?key=GET /api/admin/machines&status=500&times=20')
+  await ctl('/__fail?key=GET /api/admin/machines/:id&status=500&times=20')
+  await ctl('/__ssepause?ms=1500')
+  const old = new Date(Date.now() - 86400_000).toISOString()
+  await ctl('/__emit', { type: 'machine.health_changed', data: { machine_id: id, observed_state: 'offline', status: 'offline', probe_state: 'unreachable', last_probe_at: old, event_at: old } })
+  await page.locator('.notice-error').waitFor({ timeout: 10000 })
+  await sleep(1000)
+  const badge = await page.locator('.detail .badge').innerText()
+  const probe = await page.locator('.check').first().innerText()
+  expect(/Online/.test(badge), `old event rolled the state back: ${badge}`)
+  expect(/\bOK\b/.test(probe), `newer probe lost: ${probe}`)
+  await ctx.close()
+})
+
+await test('R3-04 an undated REPLAYED state change (older reachd) does not roll the badge back', async () => {
+  await reset('v2=0')
+  const id = await machineId('omarchy')
+  const { ctx, page } = await open(undefined, { path: `/?m=${id}` })
+  await waitFor(async () => /Online/.test(await page.locator('.detail .badge').innerText()), 5000, 'Online before')
+  await ctl('/__emit', { type: 'machine.process_title_changed', data: { machine_id: id } })
+  await sleep(300)
+  await ctl('/__fail?key=GET /api/admin/machines&status=500&times=20')
+  await ctl('/__fail?key=GET /api/admin/machines/:id&status=500&times=20')
+  await ctl('/__ssepause?ms=1500')
+  await ctl('/__emit', { type: 'machine.observed_changed', data: { machine_id: id, observed_state: 'offline', status: 'offline' } })
+  await page.locator('.notice-error').waitFor({ timeout: 10000 })
+  await sleep(1000)
+  expect(/Online/.test(await page.locator('.detail .badge').innerText()), 'replayed undated history changed the badge')
+  await ctx.close()
+})
+
 // ---------------------------------------------------------------- F09
 await test('F09 a failed disable is reported as a failed disable, not a stuck removal', async () => {
   await reset()

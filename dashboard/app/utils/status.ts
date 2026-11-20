@@ -232,7 +232,13 @@ export function connectionChecks(item: MachineWithTunnels, now = Date.now()): Co
   const probeStale = probeAt === null || now - probeAt > PROBE_FRESH_MS
   let probe: ConnectionCheck
   if (!hub || !hub.probe_state) probe = { key: 'probe', label: 'Hub probe', state: 'unknown', detail: 'No probe data yet' }
-  else if (probeStale) {
+  else if (item.probe_unverified) {
+    // An undated probe result arrived (older reachd, possibly replayed history): what we
+    // hold may no longer be current and the new one cannot be dated. Wait for the server.
+    probe = { key: 'probe', label: 'Hub probe', state: 'unknown', detail: 'Unknown: a newer probe result could not be dated; checking with the hub' }
+  } else if (hub.probe_state === 'unknown' && !hub.last_probe_at) {
+    probe = { key: 'probe', label: 'Hub probe', state: 'unknown', detail: 'Not probed yet' }
+  } else if (probeStale) {
     const age = probeAt === null ? 'unknown time' : `${formatAge(now - probeAt)} ago`
     probe = { key: 'probe', label: 'Hub probe', state: 'unknown', detail: `Unknown: last probe ${age} said ${hub.probe_state}` }
   } else if (hub.probe_state === 'reachable') probe = { key: 'probe', label: 'Hub probe', state: 'ok', detail: 'Hub reached the target sshd through the tunnel' }
