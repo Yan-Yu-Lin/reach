@@ -17,6 +17,10 @@ reserved_slugs: []
 # before it is flagged timed_out for an operator decision (retire-now).
 retiring_timeout: 24h
 
+# Include target-reported algorithm options in the legacy text endpoint
+# /api/admin/ssh-config (old clients only). Keep false.
+legacy_ssh_config_options: false
+
 # Generate with: printf '<secret>' | reachd hash-secret
 god_code_hash: "$argon2id$..."
 initial_admin:

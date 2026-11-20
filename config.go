@@ -42,6 +42,12 @@ type Config struct {
 	// RetiringTimeout is how long a machine may wait for its agent to confirm
 	// uninstall before it is flagged timed_out for an operator decision.
 	RetiringTimeout time.Duration `yaml:"retiring_timeout"`
+	// LegacySSHConfigOptions makes the legacy text endpoint
+	// (/api/admin/ssh-config) include target-reported algorithm options.
+	// Off by default: old clients write that text verbatim, so one bad
+	// value can break every ssh on the Mac (daybreak P1-2/P1-4). The JSON
+	// endpoint used by current reach-mac-agent always carries them.
+	LegacySSHConfigOptions bool `yaml:"legacy_ssh_config_options"`
 }
 
 type InitialAdmin struct {

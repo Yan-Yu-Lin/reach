@@ -105,3 +105,28 @@ func TestSSHConfigJSONEndpointForMacAgentRole(t *testing.T) {
 		t.Fatalf("mac-agent role reached machines: %d", rec.Code)
 	}
 }
+
+func TestLegacyTextOmitsTargetOptionsByDefault(t *testing.T) {
+	server, store, _ := newReliabilityTestServer(t)
+	insertSSHMachine(t, server, "m_jack01", "jack", ObservedOnline, "online", 9210)
+	raw := `{"capabilities":{"ssh":{"client_options":["KexAlgorithms=diffie-hellman-group14-sha1"]}}}`
+	if _, err := store.db.Exec(`INSERT INTO agent_observations (machine_id,heartbeat_at,raw_json) VALUES ('m_jack01',?,?)`, nowUTC(), raw); err != nil {
+		t.Fatal(err)
+	}
+	text, err := server.GenerateSSHConfig(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(text, "KexAlgorithms") {
+		t.Fatalf("legacy text carries target options by default:\n%s", text)
+	}
+	hosts, _ := server.SSHHosts(context.Background())
+	if len(hosts) != 1 || len(hosts[0].Options) != 1 {
+		t.Fatalf("JSON hosts lost options: %#v", hosts)
+	}
+	server.cfg.LegacySSHConfigOptions = true
+	text, _ = server.GenerateSSHConfig(context.Background())
+	if !strings.Contains(text, "KexAlgorithms diffie-hellman-group14-sha1") {
+		t.Fatal("opt-in did not restore options")
+	}
+}

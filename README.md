@@ -301,6 +301,8 @@ Host reach-hub
     IdentityFile ~/.ssh/id_ed25519
 ```
 
+Use `reach-mac-agent` (below) or `scripts/reach-sync-mac.sh` (a one-shot wrapper around `reach-mac-agent run --once`) to write it. Do not `curl` this endpoint into your SSH config: it is kept only for older clients, it is raw server text, and a compromised hub could put `Match exec` or `ProxyCommand` in it. Target-reported algorithm options are omitted from it unless `legacy_ssh_config_options: true`.
+
 Then include the Reach-managed file:
 
 ```sshconfig
@@ -313,7 +315,7 @@ Include ~/.ssh/reach-tunnels.conf
 scripts/reach-sync-mac.sh --api-url https://tunnels.example.com --login
 ```
 
-The script logs in, exchanges the temporary admin JWT for a `mac-agent` service token, writes `~/.ssh/reach-tunnels.conf`, and adds the `Include` line.
+The script logs in, exchanges the temporary admin JWT for a `mac-agent` service token, then runs `reach-mac-agent run --once` to write `~/.ssh/reach-tunnels.conf` from structured data, and adds the `Include` line. It needs `reach-mac-agent` on `PATH` (or `REACH_MAC_AGENT=/path`).
 
 ### Long-running Mac agent
 

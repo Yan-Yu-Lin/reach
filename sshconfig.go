@@ -209,10 +209,17 @@ func RenderSSHConfig(hosts []SSHHost) string {
 	return b.String()
 }
 
+// GenerateSSHConfig renders the legacy text document. Target-reported
+// options are omitted unless legacy_ssh_config_options is set.
 func (s *Server) GenerateSSHConfig(ctx context.Context) (string, error) {
 	hosts, err := s.SSHHosts(ctx)
 	if err != nil {
 		return "", err
+	}
+	if !s.cfg.LegacySSHConfigOptions {
+		for i := range hosts {
+			hosts[i].Options = nil
+		}
 	}
 	return RenderSSHConfig(hosts), nil
 }

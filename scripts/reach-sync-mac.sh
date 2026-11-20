@@ -14,7 +14,8 @@ die() { printf '\033[1;31m[reach-sync error]\033[0m %s\n' "$*" >&2; exit 1; }
 
 usage() {
   cat <<'USAGE'
-Sync Reach SSH aliases to ~/.ssh/reach-tunnels.conf.
+Sync Reach SSH aliases to ~/.ssh/reach-tunnels.conf using reach-mac-agent
+(structured data, fixed template, ssh -G validation).
 
 On login, this stores a non-expiring mac-agent service token (not a 24h JWT).
 
@@ -100,34 +101,33 @@ fi
 TOKEN="$(cat "$TOKEN_FILE")"
 [ -n "$TOKEN" ] || die "Token file is empty: $TOKEN_FILE"
 
-mkdir -p "$(dirname "$OUT_FILE")"
-chmod 700 "$(dirname "$OUT_FILE")" 2>/dev/null || true
-TMP=$(mktemp)
-HTTP=$(curl -sS -o "$TMP" -w '%{http_code}' "$API_URL/api/admin/ssh-config" -H "Authorization: Bearer $TOKEN") || die "Could not reach $API_URL/api/admin/ssh-config"
-if [ "$HTTP" = 401 ] || [ "$HTTP" = 403 ]; then
-  warn "Stored token was rejected; logging in again."
-  rm -f "$TOKEN_FILE"
-  login
-  TOKEN="$(cat "$TOKEN_FILE")"
-  HTTP=$(curl -sS -o "$TMP" -w '%{http_code}' "$API_URL/api/admin/ssh-config" -H "Authorization: Bearer $TOKEN") || die "Could not reach $API_URL/api/admin/ssh-config"
+# The SSH config is written only by reach-mac-agent, which renders it from
+# structured data with a fixed template and validates it with ssh -G. This
+# script used to install the server's raw text as-is, which let a
+# compromised hub run commands on the Mac (daybreak P1-2).
+AGENT="${REACH_MAC_AGENT:-}"
+if [ -z "$AGENT" ]; then
+  AGENT="$(command -v reach-mac-agent 2>/dev/null || true)"
 fi
-case "$HTTP" in
-  2*) ;;
-  *) printf 'SSH config sync failed (%s): ' "$HTTP" >&2; cat "$TMP" >&2; printf '\n' >&2; exit 1 ;;
-esac
-install -m 600 "$TMP" "$OUT_FILE"
-rm -f "$TMP"
-log "Wrote $OUT_FILE"
+[ -z "$AGENT" ] && [ -x "$HOME/.local/bin/reach-mac-agent" ] && AGENT="$HOME/.local/bin/reach-mac-agent"
+[ -n "$AGENT" ] && [ -x "$AGENT" ] || die "reach-mac-agent not found; build it with: go build -o ~/.local/bin/reach-mac-agent ./cmd/reach-mac-agent"
 
-if [ "$INSTALL_INCLUDE" = 1 ]; then
-  mkdir -p "$(dirname "$SSH_CONFIG")"
-  touch "$SSH_CONFIG"
-  chmod 600 "$SSH_CONFIG" 2>/dev/null || true
-  include_line="Include $OUT_FILE"
-  if ! grep -Fxq "$include_line" "$SSH_CONFIG" 2>/dev/null; then
-    printf '\n%s\n' "$include_line" >> "$SSH_CONFIG"
-    log "Added Include line to $SSH_CONFIG"
-  fi
+CFG="$(mktemp)"
+trap 'rm -f "$CFG"' EXIT
+include=false
+[ "$INSTALL_INCLUDE" = 1 ] && include=true
+"$PYTHON" - "$CFG" "$API_URL" "$TOKEN_FILE" "$OUT_FILE" "$SSH_CONFIG" "$include" <<'PY'
+import json, sys
+cfg, api, token_file, out_file, ssh_config, include = sys.argv[1:7]
+# JSON is valid YAML; json.dumps quotes every value safely.
+with open(cfg, "w") as f:
+    json.dump({"api_url": api, "token_file": token_file, "out_file": out_file,
+               "ssh_config_file": ssh_config, "install_include": include == "true"}, f)
+PY
+if ! "$AGENT" run --once --config "$CFG"; then
+  warn "sync failed; if the token was rejected, rerun with --login"
+  exit 1
 fi
+log "Wrote $OUT_FILE via reach-mac-agent"
 
 log "Done. Try: ssh <reach-machine-slug>"
