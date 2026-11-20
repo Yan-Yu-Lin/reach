@@ -308,6 +308,14 @@ rollback_reachd() {
     if [ "$LEGACY_WAS_ENABLED" = 1 ]; then sudo systemctl enable reach-wstunnel.service; else sudo systemctl disable reach-wstunnel.service 2>/dev/null || true; fi
     if [ "$LEGACY_WAS_ACTIVE" = 1 ]; then sudo systemctl start reach-wstunnel.service; else sudo systemctl stop reach-wstunnel.service 2>/dev/null || true; fi
   fi
+  if [ "${LIMITS_MUTATED:-0}" = 1 ]; then
+    if [ -n "${LIMITS_BACKUP:-}" ] && sudo test -f "$LIMITS_BACKUP"; then
+      sudo cp -a "$LIMITS_BACKUP" "$LIMITS_DROPIN"
+    else
+      sudo mv "$LIMITS_DROPIN" "$LIMITS_DROPIN.failed.$DEPLOY_TS" 2>/dev/null || true
+    fi
+    sudo systemctl daemon-reload
+  fi
   if [ "${REACHD_UNIT_MUTATED:-0}" = 1 ]; then
     if [ -n "${REACHD_UNIT_BACKUP:-}" ] && sudo test -f "$REACHD_UNIT_BACKUP"; then
       echo "[deploy] restoring previous reachd.service" >&2
@@ -619,6 +627,23 @@ fi
 # Optional sandboxed reachd unit (deploy/systemd/reachd.service). Off by default:
 # it must be tested once with a real provision/disable/retire cycle while the
 # hub can be reached without Reach. REACH_INSTALL_REACHD_UNIT=1 enables it.
+# Resource-limit drop-in: installed by default on every deploy (daybreak P1-6).
+# It bounds memory/tasks/fds; it is not privilege containment.
+LIMITS_DROPIN=/etc/systemd/system/reachd.service.d/10-reach-limits.conf
+LIMITS_BACKUP=""
+LIMITS_MUTATED=0
+if ! sudo cmp -s deploy/systemd/reachd.service.d/10-reach-limits.conf "$LIMITS_DROPIN" 2>/dev/null; then
+  echo "[deploy] installing reachd resource-limit drop-in..."
+  if sudo test -f "$LIMITS_DROPIN"; then
+    LIMITS_BACKUP="/var/lib/reach/deploy-backups/10-reach-limits.conf.${DEPLOY_TS}"
+    sudo cp -a "$LIMITS_DROPIN" "$LIMITS_BACKUP"
+  fi
+  LIMITS_MUTATED=1
+  sudo install -d -m 0755 /etc/systemd/system/reachd.service.d
+  sudo install -m 0644 deploy/systemd/reachd.service.d/10-reach-limits.conf "$LIMITS_DROPIN"
+  sudo systemctl daemon-reload
+fi
+
 REACHD_UNIT_BACKUP=""
 REACHD_UNIT_MUTATED=0
 if [ "${REACH_INSTALL_REACHD_UNIT:-0}" = 1 ]; then
@@ -823,6 +848,7 @@ if ! sudo "$UV_BIN" run --script scripts/prune-deploy-backups.py --retain "$BACK
   '/opt/reach/reach-ws-carrier.rollback.*' \
   '/var/lib/reach/deploy-backups/reach-ws-carrier.service.*' \
   '/var/lib/reach/deploy-backups/reachd.service.*' \
+  '/var/lib/reach/deploy-backups/10-reach-limits.conf.*' \
   '/var/lib/reach/deploy-backups/agent-publication.*' \
   "$AGENT_DOWNLOAD_ROOT/v*.replaced.*" \
   "$DB_BACKUP_DIR/failed.*" \

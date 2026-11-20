@@ -5,6 +5,7 @@ installed and what to test first.
 
 | File | What | Applied by |
 |---|---|---|
+| `systemd/reachd.service.d/10-reach-limits.conf` | `MemoryMax=1G`, `MemoryHigh`, `TasksMax=256`, `LimitNOFILE=4096`. Resource ceiling only, **not** privilege containment (reachd stays root) | **installed by default** on every deploy; backed up and restored on failed deploy |
 | `systemd/reachd.service` | reachd sandbox (plan A): `ProtectSystem=strict`, capability allowlist, `MemoryMax=1G`, `TasksMax=256` | `deploy-jason.sh` / `deploy-from-mac.sh` only with `REACH_INSTALL_REACHD_UNIT=1`; backed up and restored on failed deploy |
 | `nginx/reach-tunnels.conf` | vhost template: gzip, `/_nuxt/` immutable cache, `limit_req` on `/api/client/` and login, `limit_conn` on the carrier route | manual (`nginx -t` then reload) |
 | `haproxy/2026-11-21-bk_ssh-conn-limit.suggested.diff` | per-IP SSH connection limits on the public 443 mux | manual, after review |

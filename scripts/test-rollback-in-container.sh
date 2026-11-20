@@ -23,7 +23,7 @@ cp -R "$repo/scripts" "$work/scripts"
 cat > "$work/run.sh" <<'EOS'
 #!/usr/bin/env bash
 set -Eeuo pipefail
-apt-get -qq update >/dev/null && apt-get -qq install -y sqlite3 curl python3 sudo >/dev/null
+apt-get -qq update >/dev/null && apt-get -qq install -y sqlite3 curl python3 sudo procps >/dev/null
 # Work on the container's own filesystem: SQLite locking is unreliable on
 # the bind-mounted host volume.
 cp -R /w /work
@@ -33,10 +33,10 @@ cat > /usr/local/bin/systemctl <<'EOF'
 #!/bin/bash
 # Minimal stand-in: one "reachd serve" process, found by name.
 case "$1 $2" in
-  "stop reachd") pkill -f '^/opt/reach/reachd serve'; for i in $(seq 1 50); do pgrep -f '^/opt/reach/reachd serve' >/dev/null || break; sleep 0.1; done ;;
+  "stop reachd") pkill -f '/opt/reach/reachd serve --config'; for i in $(seq 1 50); do pgrep -f '/opt/reach/reachd serve --config' >/dev/null || break; sleep 0.1; done ;;
   "start reachd") setsid /opt/reach/reachd serve --config /etc/reach/config.yaml >>/var/log/reachd.log 2>&1 < /dev/null &
     for i in $(seq 1 50); do curl -s -o /dev/null http://127.0.0.1:9300/ && break; sleep 0.1; done ;;
-  "is-active --quiet") pgrep -f '^/opt/reach/reachd serve' >/dev/null ;;
+  "is-active --quiet") pgrep -f '/opt/reach/reachd serve --config' >/dev/null ;;
   *) exit 0 ;;
 esac
 EOF

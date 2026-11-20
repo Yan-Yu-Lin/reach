@@ -1,4 +1,9 @@
-# Reach control plane (plan A: still root, sandboxed).
+# Reach control plane (plan A: still root, sandboxed). OPT-IN.
+#
+# The memory/task/fd limits alone are installed by default as the drop-in
+# reachd.service.d/10-reach-limits.conf. This full unit adds the filesystem
+# and capability sandbox. Neither is root containment: reachd still runs as
+# root and may write /etc, /var/lib and start units via D-Bus.
 #
 # Source of truth for /etc/systemd/system/reachd.service on the hub;
 # scripts/deploy-jason.sh installs it only with REACH_INSTALL_REACHD_UNIT=1.
