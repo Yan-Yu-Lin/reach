@@ -126,6 +126,8 @@ func settingsFromDesiredProcessTitleConfig(cfg *DesiredProcessTitleConfig, fallb
 	return normalizeProcessTitleSettings(titles, interval)
 }
 
+const minProcessTitleInterval = time.Second
+
 func normalizeProcessTitleSettings(titles []string, interval time.Duration) ProcessTitleSettings {
 	clean := make([]string, 0, len(titles))
 	for _, title := range titles {
@@ -139,6 +141,11 @@ func normalizeProcessTitleSettings(titles []string, interval time.Duration) Proc
 	}
 	if interval <= 0 {
 		interval = 5 * time.Second
+	}
+	// The hub (or anyone controlling its DB) chooses this value; a tiny
+	// interval would make the agent spin (daybreak P3-3).
+	if interval < minProcessTitleInterval {
+		interval = minProcessTitleInterval
 	}
 	return ProcessTitleSettings{Titles: clean, Interval: interval}
 }

@@ -784,6 +784,15 @@ func (d *Daemon) confirmPendingUpdateAfterHeartbeat() {
 	if d.updateConfirmed || !d.canSelfUpdate() {
 		return
 	}
+	// A heartbeat only proves HTTP works. Confirm (and raise the release
+	// floor) only once the new binary also runs the tunnel and local SSH,
+	// so a binary that breaks the actual path home is rolled back
+	// (daybreak P3-2).
+	// A machine that is disabled (tunnel intentionally stopped) confirms on
+	// HTTP alone, otherwise it could never accept an update.
+	if st := d.snapshot(); d.desired.DesiredState == "active" && d.desired.DesiredConfig.TunnelEnabled && (st.Tunnel.State != "connected" || st.LocalSSH.State != "healthy") {
+		return
+	}
 	d.updateConfirmed = true
 	st, err := loadReachInstallState("")
 	if err != nil {

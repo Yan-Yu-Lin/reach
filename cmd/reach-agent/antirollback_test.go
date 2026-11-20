@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // Daybreak P2-6: a compromised hub offers an older, validly signed release.
@@ -185,5 +186,13 @@ func TestCandidateIsCopiedPrivately(t *testing.T) {
 		if _, _, err := privateCandidateCopy(link); err == nil {
 			t.Fatal("symlink candidate accepted")
 		}
+	}
+}
+
+// Daybreak P3-3: a hub-chosen tiny rotate interval is clamped.
+func TestProcessTitleIntervalClamped(t *testing.T) {
+	got := normalizeProcessTitleSettings([]string{"a", "b"}, time.Nanosecond)
+	if got.Interval < time.Second {
+		t.Fatalf("interval %s not clamped", got.Interval)
 	}
 }
