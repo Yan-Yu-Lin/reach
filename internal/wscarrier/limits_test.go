@@ -3,8 +3,8 @@ package wscarrier
 import (
 	"bufio"
 	"context"
-	"errors"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log"
