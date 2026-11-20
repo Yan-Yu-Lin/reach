@@ -329,7 +329,15 @@ func (s *Server) handleClientRegister(w http.ResponseWriter, r *http.Request) {
 	for k, v := range req.Metadata {
 		meta[k] = v
 	}
-	for k, v := range map[string]any{"name": name, "target_user": strings.TrimSpace(req.TargetUser), "slug": slug, "mode": strings.TrimSpace(req.Mode), "local_port": req.LocalPort, "distro": req.Distro, "arch": req.Arch, "transport": req.Transport, "source_ip": ip} {
+	// Resolve defaults now so the operator approves concrete values, not
+	// blanks that provision could later fill with root/system/22
+	// (daybreak P2-3).
+	bound := canonicalBinding(slug, req.TargetUser, req.Mode, req.LocalPort)
+	if bound.LocalPort < 1 || bound.LocalPort > 65535 {
+		writeErr(w, 400, "invalid local_port")
+		return
+	}
+	for k, v := range map[string]any{"name": name, "target_user": bound.TargetUser, "slug": slug, "mode": bound.Mode, "local_port": bound.LocalPort, "binding": bindingVersion, "distro": req.Distro, "arch": req.Arch, "transport": req.Transport, "source_ip": ip} {
 		meta[k] = v
 	}
 	metaJSON, _ := json.Marshal(meta)
@@ -353,7 +361,7 @@ func (s *Server) handleClientRegister(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		setupHash = HashToken(setupToken)
-		setupExpires = now.Add(s.cfg.SetupTokenTTL).Format(time.RFC3339)
+		setupExpires = clampExpiry(now.Add(s.cfg.SetupTokenTTL), expires).Format(time.RFC3339)
 		approvedAt = now.Format(time.RFC3339)
 		if kind != "god" && matchedHash != "" {
 			inviteHash = matchedHash
@@ -481,9 +489,11 @@ func (s *Server) handleClientPoll(w http.ResponseWriter, r *http.Request) {
 	}
 	// Cheap state checks first. Terminal states carry no secret material, so
 	// they are answered without verifying the client secret at all.
-	if status == "pending" {
-		if t, err := time.Parse(time.RFC3339, expiresAt); err == nil && time.Now().UTC().After(t) {
-			if res, err := s.store.db.ExecContext(r.Context(), `UPDATE requests SET status='expired' WHERE id=? AND status='pending'`, id); err == nil {
+	// The request TTL bounds approved requests too: an approval does not
+	// extend it (daybreak P2-4). Unparseable expiry fails closed.
+	if status == "pending" || status == "approved" {
+		if t, err := time.Parse(time.RFC3339, expiresAt); err != nil || time.Now().UTC().After(t) {
+			if res, err := s.store.db.ExecContext(r.Context(), `UPDATE requests SET status='expired', setup_token_hash=NULL WHERE id=? AND status IN ('pending','approved')`, id); err == nil {
 				if n, _ := res.RowsAffected(); n == 1 {
 					s.publishEvent(r.Context(), "request.expired", "", map[string]any{"request_id": id})
 				}
@@ -518,7 +528,7 @@ func (s *Server) handleClientPoll(w http.ResponseWriter, r *http.Request) {
 				writeErr(w, 500, "could not generate setup token")
 				return
 			}
-			exp := time.Now().UTC().Add(s.cfg.SetupTokenTTL).Format(time.RFC3339)
+			exp := clampExpiry(time.Now().UTC().Add(s.cfg.SetupTokenTTL), expiresAt).Format(time.RFC3339)
 			res, err := s.store.db.ExecContext(r.Context(), `UPDATE requests SET setup_token_hash=?, setup_token_expires_at=? WHERE id=? AND status='approved' AND setup_token_hash IS NULL`, HashToken(setupToken), exp, id)
 			if err != nil {
 				writeErr(w, 500, "could not persist setup token")
@@ -567,6 +577,10 @@ func (s *Server) handleClientProvision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	bound, err := s.approvedBinding(r.Context(), req.RequestID)
+	if errors.Is(err, errLegacyBinding) {
+		writeErr(w, http.StatusGone, err.Error())
+		return
+	}
 	if err != nil {
 		writeClientAuthErr(w)
 		return
@@ -662,6 +676,29 @@ type approvedBinding struct {
 	LocalPort  int
 }
 
+// bindingVersion marks requests whose metadata carries a complete,
+// default-resolved binding. Requests without it (created before this
+// release, at most request_ttl old) must re-register.
+const bindingVersion = 2
+
+var errLegacyBinding = errors.New("request predates complete approval binding; rerun setup to register again")
+
+// canonicalBinding applies the same defaults provisioning uses, so an
+// omitted field is bound to a concrete value at registration.
+func canonicalBinding(slug, targetUser, mode string, localPort int) approvedBinding {
+	b := approvedBinding{Slug: strings.TrimSpace(slug), TargetUser: strings.TrimSpace(targetUser), Mode: strings.TrimSpace(mode), LocalPort: localPort}
+	if b.TargetUser == "" {
+		b.TargetUser = "root"
+	}
+	if b.Mode == "" {
+		b.Mode = "system"
+	}
+	if b.LocalPort == 0 {
+		b.LocalPort = 22
+	}
+	return b
+}
+
 // approvedBinding loads the binding for a request. Any lookup or decode
 // failure is an error: provisioning fails closed (Opus P2-4 / daybreak P2-1).
 func (s *Server) approvedBinding(ctx context.Context, requestID string) (approvedBinding, error) {
@@ -676,33 +713,32 @@ func (s *Server) approvedBinding(ctx context.Context, requestID string) (approve
 			return approvedBinding{}, fmt.Errorf("decode approved metadata: %w", err)
 		}
 	}
-	str := func(k string) string { v, _ := want[k].(string); return strings.TrimSpace(v) }
-	b := approvedBinding{Slug: str("slug"), TargetUser: str("target_user"), Mode: str("mode")}
-	if b.Slug == "" {
-		// Requests created before slugs were bound: the alias the dashboard
-		// implied is the normalized request name.
-		b.Slug = NormalizeSlug(name)
+	if v, _ := want["binding"].(float64); int(v) != bindingVersion {
+		return approvedBinding{}, errLegacyBinding
 	}
-	if v, ok := want["local_port"].(float64); ok {
-		b.LocalPort = int(v)
+	str := func(k string) string { v, _ := want[k].(string); return strings.TrimSpace(v) }
+	port, _ := want["local_port"].(float64)
+	b := approvedBinding{Slug: str("slug"), TargetUser: str("target_user"), Mode: str("mode"), LocalPort: int(port)}
+	if b.Slug == "" || b.TargetUser == "" || b.Mode == "" || b.LocalPort == 0 {
+		return approvedBinding{}, fmt.Errorf("approved binding is incomplete")
 	}
 	return b, nil
 }
 
-// check requires exact equality for every bound value. Values the request
-// never declared (empty) may be chosen at provision time, but a declared
-// value can neither be changed nor cleared.
+// check requires the provision values, after the same defaulting as at
+// registration, to equal every bound value exactly. Nothing is a wildcard.
 func (b approvedBinding) check(slug, targetUser, mode string, localPort int) error {
-	if strings.TrimSpace(slug) != b.Slug {
-		return fmt.Errorf("slug %q differs from approved %q", slug, b.Slug)
+	got := canonicalBinding(slug, targetUser, mode, localPort)
+	if got.Slug != b.Slug {
+		return fmt.Errorf("slug %q differs from approved %q", got.Slug, b.Slug)
 	}
-	if b.TargetUser != "" && strings.TrimSpace(targetUser) != b.TargetUser {
+	if got.TargetUser != b.TargetUser {
 		return fmt.Errorf("target_user differs from approved value")
 	}
-	if b.Mode != "" && strings.TrimSpace(mode) != b.Mode {
+	if got.Mode != b.Mode {
 		return fmt.Errorf("mode differs from approved value")
 	}
-	if b.LocalPort != 0 && localPort != b.LocalPort {
+	if got.LocalPort != b.LocalPort {
 		return fmt.Errorf("local_port differs from approved value")
 	}
 	return nil
@@ -728,6 +764,14 @@ func (s *Server) slugInUse(ctx context.Context, slug string) (bool, error) {
 	return err == nil, err
 }
 
+// clampExpiry returns t, or the request expiry if that is earlier.
+func clampExpiry(t time.Time, requestExpires string) time.Time {
+	if r, err := time.Parse(time.RFC3339, requestExpires); err == nil && r.Before(t) {
+		return r
+	}
+	return t
+}
+
 func isUniqueSlugErr(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "UNIQUE constraint failed: machines.slug")
 }
@@ -738,9 +782,9 @@ var (
 )
 
 func (s *Server) consumeSetupToken(ctx context.Context, requestID, token string) (string, string, error) {
-	var id, name, status string
+	var id, name, status, reqExpires string
 	var hash, exp sql.NullString
-	err := s.store.db.QueryRowContext(ctx, `SELECT id,name,status,setup_token_hash,setup_token_expires_at FROM requests WHERE id=?`, requestID).Scan(&id, &name, &status, &hash, &exp)
+	err := s.store.db.QueryRowContext(ctx, `SELECT id,name,status,setup_token_hash,setup_token_expires_at,expires_at FROM requests WHERE id=?`, requestID).Scan(&id, &name, &status, &hash, &exp, &reqExpires)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", "", errors.New("request not found")
 	}
@@ -758,9 +802,12 @@ func (s *Server) consumeSetupToken(ctx context.Context, requestID, token string)
 		return "", "", errInvalidSetupToken
 	}
 	if exp.Valid {
-		if t, err := time.Parse(time.RFC3339, exp.String); err == nil && time.Now().UTC().After(t) {
+		if t, err := time.Parse(time.RFC3339, exp.String); err != nil || time.Now().UTC().After(t) {
 			return "", "", errSetupTokenExpired
 		}
+	}
+	if t, err := time.Parse(time.RFC3339, reqExpires); err != nil || time.Now().UTC().After(t) {
+		return "", "", errSetupTokenExpired
 	}
 	res, err := s.store.db.ExecContext(ctx, `UPDATE requests SET status='provisioning', setup_token_hash=NULL WHERE id=? AND status='approved' AND setup_token_hash=?`, requestID, hash.String)
 	if err != nil {
@@ -1440,14 +1487,16 @@ func (s *Server) handleAdminRequestAction(w http.ResponseWriter, r *http.Request
 	now := nowUTC()
 	switch action {
 	case "approve":
-		res, err := s.store.db.ExecContext(r.Context(), `UPDATE requests SET status='approved', setup_token_hash=NULL, setup_token_expires_at=NULL, approved_at=? WHERE id=? AND status='pending'`, now, id)
+		// An expired request cannot be approved even before maintenance
+		// marks it (daybreak P2-4).
+		res, err := s.store.db.ExecContext(r.Context(), `UPDATE requests SET status='approved', setup_token_hash=NULL, setup_token_expires_at=NULL, approved_at=? WHERE id=? AND status='pending' AND expires_at>?`, now, id, now)
 		if err != nil {
 			writeErr(w, 500, "approve failed")
 			return
 		}
 		n, _ := res.RowsAffected()
 		if n == 0 {
-			writeErr(w, 404, "pending request not found")
+			writeErr(w, 404, "pending, unexpired request not found")
 			return
 		}
 		s.store.Audit(r.Context(), "request.approve", claims.Username, "", "request="+id)
