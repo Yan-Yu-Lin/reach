@@ -50,7 +50,7 @@ Target Linux/macOS/Windows machine
 ### Registration and approval
 
 1. The target runs `setup.sh`.
-2. `setup.sh` downloads `reach-agent`, verifies its SHA-256 checksum, and runs `reach-agent install`.
+2. `setup.sh` downloads `reach-agent`, verifies it against the Minisign-signed release manifest (with `minisign`, or OpenSSL 3 as an Ed25519 verifier; otherwise against hashes pinned into the published script), and runs `reach-agent install`.
 3. The agent registers with the hub API.
 4. If a valid auth code is provided, the request is approved immediately.
 5. Otherwise, the request waits in the dashboard until an operator approves or denies it.
@@ -557,7 +557,7 @@ Trust assumptions:
 - Compromise of a target can reveal that target’s agent token and tunnel private key.
 - Compromise of an operator private key grants SSH access to reachable targets.
 - The generated operator SSH config uses `StrictHostKeyChecking accept-new` with a stable `HostKeyAlias`, so target SSH host keys are trust-on-first-use unless you manage known_hosts separately.
-- Hosted agent downloads are checksum-verified, but the checksums are served by the same hub; add signed releases if your threat model requires stronger supply-chain guarantees.
+- Hosted agent downloads are verified against a Minisign-signed manifest whose private key stays off the hub. `setup.sh` verifies the signature when `minisign` or OpenSSL 3 is present; otherwise, and on Windows, it relies on hashes pinned into the setup script at publish time (so a compromised hub that also rewrites the setup script is still trusted). Self-updates refuse signed releases older than the last confirmed one.
 
 ---
 

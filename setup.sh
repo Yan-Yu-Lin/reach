@@ -5,6 +5,13 @@ REACH_AGENT_VERSION="${REACH_AGENT_VERSION:-0.1.0-alpha}"
 API_URL="${REACH_API_URL:-https://tunnels.your-domain.example}"
 TRANSPORT="${REACH_TRANSPORT:-auto}"
 SOURCE_URL="${REACH_SOURCE_URL:-https://github.com/Yan-Yu-Lin/reach}"
+# Offline release-signing key; its private half never lives on the hub. Same
+# key as releaseManifestPublicKeys in cmd/reach-agent/update_binary.go.
+REACH_RELEASE_PUBKEY="RWQ+MT09E8yd1V1tf3J3NI3Eb7L9DgMgNrN4SiqdrTs1Y2C61++bpyYY"
+# Filled in by scripts/deploy-jason.sh from the signature-verified manifest of
+# the published release; used only when no Ed25519 verifier is available.
+REACH_PINNED_VERSION=""
+REACH_PINNED_SHA256S=""
 
 NAME=""
 TOKEN=""
@@ -199,32 +206,119 @@ case "$os/$arch" in
   *) die "Unsupported platform/architecture: $os/$arch" ;;
 esac
 
+if [ "$ACTION" = "repair" ] && [ "$UPDATE_AGENT" = 1 ]; then
+  # The already-installed (trusted) agent downloads and verifies the signed
+  # release itself; a freshly downloaded candidate is never executed here.
+  log "Updating existing reach-agent binary in place; this will not register, provision, or uninstall."
+  if [ "$INSTALL_MODE" = "system" ] && [ -x /opt/reach/reach-agent ]; then
+    exec $SUDO /opt/reach/reach-agent update-binary --version "$REACH_AGENT_VERSION" --api-url "$API_URL"
+  elif [ -x "$HOME/.local/bin/reach-agent" ]; then
+    exec "$HOME/.local/bin/reach-agent" update-binary --version "$REACH_AGENT_VERSION" --api-url "$API_URL"
+  fi
+  die "No installed reach-agent found to perform a verified update; rerun setup.sh without --repair."
+fi
+
 base_url="${API_URL%/}/downloads/reach-agent/v${REACH_AGENT_VERSION}"
+case "$API_URL" in https://*|http://127.0.0.1*|http://localhost*) ;; *) die "API URL must use https://" ;; esac
 tmpdir="$(mktemp -d)"
-trap 'rm -rf "$tmpdir"' EXIT
+trap 'rm -r -f "$tmpdir"' EXIT
+
+fetch() { curl -fsSL --proto '=https,http' --proto-redir '=https' --max-filesize "$3" "$1" -o "$2"; }
+
+sha256_of() {
+  if have sha256sum; then sha256sum "$1" | awk '{print $1}'
+  elif have shasum; then shasum -a 256 "$1" | awk '{print $1}'
+  elif have openssl; then openssl dgst -sha256 "$1" | awk '{print $NF}'
+  else die "Need sha256sum, shasum, or openssl to verify reach-agent."
+  fi
+}
+
+# find_ed25519_openssl prints an openssl that can verify raw Ed25519
+# (OpenSSL >= 3.0, pkeyutl -rawin). macOS LibreSSL cannot.
+find_ed25519_openssl() {
+  local c
+  for c in openssl /opt/homebrew/opt/openssl@3/bin/openssl /usr/local/opt/openssl@3/bin/openssl openssl3; do
+    command -v "$c" >/dev/null 2>&1 || continue
+    if "$c" version 2>/dev/null | grep -Eq '^OpenSSL [3-9]\.'; then printf '%s\n' "$c"; return 0; fi
+  done
+  return 1
+}
+
+# verify_minisign_openssl MSG SIG: check a minisign Ed25519 signature and its
+# trusted-comment signature against REACH_RELEASE_PUBKEY.
+verify_minisign_openssl() {
+  local msg="$1" sig="$2" d="$tmpdir/ms" tc
+  mkdir -p "$d"
+  printf '%s' "$REACH_RELEASE_PUBKEY" | "$OSSL" base64 -d -A > "$d/pk.bin" || return 1
+  [ "$(wc -c < "$d/pk.bin" | tr -d ' ')" = 42 ] || return 1
+  sed -n 2p "$sig" | tr -d '\r\n' | "$OSSL" base64 -d -A > "$d/sig.bin" || return 1
+  [ "$(wc -c < "$d/sig.bin" | tr -d ' ')" = 74 ] || return 1
+  [ "$(head -c 2 "$d/sig.bin")" = "Ed" ] || { warn "unsupported minisign signature algorithm"; return 1; }
+  head -c 10 "$d/pk.bin" | tail -c 8 > "$d/pk.id"
+  head -c 10 "$d/sig.bin" | tail -c 8 > "$d/sig.id"
+  cmp -s "$d/pk.id" "$d/sig.id" || { warn "manifest signed by an unknown key"; return 1; }
+  tail -c 32 "$d/pk.bin" > "$d/pk.raw"
+  { printf '\060\052\060\005\006\003\053\145\160\003\041\000'; cat "$d/pk.raw"; } > "$d/pk.der"
+  "$OSSL" pkey -pubin -inform DER -in "$d/pk.der" -out "$d/pk.pem" 2>/dev/null || return 1
+  tail -c 64 "$d/sig.bin" > "$d/sig.raw"
+  "$OSSL" pkeyutl -verify -pubin -inkey "$d/pk.pem" -rawin -in "$msg" -sigfile "$d/sig.raw" >/dev/null 2>&1 || return 1
+  tc="$(sed -n 3p "$sig" | tr -d '\r')"
+  case "$tc" in "trusted comment: "*) ;; *) return 1 ;; esac
+  { cat "$d/sig.raw"; printf '%s' "${tc#trusted comment: }"; } > "$d/global.msg"
+  sed -n 4p "$sig" | tr -d '\r\n' | "$OSSL" base64 -d -A > "$d/global.sig" || return 1
+  "$OSSL" pkeyutl -verify -pubin -inkey "$d/pk.pem" -rawin -in "$d/global.msg" -sigfile "$d/global.sig" >/dev/null 2>&1
+}
+
+# manifest_asset_field ASSET KEY reads sha256/size for ASSET from the signed
+# manifest (indented JSON written by reach-release).
+manifest_asset_field() {
+  awk -v a="\"$1\": {" -v k="\"$2\":" '
+    index($0, a) { inside=1; next }
+    inside && index($0, k) { v=$0; sub(/.*: */, "", v); gsub(/[",[:space:]]/, "", v); print v; exit }
+    inside && /}/ { exit }' "$tmpdir/manifest.json"
+}
 
 log "Source code: $SOURCE_URL"
 log "Downloading reach-agent $REACH_AGENT_VERSION for $os/$arch."
-curl -fsSL "$base_url/$asset" -o "$tmpdir/reach-agent"
-curl -fsSL "$base_url/checksums.txt" -o "$tmpdir/checksums.txt"
-expected="$(awk -v f="$asset" '$2 == f {print $1}' "$tmpdir/checksums.txt")"
-[ -n "$expected" ] || die "No checksum found for $asset"
-if have sha256sum; then actual="$(sha256sum "$tmpdir/reach-agent" | awk '{print $1}')"
-elif have shasum; then actual="$(shasum -a 256 "$tmpdir/reach-agent" | awk '{print $1}')"
-elif have openssl; then actual="$(openssl dgst -sha256 "$tmpdir/reach-agent" | awk '{print $NF}')"
-else die "Need sha256sum, shasum, or openssl to verify reach-agent."
-fi
-[ "$actual" = "$expected" ] || die "reach-agent checksum mismatch: got $actual expected $expected"
-chmod +x "$tmpdir/reach-agent"
-
-if [ "$ACTION" = "repair" ] && [ "$UPDATE_AGENT" = 1 ]; then
-  log "Updating existing reach-agent binary in place; this will not register, provision, or uninstall."
-  if [ "$USE_SUDO" = 1 ]; then
-    exec $SUDO "$tmpdir/reach-agent" update-binary --foreground --candidate "$tmpdir/reach-agent" --version "$REACH_AGENT_VERSION" --api-url "$API_URL"
+fetch "$base_url/$asset" "$tmpdir/reach-agent" 134217728
+actual="$(sha256_of "$tmpdir/reach-agent")"
+verified=""
+OSSL=""
+if have minisign || OSSL="$(find_ed25519_openssl)"; then
+  fetch "$base_url/manifest.json" "$tmpdir/manifest.json" 1048576
+  fetch "$base_url/manifest.json.minisig" "$tmpdir/manifest.json.minisig" 16384
+  if have minisign; then
+    minisign -Vm "$tmpdir/manifest.json" -x "$tmpdir/manifest.json.minisig" -P "$REACH_RELEASE_PUBKEY" -q || die "release manifest signature verification failed"
+    verified="minisign"
   else
-    exec "$tmpdir/reach-agent" update-binary --foreground --candidate "$tmpdir/reach-agent" --version "$REACH_AGENT_VERSION" --api-url "$API_URL"
+    verify_minisign_openssl "$tmpdir/manifest.json" "$tmpdir/manifest.json.minisig" || die "release manifest signature verification failed"
+    verified="Ed25519 via $OSSL"
   fi
+  grep -Eq '^  "project": "reach-agent",?$' "$tmpdir/manifest.json" || die "signed manifest is not for reach-agent"
+  grep -Fq "\"version\": \"$REACH_AGENT_VERSION\"," "$tmpdir/manifest.json" || die "signed manifest is for a different version"
+  expected="$(manifest_asset_field "$asset" sha256)"
+  size="$(manifest_asset_field "$asset" size)"
+  [ -n "$expected" ] && [ -n "$size" ] || die "signed manifest has no entry for $asset"
+  [ "$(wc -c < "$tmpdir/reach-agent" | tr -d ' ')" = "$size" ] || die "reach-agent size does not match the signed manifest"
+  [ "$actual" = "$expected" ] || die "reach-agent checksum does not match the signed manifest"
+  log "Verified reach-agent against the signed release manifest ($verified)."
+elif [ -n "$REACH_PINNED_SHA256S" ] && [ "$REACH_PINNED_VERSION" = "$REACH_AGENT_VERSION" ]; then
+  expected=""
+  for pin in $REACH_PINNED_SHA256S; do
+    [ "${pin%%=*}" = "$asset" ] && expected="${pin#*=}"
+  done
+  [ -n "$expected" ] || die "setup.sh has no pinned hash for $asset"
+  [ "$actual" = "$expected" ] || die "reach-agent checksum does not match the hash pinned in setup.sh"
+  log "Verified reach-agent against the hash pinned in setup.sh (no Ed25519 verifier on this machine)."
+elif [ "${REACH_ALLOW_UNVERIFIED:-0}" = 1 ]; then
+  warn "REACH_ALLOW_UNVERIFIED=1: checking only the same-origin checksums.txt."
+  fetch "$base_url/checksums.txt" "$tmpdir/checksums.txt" 65536
+  expected="$(awk -v f="$asset" '$2 == f {print $1}' "$tmpdir/checksums.txt")"
+  [ -n "$expected" ] && [ "$actual" = "$expected" ] || die "reach-agent checksum mismatch"
+else
+  die "Cannot verify the reach-agent release signature: install minisign or OpenSSL 3, or set REACH_ALLOW_UNVERIFIED=1 if you trust this server."
 fi
+chmod +x "$tmpdir/reach-agent"
 
 log "Installing reach-agent to $AGENT_PATH ($INSTALL_MODE mode; privilege: $PRIV)."
 run_priv mkdir -p "$INSTALL_PREFIX"

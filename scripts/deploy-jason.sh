@@ -644,19 +644,29 @@ if [ "$PUBLISH_AGENT_RELEASE" = 1 ]; then
   esac
   CONFIG_API_URL_SED="$(printf '%s' "$CONFIG_API_URL" | sed 's/[&|\\]/\\&/g')"
   AGENT_VERSION_SED="$(printf '%s' "$AGENT_VERSION" | sed 's/[&|\\]/\\&/g')"
+  # Pin the agent hashes from the signature-verified manifest into setup.sh
+  # for targets without minisign/OpenSSL 3 (daybreak P1-5).
+  PINNED_SHA256S="$(go run ./cmd/reach-release pins --manifest "$ARTIFACT_DIR/manifest.json")"
+  case "$PINNED_SHA256S" in *[!A-Za-z0-9_.=\ -]*|'') echo "[deploy] ERROR: invalid pinned hashes" >&2; false ;; esac
   sed \
     -e "s|^REACH_AGENT_VERSION=.*|REACH_AGENT_VERSION=\"\${REACH_AGENT_VERSION:-${AGENT_VERSION_SED}}\"|" \
     -e "s|^API_URL=.*|API_URL=\"\${REACH_API_URL:-${CONFIG_API_URL_SED}}\"|" \
+    -e "s|^REACH_PINNED_VERSION=.*|REACH_PINNED_VERSION=\"${AGENT_VERSION_SED}\"|" \
+    -e "s|^REACH_PINNED_SHA256S=.*|REACH_PINNED_SHA256S=\"${PINNED_SHA256S}\"|" \
     -e "s|https://tunnels.your-domain.example|${CONFIG_API_URL_SED}|g" \
     setup.sh > /tmp/reach-setup.sh
   sed \
     -e "s|\"https://tunnels.your-domain.example\"|\"${CONFIG_API_URL_SED}\"|g" \
     -e "s|\"0.1.0-alpha\"|\"${AGENT_VERSION_SED}\"|g" \
+    -e "s|^\\\$ReachPinnedVersion = .*|\\\$ReachPinnedVersion = '${AGENT_VERSION_SED}'|" \
+    -e "s|^\\\$ReachPinnedSha256s = .*|\\\$ReachPinnedSha256s = '${PINNED_SHA256S}'|" \
     setup.ps1 > /tmp/reach-setup.ps1
   grep -Fq "$CONFIG_API_URL" /tmp/reach-setup.sh
   grep -Fq "$CONFIG_API_URL" /tmp/reach-setup.ps1
   grep -Fq "$AGENT_VERSION" /tmp/reach-setup.sh
   grep -Fq "$AGENT_VERSION" /tmp/reach-setup.ps1
+  grep -Fq "REACH_PINNED_SHA256S=\"reach-agent_" /tmp/reach-setup.sh
+  grep -Fq "\$ReachPinnedSha256s = 'reach-agent_" /tmp/reach-setup.ps1
   printf '%s\n' "$AGENT_VERSION" > /tmp/reach-latest-version
   printf '{"version":"%s","api_url":"%s","created_at":"%s"}\n' \
     "$AGENT_VERSION" "$CONFIG_API_URL" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /tmp/reach-latest.json

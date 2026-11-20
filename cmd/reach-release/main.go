@@ -38,6 +38,8 @@ func run(args []string) error {
 		return verifyCommand(args[1:])
 	case "keygen":
 		return keygenCommand(args[1:])
+	case "pins":
+		return pinsCommand(args[1:])
 	case "help", "--help", "-h":
 		usage()
 		return nil
@@ -257,6 +259,36 @@ func verifyReleaseBinary(path string, target releaseTarget, asset releaseAsset, 
 	return nil
 }
 
+// pinsCommand prints "asset=sha256 ..." for embedding in setup scripts.
+func pinsCommand(args []string) error {
+	fs := flag.NewFlagSet("pins", flag.ContinueOnError)
+	manifestPath := fs.String("manifest", "", "verified manifest.json")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	b, err := os.ReadFile(*manifestPath)
+	if err != nil {
+		return err
+	}
+	var m releaseManifest
+	if err := json.Unmarshal(b, &m); err != nil {
+		return err
+	}
+	var pins []string
+	for _, target := range releaseTargets {
+		a, ok := m.Assets[target.Name]
+		if !ok || len(a.SHA256) != 64 {
+			return fmt.Errorf("manifest has no valid hash for %s", target.Name)
+		}
+		if _, err := hex.DecodeString(a.SHA256); err != nil {
+			return fmt.Errorf("invalid hash for %s", target.Name)
+		}
+		pins = append(pins, target.Name+"="+strings.ToLower(a.SHA256))
+	}
+	fmt.Println(strings.Join(pins, " "))
+	return nil
+}
+
 func keygenCommand(args []string) error {
 	fs := flag.NewFlagSet("keygen", flag.ContinueOnError)
 	keyPath := fs.String("key", defaultReleaseKeyPath(), "minisign private key path")
@@ -363,6 +395,7 @@ Usage:
   reach-release manifest --dir DIR --version VERSION [--commit COMMIT]
   reach-release sign --manifest manifest.json [--key ~/.minisign/reach-release.key] [--password-file FILE]
   reach-release verify --manifest manifest.json [--signature manifest.json.minisig] [--artifacts-dir DIR] [--public-key KEY]
+  reach-release pins --manifest manifest.json
   reach-release keygen [--key ~/.minisign/reach-release.key] [--pub ~/.minisign/reach-release.pub] [--password-file FILE]
 `)
 }

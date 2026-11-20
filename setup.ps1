@@ -16,6 +16,14 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
+# Agent hashes pinned at publish time by scripts/deploy-jason.sh from the
+# Minisign-verified release manifest. Windows PowerShell 5.1 has no Ed25519
+# verifier, so this pin (not the same-origin checksums.txt) is what a fresh
+# install trusts (daybreak P1-5). An empty pin refuses to install unless
+# REACH_ALLOW_UNVERIFIED=1 is set.
+$ReachPinnedVersion = ''
+$ReachPinnedSha256s = ''
+
 function Log([string]$Message) { Write-Host "[reach] $Message" -ForegroundColor Cyan }
 function Warn([string]$Message) { Write-Warning "[reach] $Message" }
 function Die([string]$Message) { Write-Error "[reach] $Message"; exit 1 }
@@ -106,17 +114,37 @@ function Invoke-ReachDownload([string]$Url, [string]$OutFile) {
   Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing
 }
 
+function Get-ReachPinnedHash([string]$Asset) {
+  if (-not $ReachPinnedSha256s -or $ReachPinnedVersion -ne $Version) { return $null }
+  foreach ($pin in ($ReachPinnedSha256s -split '\s+')) {
+    $parts = $pin -split '=', 2
+    if ($parts.Count -eq 2 -and $parts[0] -eq $Asset) { return $parts[1].ToLowerInvariant() }
+  }
+  return $null
+}
+
 function Save-ReachAgentCandidate([string]$Destination) {
+  if (-not ($ApiUrl -match '^https://' -or $ApiUrl -match '^http://(127\.0\.0\.1|localhost)')) { Die "API URL must use https://" }
   $asset = Get-ReachAgentAsset
   $baseUrl = ($ApiUrl.TrimEnd('/')) + "/downloads/reach-agent/v$Version"
   $dir = Split-Path -Parent $Destination
   if (-not $dir) { $dir = '.' }
   New-Item -ItemType Directory -Force -Path $dir | Out-Null
-  $checksums = Join-Path $dir 'checksums.txt'
   Invoke-ReachDownload "$baseUrl/$asset" $Destination
+  $actual = (Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash.ToLowerInvariant()
+  $pinned = Get-ReachPinnedHash $asset
+  if ($pinned) {
+    if ($actual -ne $pinned) { Die "reach-agent checksum does not match the hash pinned from the signed release manifest" }
+    Log "Verified reach-agent against the hash pinned from the signed release manifest"
+    return
+  }
+  if ($env:REACH_ALLOW_UNVERIFIED -ne '1') {
+    Die "setup.ps1 has no pinned hash for $asset version $Version; refusing to run an unverified binary. Set REACH_ALLOW_UNVERIFIED=1 only if you trust this server."
+  }
+  Warn "REACH_ALLOW_UNVERIFIED=1: checking only the same-origin checksums.txt"
+  $checksums = Join-Path $dir 'checksums.txt'
   Invoke-ReachDownload "$baseUrl/checksums.txt" $checksums
   $expected = Get-ReachChecksum $checksums $asset
-  $actual = (Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash.ToLowerInvariant()
   if ($actual -ne $expected) { Die "reach-agent checksum mismatch: got $actual expected $expected" }
 }
 
