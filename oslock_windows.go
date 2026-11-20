@@ -9,3 +9,5 @@ import "os"
 func tryFlock(*os.File, bool) (bool, error) { return true, nil }
 func flockBlocking(*os.File) error          { return nil }
 func unflock(*os.File) error                { return nil }
+
+func copyOwner(*os.File, os.FileInfo) error { return nil }

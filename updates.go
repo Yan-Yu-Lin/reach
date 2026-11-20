@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"context"
 	"encoding/json"
 	"errors"
@@ -130,14 +131,33 @@ func (s *Server) queueAgentUpdate(ctx context.Context, m Machine, actor, reason 
 	if !ok {
 		return errNoAgentUpdateAvailable
 	}
-	if s.hasOpenUpdateCommand(ctx, m.ID) {
-		return errUpdateAlreadyQueued
-	}
-	if err := s.prov.QueueCommand(ctx, m.ID, m.DesiredGeneration, "update_agent", updateAgentPayload(rel), 24*time.Hour); err != nil {
-		return err
-	}
 	if actor == "" {
 		actor = "system"
+	}
+	// One open update per machine, checked and inserted in one transaction
+	// (daybreak round 4 P2-04). A manual update is an operator decision and
+	// is journalled with it (astra R3-02, daybreak P2-05); the automatic
+	// policy queue stays discardable (it is re-queued by the next heartbeat).
+	err := s.store.inTx(ctx, func(tx *sql.Tx) error {
+		var open int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM agent_commands WHERE machine_id=? AND type='update_agent' AND status IN ('pending','sent') AND (expires_at IS NULL OR expires_at>?)`, m.ID, nowUTC()).Scan(&open); err != nil {
+			return err
+		}
+		if open > 0 {
+			return errUpdateAlreadyQueued
+		}
+		if err := queueCommandTx(ctx, tx, m.ID, m.DesiredGeneration, "update_agent", updateAgentPayload(rel), 24*time.Hour); err != nil {
+			return err
+		}
+		if actor != "system" {
+			if _, err := recordDurable(ctx, tx, "machine.agent_update.queue", m.ID, actor, durableDone); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
 	}
 	s.store.Audit(ctx, "machine.agent_update.queue", actor, m.ID, "version="+rel.Version+" reason="+reason)
 	s.publishEvent(ctx, "agent.update_queued", m.ID, map[string]any{"machine_id": m.ID, "version": rel.Version, "reason": reason})

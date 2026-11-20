@@ -245,8 +245,9 @@ cleanup() {
 
 # stop_reachd_verified: stop reachd and prove it is gone before anyone
 # touches the database (astra R2-03). Returns non-zero when systemctl fails,
-# the unit is still active, the old main PID is still alive, or (when fuser
-# exists) some process still holds the database file.
+# the unit is still active, the old main PID is still alive, fuser is
+# missing, or some process still holds the database or its WAL/SHM (astra
+# R3-03, daybreak round 4).
 stop_reachd_verified() {
   local pid
   pid="$(systemctl show -p MainPID --value reachd 2>/dev/null || true)"
@@ -270,9 +271,18 @@ stop_reachd_verified() {
       return 1
     fi
   fi
-  if [ -n "${DB_PATH:-}" ] && command -v fuser >/dev/null 2>&1 && sudo fuser "$DB_PATH" >/dev/null 2>&1; then
-    echo "[deploy] ERROR: a process still has $DB_PATH open" >&2
-    return 1
+  if [ -n "${DB_PATH:-}" ]; then
+    if ! command -v fuser >/dev/null 2>&1; then
+      echo "[deploy] ERROR: fuser (psmisc) is required to prove nobody holds the database" >&2
+      return 1
+    fi
+    local f
+    for f in "$DB_PATH" "$DB_PATH-wal" "$DB_PATH-shm"; do
+      if sudo test -e "$f" && sudo fuser "$f" >/dev/null 2>&1; then
+        echo "[deploy] ERROR: a process still has $f open" >&2
+        return 1
+      fi
+    done
   fi
   return 0
 }
@@ -647,6 +657,7 @@ DASHBOARD_STAGE="/opt/.reach-dashboard.staged.${DEPLOY_TS}.$$"
 DASHBOARD_BACKUP="/opt/reach-dashboard.backup.${DEPLOY_TS}"
 
 command -v sqlite3 >/dev/null || { echo "[deploy] ERROR: sqlite3 is required for safe backups" >&2; exit 1; }
+command -v fuser >/dev/null || { echo "[deploy] ERROR: fuser (apt install psmisc) is required to prove nobody holds the database" >&2; exit 1; }
 if [ -r /etc/reach/config.yaml ]; then
   DB_PATH="$("$UV_BIN" run --script scripts/read-reach-config.py --config /etc/reach/config.yaml db_path)"
   LISTEN_ADDR="$("$UV_BIN" run --script scripts/read-reach-config.py --config /etc/reach/config.yaml listen_addr)"
@@ -839,13 +850,18 @@ fi
 DB_BACKUP_DIR="$(dirname "$DB_PATH")/backups"
 DB_BACKUP_PATH="${DB_BACKUP_DIR}/$(basename "$DB_PATH").${DEPLOY_TS}"
 sudo install -d -m 0700 "$DB_BACKUP_DIR"
-sudo sqlite3 "$DB_PATH" ".timeout 10000" ".backup '$DB_BACKUP_PATH'"
-if [ "$(sudo sqlite3 "$DB_BACKUP_PATH" 'PRAGMA quick_check;')" != "ok" ]; then
-  echo "[deploy] ERROR: backup database failed PRAGMA quick_check" >&2
-  false
-fi
 if [ "$(sudo sqlite3 "$DB_PATH" 'PRAGMA quick_check;')" != "ok" ]; then
   echo "[deploy] ERROR: live database failed PRAGMA quick_check" >&2
+  false
+fi
+# Fence first, then snapshot, both under the exclusive writers lock that
+# every reachd/CLI writer of this version holds shared (daybreak round 4
+# P1-02, astra R3-03). A write slipping in between would be in the snapshot
+# AND above the fence, so a rollback would refuse to restore: never lost.
+DEPLOY_FENCE="${DB_BACKUP_DIR}/deploy-fence.${DEPLOY_TS}.json"
+sudo /tmp/reachd-build deploy-fence record --config /etc/reach/config.yaml --fence "$DEPLOY_FENCE" --snapshot "$DB_BACKUP_PATH"
+if [ "$(sudo sqlite3 "$DB_BACKUP_PATH" 'PRAGMA quick_check;')" != "ok" ]; then
+  echo "[deploy] ERROR: backup database failed PRAGMA quick_check" >&2
   false
 fi
 echo "[deploy] database backup: $DB_BACKUP_PATH"
@@ -857,10 +873,16 @@ if [ "$REACHD_EXISTED" = 1 ] && [ "${REACH_SKIP_ROLLBACK_REHEARSAL:-0}" != 1 ]; 
   echo "[deploy] rehearsing rollback on a private copy of the snapshot..."
   sudo bash scripts/rehearse-rollback.sh /opt/reach/reachd /tmp/reachd-build "$DB_BACKUP_PATH" /etc/reach/config.yaml
 fi
-DEPLOY_FENCE="${DB_BACKUP_DIR}/deploy-fence.${DEPLOY_TS}.json"
-sudo /tmp/reachd-build deploy-fence record --config /etc/reach/config.yaml --fence "$DEPLOY_FENCE"
 
 install_new_reachd
+
+# The new binary's first start invalidates pre-upgrade admin JWTs through a
+# DB migration, which a snapshot restore would undo. Rotate jwt_secret
+# instead (only while that migration is still pending): config.yaml is not
+# part of the rollback, so the restored old binary keeps the new secret and
+# old JWTs stay invalid (daybreak round 4 P1-03). Everyone logs in again.
+sudo cp -a /etc/reach/config.yaml "/var/lib/reach/deploy-backups/config.yaml.${DEPLOY_TS}"
+sudo "$PROBE_BIN" rotate-jwt-secret --config /etc/reach/config.yaml --if-session-migration-pending
 
 DB_MAY_HAVE_MIGRATED=1
 sudo systemctl start reachd
@@ -1009,6 +1031,7 @@ if ! sudo "$UV_BIN" run --script scripts/prune-deploy-backups.py --retain "$BACK
   '/var/lib/reach/deploy-backups/10-reach-limits.conf.*' \
   '/var/lib/reach/deploy-backups/ws-carrier.env.*' \
   '/var/lib/reach/deploy-backups/reachd-probe.*' \
+  '/var/lib/reach/deploy-backups/config.yaml.*' \
   '/var/lib/reach/deploy-backups/agent-publication.*' \
   "$AGENT_DOWNLOAD_ROOT/v*.replaced.*" \
   "$DB_BACKUP_DIR/failed.*" \

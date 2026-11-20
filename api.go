@@ -904,13 +904,21 @@ func (s *Server) consumeSetupToken(ctx context.Context, requestID, token string)
 	if t, err := time.Parse(time.RFC3339, reqExpires); err != nil || time.Now().UTC().After(t) {
 		return "", "", errSetupTokenExpired
 	}
-	res, err := s.store.db.ExecContext(ctx, `UPDATE requests SET status='provisioning', setup_token_hash=NULL, provisioning_started_at=? WHERE id=? AND status='approved' AND setup_token_hash=?`, nowUTC(), requestID, hash.String)
+	// Consuming the one-time token is a durable decision: a snapshot
+	// restore must not make it valid again (daybreak round 4 P2-01). The
+	// state change, the cleared hash and the journal row commit together.
+	err = s.store.durableTx(ctx, "request.provision.start", "", requestID, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `UPDATE requests SET status='provisioning', setup_token_hash=NULL, provisioning_started_at=? WHERE id=? AND status='approved' AND setup_token_hash=?`, nowUTC(), requestID, hash.String)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return errInvalidSetupToken
+		}
+		return nil
+	})
 	if err != nil {
 		return "", "", err
-	}
-	n, _ := res.RowsAffected()
-	if n != 1 {
-		return "", "", errInvalidSetupToken
 	}
 	return id, name, nil
 }

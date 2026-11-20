@@ -30,3 +30,12 @@ func flockBlocking(f *os.File) error {
 }
 
 func unflock(f *os.File) error { return syscall.Flock(int(f.Fd()), syscall.LOCK_UN) }
+
+// copyOwner gives f the owner and group of st (used when replacing a
+// root-owned config file in place).
+func copyOwner(f *os.File, st os.FileInfo) error {
+	if sys, ok := st.Sys().(*syscall.Stat_t); ok {
+		return f.Chown(int(sys.Uid), int(sys.Gid))
+	}
+	return nil
+}

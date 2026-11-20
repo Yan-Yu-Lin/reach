@@ -920,6 +920,10 @@ func retireTunnelRowTx(ctx context.Context, q sqlQueryExecer, t Tunnel) (Tunnel,
 }
 
 func (p *Provisioner) QueueCommand(ctx context.Context, machineID string, generation int64, typ string, payload any, ttl time.Duration) error {
+	return queueCommandTx(ctx, p.store.db, machineID, generation, typ, payload, ttl)
+}
+
+func queueCommandTx(ctx context.Context, ex sqlExecer, machineID string, generation int64, typ string, payload any, ttl time.Duration) error {
 	id, err := RandomID("cmd")
 	if err != nil {
 		return err
@@ -932,7 +936,7 @@ func (p *Provisioner) QueueCommand(ctx context.Context, machineID string, genera
 	if ttl > 0 {
 		expires = time.Now().UTC().Add(ttl).Format(time.RFC3339)
 	}
-	_, err = p.store.db.ExecContext(ctx, `INSERT INTO agent_commands (id,machine_id,generation,type,payload_json,status,created_at,expires_at) VALUES (?,?,?,?,?,?,?,?)`, id, machineID, generation, typ, nullable(string(raw)), "pending", nowUTC(), nullable(expires))
+	_, err = ex.ExecContext(ctx, `INSERT INTO agent_commands (id,machine_id,generation,type,payload_json,status,created_at,expires_at) VALUES (?,?,?,?,?,?,?,?)`, id, machineID, generation, typ, nullable(string(raw)), "pending", nowUTC(), nullable(expires))
 	return err
 }
 

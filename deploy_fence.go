@@ -197,6 +197,7 @@ func cliDeployFence(ctx context.Context, args []string) error {
 	mode := args[0]
 	fs, cfgPath := baseFS("deploy-fence", args[1:])
 	fencePath := fs.String("fence", "", "fence file")
+	snapshotPath := fs.String("snapshot", "", "record only: also write a consistent DB snapshot here, after the fence, under the writers lock")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -207,19 +208,14 @@ func cliDeployFence(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	if mode == "record" {
+		return recordFenceAndSnapshot(ctx, cfg.DBPath, *fencePath, *snapshotPath)
+	}
 	store, err := OpenStore(cfg.DBPath)
 	if err != nil {
 		return err
 	}
 	defer store.Close()
-	if mode == "record" {
-		f, err := recordDeployFence(ctx, store.db, time.Now())
-		if err != nil {
-			return err
-		}
-		b, _ := json.Marshal(f)
-		return os.WriteFile(*fencePath, append(b, '\n'), 0o600)
-	}
 	b, err := os.ReadFile(*fencePath)
 	if err != nil {
 		return err
@@ -278,4 +274,76 @@ func cliAdminProbeToken(ctx context.Context, args []string) error {
 	}
 	fmt.Println(tok)
 	return nil
+}
+
+// recordFenceAndSnapshot records the fence and then the snapshot, both
+// while holding the writers lock exclusively (daybreak round 4 P1-02,
+// astra R3-03). Order matters: a write after the fence but before the
+// snapshot is in the snapshot AND above the fence, so a rollback refuses
+// to restore (safe); the opposite order would let the write vanish.
+// Writers of this version (reachd serve, CLI create/disable/remove) hold
+// the lock shared, so none can run while it is held.
+func recordFenceAndSnapshot(ctx context.Context, dbPath, fencePath, snapshotPath string) error {
+	lock, err := acquireWritersExclusive(dbPath)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	store, err := OpenStore(dbPath)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	// Clear retired machines' tokens before the snapshot, so a rollback
+	// cannot bring them back (daybreak round 4 P1-03).
+	if err := clearRetiredTokens(ctx, store.db); err != nil {
+		return fmt.Errorf("clear retired tokens: %w", err)
+	}
+	f, err := recordDeployFence(ctx, store.db, time.Now())
+	if err != nil {
+		return err
+	}
+	b, _ := json.Marshal(f)
+	if err := writeSyncedFile(fencePath, append(b, '\n'), 0o600); err != nil {
+		return err
+	}
+	if snapshotPath == "" {
+		return nil
+	}
+	if _, err := os.Stat(snapshotPath); err == nil {
+		return fmt.Errorf("snapshot %s already exists", snapshotPath)
+	}
+	if _, err := store.db.ExecContext(ctx, `VACUUM INTO ?`, snapshotPath); err != nil {
+		return fmt.Errorf("snapshot: %w", err)
+	}
+	if err := os.Chmod(snapshotPath, 0o600); err != nil {
+		return err
+	}
+	// Plain open: no WAL pragma, so the snapshot file stays self-contained.
+	snap, err := sql.Open("sqlite", snapshotPath)
+	if err != nil {
+		return err
+	}
+	defer snap.Close()
+	var res string
+	if err := snap.QueryRowContext(ctx, `PRAGMA quick_check`).Scan(&res); err != nil || res != "ok" {
+		return fmt.Errorf("snapshot quick_check: %q %v", res, err)
+	}
+	return nil
+}
+
+func writeSyncedFile(path string, data []byte, mode os.FileMode) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, mode)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
 }

@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -128,5 +131,52 @@ func TestDeployFenceDetectsDurableWrites(t *testing.T) {
 				t.Fatalf("%s not detected (want %q): %v", name, c.want, w)
 			}
 		})
+	}
+}
+
+// Daybreak round 4 P1-02: fence first, then snapshot, under the exclusive
+// writers lock. A write that a writer managed to make before the lock is in
+// both (restore refused, which is safe); while the lock is held no writer
+// can start.
+func TestRecordFenceThenSnapshot(t *testing.T) {
+	server, store, _ := newReliabilityTestServer(t)
+	insertRetireFixture(t, server, "m_s", "s-box", "rt-sbox1111", 9251)
+	dir := t.TempDir()
+	fence := filepath.Join(dir, "fence.json")
+	snap := filepath.Join(dir, "snap.db")
+	if err := recordFenceAndSnapshot(context.Background(), store.path, fence, snap); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(fence)
+	var f deployFence
+	if err := json.Unmarshal(b, &f); err != nil || !f.JournalPresent {
+		t.Fatalf("fence %s %v", b, err)
+	}
+	// The snapshot contains everything up to the fence.
+	s2, err := OpenStore(snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	var n int
+	_ = s2.db.QueryRow(`SELECT COUNT(*) FROM machines WHERE id='m_s'`).Scan(&n)
+	if n != 1 {
+		t.Fatal("snapshot misses data written before the fence")
+	}
+	// A durable action after the fence is detected.
+	if _, err := server.prov.SetDesiredState(context.Background(), "m_s", DesiredDisabled, "t"); err != nil {
+		t.Fatal(err)
+	}
+	if w := durable(t, server, f); len(w) == 0 {
+		t.Fatal("action after the fence not detected")
+	}
+	// A running writer (shared lock) blocks the record step.
+	release, err := acquireWritersShared(store.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	if err := recordFenceAndSnapshot(context.Background(), store.path, filepath.Join(dir, "f2.json"), filepath.Join(dir, "s2.db")); err == nil {
+		t.Fatal("fence recorded while a writer held the lock")
 	}
 }

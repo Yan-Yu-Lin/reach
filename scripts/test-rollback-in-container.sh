@@ -21,6 +21,9 @@
 #      (daybreak P1-A / astra R2-02) -> the journal blocks the restore.
 #   G. carrier rollback restores /etc/reach/ws-carrier.env, or moves away
 #      the one this deploy added (astra R2-06).
+#   I. fuser is missing -> cannot prove nobody holds the DB -> stopped,
+#      DB untouched (astra R3-03).
+#   J. another SQLite client holds the DB -> stopped, DB untouched.
 #
 # Usage (from the repo root, Docker running): bash scripts/test-rollback-in-container.sh
 set -Eeuo pipefail
@@ -37,7 +40,7 @@ cp -R "$repo/scripts" "$work/scripts"
 cat > "$work/run.sh" <<'EOS'
 #!/usr/bin/env bash
 set -Eeuo pipefail
-apt-get -qq update >/dev/null && apt-get -qq install -y sqlite3 curl python3 sudo procps >/dev/null
+apt-get -qq update >/dev/null && apt-get -qq install -y sqlite3 curl python3 sudo procps psmisc >/dev/null
 # Work on the container's own filesystem: SQLite locking is unreliable on
 # the bind-mounted host volume.
 cp -R /w /work
@@ -109,12 +112,19 @@ scenario() { # name kind
   PUBLICATION_ARMED=0 DASHBOARD_SWAP_ARMED=0 CARRIER_STATE_SNAPSHOTTED=0 REACHD_UNIT_MUTATED=0 LIMITS_MUTATED=0
   stop_reachd_verified || fail "$1: initial stop"
   DB_BACKUP_DIR=/var/lib/reach/backups; DB_BACKUP_PATH=$DB_BACKUP_DIR/reach.db.$DEPLOY_TS
-  sqlite3 $DB_PATH ".backup '$DB_BACKUP_PATH'"
   cp $W/reachd-new /tmp/reachd-build
-  bash scripts/rehearse-rollback.sh /opt/reach/reachd /tmp/reachd-build "$DB_BACKUP_PATH" /etc/reach/config.yaml | tail -1
+  # As deploy-jason.sh: fence first, then the snapshot, under the writers lock.
   DEPLOY_FENCE=$DB_BACKUP_DIR/deploy-fence.$DEPLOY_TS.json
-  /tmp/reachd-build deploy-fence record --config /etc/reach/config.yaml --fence $DEPLOY_FENCE
+  /tmp/reachd-build deploy-fence record --config /etc/reach/config.yaml --fence $DEPLOY_FENCE --snapshot "$DB_BACKUP_PATH"
+  bash scripts/rehearse-rollback.sh /opt/reach/reachd /tmp/reachd-build "$DB_BACKUP_PATH" /etc/reach/config.yaml | tail -1
+  # A pre-deploy admin JWT, signed by the old binary with the old secret.
+  # (8c74086 has no admin-probe-token; the new binary signs with the same
+  # still-unrotated secret.)
+  pre_jwt="$($W/reachd-new admin-probe-token --config /etc/reach/config.yaml)"
   install_new_reachd
+  # As deploy-jason.sh: rotate jwt_secret while the session migration is
+  # still pending (daybreak round 4 P1-03).
+  "$PROBE_BIN" rotate-jwt-secret --config /etc/reach/config.yaml --if-session-migration-pending >/dev/null
   [ "$PROBE_BIN" = /var/lib/reach/deploy-backups/reachd-probe.$DEPLOY_TS ] || fail "$1: unexpected PROBE_BIN $PROBE_BIN"
   [ ! -e /tmp/reachd-build ] || fail "$1: build binary not consumed"
   DB_MAY_HAVE_MIGRATED=1
@@ -129,6 +139,11 @@ scenario() { # name kind
     noprobe) /usr/bin/rm -f "$PROBE_BIN" ;;
     stopfail) touch /tmp/fail-stop ;;
     forensic) touch /tmp/fail-forensic ;;
+    nofuser) mv /usr/bin/fuser /usr/bin/fuser.off ;;
+    holder)
+      # Another SQLite client keeps the DB open (a CLI, a backup script).
+      python3 -c "import sqlite3,time; c=sqlite3.connect('$DB_PATH'); c.execute('select 1').fetchall(); time.sleep(60)" &
+      holder_pid=$!; sleep 0.5 ;;
     auditfail)
       sqlite3 $DB_PATH "CREATE TRIGGER fail_audit BEFORE INSERT ON audit_log BEGIN SELECT RAISE(ABORT,'injected audit failure'); END;"
       echo "revoke-all with failing audit: $(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:9300/api/admin/sessions/revoke-all -H "Authorization: Bearer $adm")" ;;
@@ -146,11 +161,16 @@ scenario() { # name kind
   case "$2" in
     lazy)
       [ "$result" = running/200 ] || fail "A: expected old reachd running with legacy heartbeat 200"
+      # K (daybreak round 4 P1-03): the DB was rolled back, yet the
+      # pre-deploy JWT must stay invalid on the old binary.
+      code="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $pre_jwt" http://127.0.0.1:9300/api/admin/machines)"
+      [ "$code" = 401 ] || fail "K: pre-deploy JWT after rollback = $code"
+      echo "K: pre-deploy JWT after rollback: $code"
       cmp -s /opt/reach/reachd $W/reachd-old || fail "A: old binary not restored"
       [ -f /opt/reach/reachd.rollback.$DEPLOY_TS ] || fail "A: rollback backup was consumed"
       [ "$claimed" = 1 ] || fail "A: success not reported"
       [ -s $DB_BACKUP_DIR/failed.$DEPLOY_TS/reach.db ] || fail "A: forensic set missing" ;;
-    durable|auditfail|noprobe|forensic)
+    durable|auditfail|noprobe|forensic|nofuser|holder)
       [ "$result" = stopped ] || fail "$1: expected reachd left stopped"
       [ "$claimed" = 0 ] || fail "$1: rollback claimed success"
       [ "$(token_kind)" = "sha256:" ] || fail "$1: live DB was replaced by the snapshot" ;;
@@ -163,6 +183,8 @@ scenario() { # name kind
       [ "$claimed" = 0 ] || fail "D: rollback claimed success"
       /usr/bin/rm -f /tmp/fail-stop ;;
   esac
+  if [ "$2" = nofuser ]; then mv /usr/bin/fuser.off /usr/bin/fuser; fi
+  if [ "$2" = holder ]; then kill "$holder_pid" 2>/dev/null || true; wait "$holder_pid" 2>/dev/null || true; fi
   if [ "$2" = forensic ]; then
     [ ! -e $DB_BACKUP_DIR/failed.$DEPLOY_TS ] || fail "E: partial forensic set published"
   fi
@@ -200,8 +222,10 @@ echo "== C: probe/fence binary missing ==";          scenario C noprobe
 echo "== D: systemctl stop fails ==";                scenario D stopfail
 echo "== E: forensic copy fails ==";                 scenario E forensic
 echo "== F: revoke-all while audit inserts fail =="; scenario F auditfail
+echo "== I: fuser missing ==";                       scenario I nofuser
+echo "== J: another process holds the DB ==";        scenario J holder
 echo "== G: carrier env rollback ==";                carrier_env 1; carrier_env 0
-echo "PASS: rollback scenarios A-G"
+echo "PASS: rollback scenarios A-J"
 EOS
 chmod +x "$work/run.sh"
 docker run --rm -v "$work:/w" ubuntu:24.04 bash /w/run.sh

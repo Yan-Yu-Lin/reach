@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"strings"
 	"sync"
@@ -240,5 +241,96 @@ func TestDeployFenceOnPreJournalSchema(t *testing.T) {
 	// Old fence files (no journal fields) fail closed.
 	if _, err := durableWritesSince(context.Background(), store.db, deployFence{RecordedAt: f.RecordedAt}); err == nil {
 		t.Fatal("fence without journal information was accepted")
+	}
+}
+
+// Daybreak round 4 P2-01: consuming a setup token is journalled in the
+// same transaction; if the journal fails, the token stays unconsumed.
+func TestSetupTokenConsumptionIsJournalled(t *testing.T) {
+	server, store, cfg := newReliabilityTestServer(t)
+	id, secret := registerAndApprove(t, server, cfg, `{"mode":"system","local_port":22,"name":"journal-box"}`)
+	rec := doJSON(t, server, http.MethodPost, "/api/client/register/"+id+"/poll", `{"client_secret":"`+secret+`"}`, "")
+	var out struct {
+		SetupToken string `json:"setup_token"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &out)
+	if out.SetupToken == "" {
+		t.Fatalf("no setup token: %s", rec.Body.String())
+	}
+	f := fenceNow(t, server)
+	failJournal(t, store)
+	if _, _, err := server.consumeSetupToken(context.Background(), id, out.SetupToken); err == nil {
+		t.Fatal("token consumed although the journal failed")
+	}
+	var status string
+	_ = store.db.QueryRow(`SELECT status FROM requests WHERE id=?`, id).Scan(&status)
+	if status != "approved" {
+		t.Fatalf("status after failed consume = %s", status)
+	}
+	if _, err := store.db.Exec(`DROP TRIGGER fail_journal`); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := server.consumeSetupToken(context.Background(), id, out.SetupToken); err != nil {
+		t.Fatal(err)
+	}
+	if w := durable(t, server, f); !strings.Contains(strings.Join(w, "\n"), "request.provision.start") {
+		t.Fatalf("consumption not journalled: %v", w)
+	}
+}
+
+// Astra R3-02 / daybreak round 4 P2-05: a manual update-agent is a durable
+// operator decision; with the journal failing it is not queued at all.
+func TestManualUpdateIsJournalled(t *testing.T) {
+	for _, fault := range []string{"audit", "journal"} {
+		t.Run(fault, func(t *testing.T) {
+			s, store, cfg := newReliabilityTestServer(t)
+			insertRetireFixture(t, s, "m_manual", "manual-box", "rt-manual11", 9254)
+			s.cfg.AgentUpdates.Enabled = true
+			s.cfg.AgentUpdates.LatestVersion = "99.0.0"
+			admin, _ := adminTestToken(t, store, cfg)
+			f := fenceNow(t, s)
+			if fault == "audit" {
+				failAudit(t, store)
+			} else {
+				failJournal(t, store)
+			}
+			rec := doJSON(t, s, http.MethodPost, "/api/admin/machines/m_manual/update-agent", "", admin)
+			var commands int
+			_ = store.db.QueryRow(`SELECT COUNT(*) FROM agent_commands WHERE machine_id='m_manual' AND type='update_agent'`).Scan(&commands)
+			if fault == "audit" {
+				if rec.Code != 200 || commands != 1 {
+					t.Fatalf("manual update = %d, %d commands", rec.Code, commands)
+				}
+				if w := durable(t, s, f); !strings.Contains(strings.Join(w, "\n"), "agent_update.queue") {
+					t.Fatalf("manual update not journalled: %v", w)
+				}
+			} else if rec.Code == 200 || commands != 0 {
+				t.Fatalf("journal failure: HTTP %d, %d commands queued", rec.Code, commands)
+			}
+		})
+	}
+}
+
+// Daybreak round 4 P2-04: one open update command per machine, also under
+// concurrent requests.
+func TestOnlyOneOpenUpdatePerMachine(t *testing.T) {
+	s, store, cfg := newReliabilityTestServer(t)
+	insertRetireFixture(t, s, "m_one", "one-box", "rt-onebox11", 9255)
+	s.cfg.AgentUpdates.Enabled = true
+	s.cfg.AgentUpdates.LatestVersion = "99.0.0"
+	admin, _ := adminTestToken(t, store, cfg)
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			doJSON(t, s, http.MethodPost, "/api/admin/machines/m_one/update-agent", "", admin)
+		}()
+	}
+	wg.Wait()
+	var n int
+	_ = store.db.QueryRow(`SELECT COUNT(*) FROM agent_commands WHERE machine_id='m_one' AND type='update_agent' AND status='pending'`).Scan(&n)
+	if n != 1 {
+		t.Fatalf("%d open update commands", n)
 	}
 }
