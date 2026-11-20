@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { MachineWithTunnels } from '../app/composables/useReachApi'
-import { connectionChecks, DAY_MS, groupFleet, uiStatus } from '../app/utils/status'
+import { connectionChecks, DAY_MS, groupFleet, statusSentence, uiStatus } from '../app/utils/status'
 
 const NOW = Date.parse('2026-11-21T12:00:00Z')
 const ago = (ms: number) => new Date(NOW - ms).toISOString()
@@ -47,6 +47,12 @@ describe('uiStatus', () => {
     expect(uiStatus(machine({ desired_state: 'retiring', cleanup_state: 'timed_out', desired_changed_at: ago(60_000) }), NOW)).toBe('stuck')
     expect(uiStatus(machine({ desired_state: 'retiring', status: 'cleanup_failed' }), NOW)).toBe('failed')
     expect(uiStatus(machine({ desired_state: 'disabled', status: 'disable_failed' }), NOW)).toBe('failed')
+  })
+
+  it('tells the user to retry a failed disable, not to force retire', () => {
+    const item = machine({ desired_state: 'disabled', status: 'disable_failed', cleanup_state: 'disable_failed' })
+    expect(uiStatus(item, NOW)).toBe('failed')
+    expect(statusSentence(item, 'failed', NOW)).toMatch(/Retry disable/)
   })
 
   it('keeps disabled distinct from failure states (A10)', () => {

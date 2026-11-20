@@ -94,7 +94,7 @@ export type RequestRow = {
   denied_at?: string
   setup_token_expires_at?: string
   /** IP the server itself saw (newer servers). Trustworthy, unlike metadata.source_ip. */
-  observed_ip?: string
+  observed_ip?: string | null
   /** Fields the server binds at approval time (newer servers). Provision must match them. */
   slug?: string
   target_user?: string

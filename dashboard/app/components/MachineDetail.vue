@@ -160,6 +160,13 @@
         </div>
         <button type="button" class="btn btn-warn" @click="dialog = 'disable'">Disable</button>
       </div>
+      <div v-if="item.machine.desired_state === 'disabled' && status === 'failed'" class="dz-row dz-severe">
+        <div class="dz-text">
+          <strong>Retry disable</strong>
+          <p>The last disable did not finish on the hub, so the tunnel key may still work. Try again.</p>
+        </div>
+        <button type="button" class="btn btn-warn" @click="dialog = 'disable'">Retry disable</button>
+      </div>
       <div v-else-if="item.machine.desired_state === 'disabled'" class="dz-row">
         <div class="dz-text">
           <strong>Enable</strong>
@@ -176,7 +183,7 @@
         <button type="button" class="btn btn-danger" @click="dialog = 'remove'">Remove...</button>
       </div>
 
-      <div v-if="status === 'stuck' || status === 'failed' || item.machine.desired_state === 'retiring'" class="dz-row dz-severe">
+      <div v-if="status === 'stuck' || item.machine.desired_state === 'retiring' || (status === 'failed' && item.machine.desired_state !== 'disabled')" class="dz-row dz-severe">
         <div class="dz-text">
           <strong>Force retire</strong>
           <p>Finishes the removal on the hub without waiting for the agent. Use it when the machine is gone for good{{ status === 'failed' ? ', or to retry the failed cleanup' : '' }}.</p>

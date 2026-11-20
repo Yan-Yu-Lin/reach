@@ -172,6 +172,11 @@ export function statusSentence(item: MachineWithTunnels, status: UiStatus, now =
     case 'stuck':
       return 'Removal started but the agent never confirmed. Force retire finishes the hub-side cleanup.'
     case 'failed':
+      if (item.machine.status === 'disable_failed' || item.machine.cleanup_state === 'disable_failed') {
+        return item.machine.desired_state === 'disabled'
+          ? 'Disable did not finish: the hub could not block the tunnel key, so it may still work. Retry disable.'
+          : 'Removal could not block the tunnel key on the hub, so it may still work. Force retire tries again.'
+      }
       return 'Hub-side cleanup failed, so the tunnel account was kept. Force retire tries the cleanup again.'
     case 'retired':
       return 'Removed.'
