@@ -229,10 +229,18 @@ func TestRetireFinalizeIsAtomicAgainstOtherWriters(t *testing.T) {
 	insertRetireFixture(t, server, "m_x", "x-box", "rt-xbox1111", 9281)
 	server.prov.osOps = &bumpOnRemoveOS{store: store}
 	_, err := server.prov.SetDesiredState(context.Background(), "m_x", DesiredRetired, "retirer")
-	if !errors.Is(err, errConcurrentTransition) {
+	if !errors.Is(err, ErrCleanupFailed) {
 		t.Fatalf("retire error = %v", err)
 	}
 	assertMachineTunnelAgree(t, store, "m_x")
+	// The hub account is gone: the machine must not stay active with a
+	// valid token (astra R3-01 second schedule).
+	var desired, cleanup string
+	var token sql.NullString
+	_ = store.db.QueryRow(`SELECT desired_state,COALESCE(cleanup_state,''),agent_token_hash FROM machines WHERE id='m_x'`).Scan(&desired, &cleanup, &token)
+	if desired != DesiredRetiring || cleanup != CleanupFailed || token.Valid {
+		t.Fatalf("after lost retire CAS: desired=%s cleanup=%s token=%v", desired, cleanup, token.Valid)
+	}
 }
 
 func assertMachineTunnelAgree(t *testing.T, store *Store, id string) {

@@ -40,6 +40,8 @@ type Provisioner struct {
 	transitions  machineLocks
 	// listListeners overrides `ss -Htln` in tests.
 	listListeners func(context.Context) (map[int]bool, error)
+	// createAccount overrides createSystemAccount in tests.
+	createAccount func(ctx context.Context, unixUser string, port int, pubkey, expiresAt string) error
 }
 
 type CreateMachineInput struct {
@@ -177,14 +179,23 @@ func (p *Provisioner) CreateMachine(ctx context.Context, in CreateMachineInput) 
 	}
 	// Hold the machine lock through the OS phase so provisioning recovery
 	// (which retires through the same lock) cannot run alongside it.
-	unlock := p.transitions.lock(machineID)
+	unlock, err := p.lockMachine(machineID)
+	if err != nil {
+		return res, err
+	}
 	defer unlock()
 	if err := tx.Commit(); err != nil {
 		return res, err
 	}
 
-	if p.cfg.ProvisioningEnabled {
-		if err := p.createSystemAccount(ctx, unixUser, port, in.Pubkey, in.ExpiresAt); err != nil {
+	create := p.createSystemAccount
+	if p.createAccount != nil {
+		create = p.createAccount
+	} else if !p.cfg.ProvisioningEnabled {
+		create = nil
+	}
+	if create != nil {
+		if err := create(ctx, unixUser, port, in.Pubkey, in.ExpiresAt); err != nil {
 			// The tunnel row keeps status 'failed' and its port/user as a
 			// tombstone; the allocator never reuses non-retired rows.
 			p.markProvisionFailed(ctx, machineID, tunnelID, err)
@@ -200,6 +211,12 @@ func (p *Provisioner) CreateMachine(ctx context.Context, in CreateMachineInput) 
 		return res, err
 	}
 	if n, _ := up.RowsAffected(); n != 1 {
+		// Someone changed the machine without holding its lock (an older
+		// binary, a manual DB edit). Undo what this provision created,
+		// under our lock, and keep the tunnel row as a failed tombstone so
+		// its port and user stay reserved until cleanup is verified
+		// (astra R3-01).
+		p.compensateProvision(ctx, machineID, tunnelID, unixUser)
 		p.store.settleDurable(ctx, journalID, durableFailed)
 		return res, errProvisioningLeaseLost
 	}
@@ -210,6 +227,21 @@ func (p *Provisioner) CreateMachine(ctx context.Context, in CreateMachineInput) 
 	res.Hub = hub
 	res.AgentToken = agentToken
 	return res, nil
+}
+
+// compensateProvision removes the hub account a provision created after its
+// final DB update lost, and records the outcome. The tunnel row stays
+// non-retired, so the allocator keeps its port.
+func (p *Provisioner) compensateProvision(ctx context.Context, machineID, tunnelID, unixUser string) {
+	msg := "provision lost a concurrent change; hub account removed"
+	if err := p.ops().Remove(ctx, unixUser); err != nil {
+		msg = "provision lost a concurrent change; removing the hub account failed: " + err.Error()
+	} else if residue, err := p.ops().Residue(ctx, unixUser); err != nil || len(residue) > 0 {
+		msg = fmt.Sprintf("provision lost a concurrent change; hub residue remains: %v %v", residue, err)
+	}
+	_, _ = p.store.db.ExecContext(ctx, `UPDATE tunnels SET status='cleanup_failed' WHERE id=? AND status<>'retired'`, tunnelID)
+	_, _ = p.store.db.ExecContext(ctx, `UPDATE machines SET provision_error=?, updated_at=? WHERE id=?`, msg, nowUTC(), machineID)
+	p.store.Audit(ctx, "machine.provision_compensated", "system", machineID, msg)
 }
 
 func getHubTx(ctx context.Context, tx *sql.Tx, id string) (Hub, error) {
@@ -395,6 +427,23 @@ type machineLocks struct {
 	locks map[string]*sync.Mutex
 }
 
+// lockMachine takes the in-process mutex and the cross-process file lock of
+// one machine (astra R3-01). Every step that reads a machine, changes hub OS
+// state for it and records the result runs under it, so another reachd or
+// CLI instance cannot interleave its own OS phase.
+func (p *Provisioner) lockMachine(id string) (func(), error) {
+	unlock := p.transitions.lock(id)
+	if p.store == nil || p.store.path == "" {
+		return unlock, nil
+	}
+	unlockFile, err := lockMachineOS(p.store.path, id)
+	if err != nil {
+		unlock()
+		return nil, fmt.Errorf("machine lock: %w", err)
+	}
+	return func() { unlockFile(); unlock() }, nil
+}
+
 func (l *machineLocks) lock(id string) func() {
 	l.mu.Lock()
 	if l.locks == nil {
@@ -435,7 +484,10 @@ func (p *Provisioner) SetDesiredState(ctx context.Context, idOrSlug, desired, ac
 	if err != nil {
 		return Machine{}, err
 	}
-	unlock := p.transitions.lock(first.ID)
+	unlock, err := p.lockMachine(first.ID)
+	if err != nil {
+		return Machine{}, err
+	}
 	defer unlock()
 	// Re-read under the lock: the state may have changed while we waited.
 	m, tunnels, err := p.getMachineAndTunnels(ctx, first.ID)
@@ -642,6 +694,17 @@ func (p *Provisioner) retire(ctx context.Context, m Machine, tunnels []Tunnel, o
 		_, err := tx.ExecContext(ctx, `UPDATE agent_commands SET status='cancelled', last_error='machine retired' WHERE machine_id=? AND status IN ('pending','sent')`, m.ID)
 		return err
 	})
+	if errors.Is(err, errConcurrentTransition) {
+		// The hub account is already gone but someone changed the machine
+		// without its lock. Do not leave it looking active: record a
+		// retiring/cleanup_failed tombstone (ports stay reserved, the
+		// token is revoked) so retire-now finishes it (astra R3-01).
+		msg := "hub account removed but the machine changed concurrently; run retire-now again"
+		_, _ = p.store.db.ExecContext(ctx, `UPDATE tunnels SET status='cleanup_failed' WHERE machine_id=? AND status<>'retired'`, m.ID)
+		_, _ = p.store.db.ExecContext(ctx, `UPDATE machines SET desired_state=?, desired_generation=desired_generation+1, status=?, cleanup_state=?, provision_error=?, agent_token_hash=NULL, updated_at=? WHERE id=?`, DesiredRetiring, CleanupFailed, CleanupFailed, msg, now, m.ID)
+		p.store.Audit(ctx, "machine.cleanup_failed", actor, m.ID, msg)
+		return Machine{}, fmt.Errorf("%w: %s", ErrCleanupFailed, msg)
+	}
 	if err != nil {
 		return Machine{}, err
 	}
@@ -683,7 +746,10 @@ func (p *Provisioner) SetProcessTitleConfig(ctx context.Context, idOrSlug string
 	}
 	// Bumps desired_generation, so it takes the same per-machine lock as
 	// lifecycle transitions and writes with a generation CAS (astra R2-04).
-	unlock := p.transitions.lock(first.ID)
+	unlock, err := p.lockMachine(first.ID)
+	if err != nil {
+		return Machine{}, err
+	}
 	defer unlock()
 	m, err := p.GetMachine(ctx, first.ID)
 	if err != nil {

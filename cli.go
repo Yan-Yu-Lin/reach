@@ -69,10 +69,20 @@ func initApp(ctx context.Context, configPath string) (Config, *Store, *Provision
 	if err != nil {
 		return cfg, nil, nil, err
 	}
-	store, err := OpenStore(cfg.DBPath)
+	// Everything that migrates or mutates the DB holds the writers lock
+	// (shared) while it runs; a deployment takes it exclusively around its
+	// fence and snapshot, so no writer can slip in between (daybreak round
+	// 4 P1-02, astra R3-03).
+	release, err := acquireWritersShared(cfg.DBPath)
 	if err != nil {
 		return cfg, nil, nil, err
 	}
+	store, err := OpenStore(cfg.DBPath)
+	if err != nil {
+		release()
+		return cfg, nil, nil, err
+	}
+	store.releaseWriters = release
 	if err := store.Migrate(ctx, cfg); err != nil {
 		_ = store.Close()
 		return cfg, nil, nil, err

@@ -14,7 +14,13 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-type Store struct{ db *sql.DB }
+type Store struct {
+	db *sql.DB
+	// path is the database file; cross-process lock files live next to it.
+	path string
+	// releaseWriters drops the shared writers lock (see oslock.go).
+	releaseWriters func()
+}
 
 func OpenStore(path string) (*Store, error) {
 	if strings.Contains(path, "?") {
@@ -41,10 +47,17 @@ func OpenStore(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("open sqlite database: %w", err)
 	}
-	return &Store{db: db}, nil
+	return &Store{db: db, path: path}, nil
 }
 
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error {
+	err := s.db.Close()
+	if s.releaseWriters != nil {
+		s.releaseWriters()
+		s.releaseWriters = nil
+	}
+	return err
+}
 
 func (s *Store) CheckReady(ctx context.Context) error {
 	conn, err := s.db.Conn(ctx)
