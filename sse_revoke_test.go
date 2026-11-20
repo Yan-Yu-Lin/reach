@@ -220,3 +220,53 @@ func TestReplayByteCapForcesResnapshot(t *testing.T) {
 		t.Fatalf("byte cap not enforced: overflow=%v err=%v", overflow, err)
 	}
 }
+
+// Astra R2-12 / daybreak round 3 P3-A: at the global cap, a mac-agent
+// reconnect from another IP must not cancel the old stream and then be
+// rejected. Either it takes the old slot over, or nothing changes.
+func TestSingleStreamReplacementAtCapKeepsOneStream(t *testing.T) {
+	l := newStreamLimiter(1, 1, 8)
+	oldCtx, oldRelease, ok := l.acquire(context.Background(), "1.1.1.1", "sat", true)
+	if !ok {
+		t.Fatal("first stream rejected")
+	}
+	// Same credential, different IP, global cap 1: the old slot is handed
+	// over, so the new stream fits.
+	newCtx, newRelease, ok := l.acquire(context.Background(), "2.2.2.2", "sat", true)
+	if !ok {
+		t.Fatal("replacement rejected although it can take the old slot")
+	}
+	if oldCtx.Err() == nil {
+		t.Fatal("old stream not cancelled after replacement")
+	}
+	oldRelease() // the old handler exits: must not free the new slot
+	if _, _, ok := l.acquire(context.Background(), "3.3.3.3", "other", false); ok {
+		t.Fatal("old stream's release freed the new stream's slot")
+	}
+	if newCtx.Err() != nil {
+		t.Fatal("new stream cancelled")
+	}
+	newRelease()
+	if l.total != 0 || len(l.perIP) != 0 {
+		t.Fatalf("counters not back to zero: total=%d perIP=%v", l.total, l.perIP)
+	}
+}
+
+func TestRejectedReplacementKeepsIncumbent(t *testing.T) {
+	// Per-IP cap 1 on IP B is already used by another client; the Mac
+	// reconnecting from B cannot fit, so its old stream on A must survive.
+	l := newStreamLimiter(10, 1, 8)
+	oldCtx, _, ok := l.acquire(context.Background(), "A", "sat", true)
+	if !ok {
+		t.Fatal("first stream rejected")
+	}
+	if _, _, ok := l.acquire(context.Background(), "B", "dash", false); !ok {
+		t.Fatal("dashboard stream rejected")
+	}
+	if _, _, ok := l.acquire(context.Background(), "B", "sat", true); ok {
+		t.Fatal("replacement over the per-IP cap accepted")
+	}
+	if oldCtx.Err() != nil {
+		t.Fatal("rejected replacement cancelled the incumbent stream")
+	}
+}
