@@ -65,7 +65,6 @@ scenario() { # name, durable_action(0/1)
   rm -f /var/lib/reach/reach.db* /var/log/reachd.log
   install -m 0755 $W/reachd-old /opt/reach/reachd
   systemctl start reachd; systemctl stop reachd   # old version creates schema
-  echo "procs after stop: $(pgrep -af reachd || echo none)"; ls -la /var/lib/reach; ps -ef | grep -v grep | grep -i reach || true
   h="$(printf '%s' "$token" | $W/reachd-old hash-secret)"
   sqlite3 /var/lib/reach/reach.db "INSERT INTO machines (id,slug,original_slug,status,desired_state,observed_state,desired_generation,agent_token_hash,created_at) VALUES ('m_legacy','legacy-box','legacy-box','offline','active','offline',1,'$h','2026-01-01T00:00:00Z');"
 
@@ -96,13 +95,17 @@ scenario() { # name, durable_action(0/1)
   PUBLICATION_ARMED=0 DASHBOARD_SWAP_ARMED=0 CARRIER_STATE_SNAPSHOTTED=0 REACHD_UNIT_MUTATED=0 SERVICE_STOPPED=0
   ( ROLLBACK_EXIT_CODE=1 rollback_reachd ) 2>&1 | grep -E 'restoring|NOT restoring|operator|durable|audit' | head -5 || true
   if systemctl is-active --quiet reachd; then
-    echo "after rollback: reachd running, legacy heartbeat $(heartbeat)"
+    result="running/$(heartbeat)"
   else
-    echo "after rollback: reachd stopped (manual decision)"
+    result="stopped"
   fi
+  echo "after rollback: $result"
+  if [ "$2" = 0 ] && [ "$result" != "running/200" ]; then echo "FAIL A: expected old reachd running with legacy heartbeat 200"; exit 1; fi
+  if [ "$2" = 1 ] && [ "$result" != "stopped" ]; then echo "FAIL B: expected reachd left stopped for an operator"; exit 1; fi
 }
 echo "== A: failure after lazy token migration =="; scenario A 0
 echo "== B: failure after an operator disable  =="; scenario B 1
+echo "PASS: rollback scenarios A and B"
 EOS
 chmod +x "$work/run.sh"
 docker run --rm -v "$work:/w" ubuntu:24.04 bash /w/run.sh
