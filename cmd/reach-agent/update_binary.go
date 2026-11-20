@@ -256,6 +256,11 @@ func performBinaryUpdate(ctx context.Context, st reachInstallState, opt updateBi
 			apiURL = cfg.Heartbeat.APIURL
 		}
 	}
+	if apiURL != "" {
+		if err := validateAPIURL(apiURL); err != nil {
+			return err
+		}
+	}
 	if apiURL == "" && opt.CandidatePath == "" {
 		return fmt.Errorf("--api-url is required when the existing config does not provide heartbeat.api_url")
 	}

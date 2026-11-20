@@ -163,6 +163,9 @@ func installCommand(ctx context.Context, args []string) error {
 	default:
 		return fmt.Errorf("--transport must be auto, direct, or websocket")
 	}
+	if err := validateAPIURL(opt.APIURL); err != nil {
+		return err
+	}
 	if opt.Name == "" {
 		opt.Name = hostnameDefault()
 	}

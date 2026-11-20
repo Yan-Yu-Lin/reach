@@ -980,6 +980,9 @@ func (d *Daemon) sendHeartbeat(ctx context.Context, shutdown *ShutdownNotice) (H
 	if !d.cfg.Heartbeat.Enabled || d.cfg.Heartbeat.APIURL == "" || d.cfg.Heartbeat.Token == "" {
 		return HeartbeatResponse{}, errors.New("heartbeat disabled")
 	}
+	if err := validateAPIURL(d.cfg.Heartbeat.APIURL); err != nil {
+		return HeartbeatResponse{}, err
+	}
 	st := d.snapshot()
 	d.mu.Lock()
 	results := append([]CommandResult(nil), d.pendingResults...)
