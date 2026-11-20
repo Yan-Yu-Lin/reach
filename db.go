@@ -192,6 +192,20 @@ func (s *Store) Migrate(ctx context.Context, cfg Config) error {
 			used_by TEXT,
 			created_at TEXT NOT NULL
 		);`,
+		// Durable action journal (daybreak round 3 P1-A): one row per
+		// operator/enrollment decision, written in the same transaction as
+		// the decision (DB-only actions) or committed as an intent before
+		// any OS side effect. Deploy rollback refuses to restore a DB
+		// snapshot if any row was added after the deploy fence.
+		`CREATE TABLE IF NOT EXISTS durable_actions (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			kind TEXT NOT NULL,
+			machine_id TEXT,
+			actor TEXT,
+			state TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			updated_at TEXT
+		);`,
 		`CREATE TABLE IF NOT EXISTS audit_log (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			action TEXT NOT NULL,

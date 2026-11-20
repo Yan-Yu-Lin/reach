@@ -1,0 +1,244 @@
+package main
+
+import (
+	"context"
+	"net/http"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+// failAudit makes every audit_log insert fail, as in the astra R2-02 and
+// daybreak round 3 P1-A PoCs.
+func failAudit(t *testing.T, store *Store) {
+	t.Helper()
+	if _, err := store.db.Exec(`CREATE TRIGGER fail_audit BEFORE INSERT ON audit_log BEGIN SELECT RAISE(ABORT,'injected audit failure'); END;`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func failJournal(t *testing.T, store *Store) {
+	t.Helper()
+	if _, err := store.db.Exec(`CREATE TRIGGER fail_journal BEFORE INSERT ON durable_actions BEGIN SELECT RAISE(ABORT,'injected journal failure'); END;`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type durableCase struct {
+	path, body string
+	// effect reports whether the mutation itself was committed.
+	effect func(t *testing.T, store *Store) bool
+}
+
+func durableCases() map[string]durableCase {
+	desired := func(want string) func(*testing.T, *Store) bool {
+		return func(t *testing.T, store *Store) bool {
+			var d string
+			_ = store.db.QueryRow(`SELECT desired_state FROM machines WHERE id='m_d'`).Scan(&d)
+			return d == want
+		}
+	}
+	return map[string]durableCase{
+		"disable": {"/api/admin/machines/m_d/disable", "", desired(DesiredDisabled)},
+		"remove":  {"/api/admin/machines/m_d/remove", "", desired(DesiredRetiring)},
+		"revoke-all": {"/api/admin/sessions/revoke-all", "", func(t *testing.T, store *Store) bool {
+			var sv int
+			_ = store.db.QueryRow(`SELECT MAX(session_version) FROM users`).Scan(&sv)
+			return sv > 5 // fixture sets 5
+		}},
+		"update-policy": {"/api/admin/machines/m_d/update-policy", `{"update_policy":"auto"}`, func(t *testing.T, store *Store) bool {
+			var p string
+			_ = store.db.QueryRow(`SELECT update_policy FROM machines WHERE id='m_d'`).Scan(&p)
+			return p == "auto"
+		}},
+		"process-title": {"/api/admin/machines/m_d/process-title", `{"process_title_config":{"process_title":"x"}}`, func(t *testing.T, store *Store) bool {
+			var c string
+			_ = store.db.QueryRow(`SELECT COALESCE(process_title_config_json,'') FROM machines WHERE id='m_d'`).Scan(&c)
+			return c != ""
+		}},
+		"service-token": {"/api/admin/service-tokens", `{"label":"x"}`, func(t *testing.T, store *Store) bool {
+			var n int
+			_ = store.db.QueryRow(`SELECT COUNT(*) FROM service_tokens`).Scan(&n)
+			return n > 0
+		}},
+		"logout": {"/api/admin/logout", "", func(t *testing.T, store *Store) bool {
+			var n int
+			_ = store.db.QueryRow(`SELECT COUNT(*) FROM jwt_blacklist`).Scan(&n)
+			return n > 0
+		}},
+	}
+}
+
+// Astra R2-02 / daybreak P1-A: with audit inserts failing, every durable
+// action still succeeds AND still blocks an automatic snapshot restore.
+func TestDeployFenceDetectsDurableActionsWhenAuditFails(t *testing.T) {
+	for name, c := range durableCases() {
+		t.Run(name, func(t *testing.T) {
+			server, store, cfg := newReliabilityTestServer(t)
+			server.prov.osOps = &fakeTunnelOS{}
+			insertRetireFixture(t, server, "m_d", "d-box", "rt-dbox1111", 9250)
+			if _, err := store.db.Exec(`UPDATE users SET session_version=5`); err != nil {
+				t.Fatal(err)
+			}
+			admin, _ := adminTestToken(t, store, cfg)
+			f := fenceNow(t, server)
+			if _, err := store.db.Exec(`UPDATE machines SET created_at='2026-01-01T00:00:00Z'`); err != nil {
+				t.Fatal(err)
+			}
+			failAudit(t, store)
+			rec := doJSON(t, server, http.MethodPost, c.path, c.body, admin)
+			if rec.Code != 200 {
+				t.Fatalf("%s returned %d: %s", name, rec.Code, rec.Body.String())
+			}
+			if !c.effect(t, store) {
+				t.Fatalf("%s: mutation not committed", name)
+			}
+			w := durable(t, server, f)
+			if !strings.Contains(strings.Join(w, "\n"), "journal #") {
+				t.Fatalf("%s committed but the fence reports no journal entry: %v", name, w)
+			}
+		})
+	}
+}
+
+// If the journal row cannot be written, a DB-only durable action must not
+// happen at all (no unrecorded mutation) and the caller gets a 5xx.
+func TestDurableActionRollsBackWhenJournalFails(t *testing.T) {
+	for name, c := range durableCases() {
+		t.Run(name, func(t *testing.T) {
+			server, store, cfg := newReliabilityTestServer(t)
+			server.prov.osOps = &fakeTunnelOS{}
+			insertRetireFixture(t, server, "m_d", "d-box", "rt-dbox1111", 9250)
+			if _, err := store.db.Exec(`UPDATE users SET session_version=5`); err != nil {
+				t.Fatal(err)
+			}
+			admin, _ := adminTestToken(t, store, cfg)
+			failJournal(t, store)
+			rec := doJSON(t, server, http.MethodPost, c.path, c.body, admin)
+			if rec.Code < 500 {
+				t.Fatalf("%s returned %d with a failing journal", name, rec.Code)
+			}
+			if c.effect(t, store) {
+				t.Fatalf("%s: mutation committed without its journal row", name)
+			}
+		})
+	}
+}
+
+// recordingOS checks that the intent row exists before any OS side effect.
+type recordingOS struct {
+	fakeTunnelOS
+	store   *Store
+	mu      sync.Mutex
+	sawRows []int
+	enabled map[string]bool
+}
+
+func (r *recordingOS) note() {
+	var n int
+	_ = r.store.db.QueryRow(`SELECT COUNT(*) FROM durable_actions WHERE state='intent'`).Scan(&n)
+	r.mu.Lock()
+	r.sawRows = append(r.sawRows, n)
+	r.mu.Unlock()
+}
+func (r *recordingOS) EnableAuth(ctx context.Context, u string) error { r.note(); return nil }
+func (r *recordingOS) DisableAuth(ctx context.Context, u string) error {
+	r.note()
+	return r.fakeTunnelOS.DisableAuth(ctx, u)
+}
+func (r *recordingOS) Remove(ctx context.Context, u string) error {
+	r.note()
+	return r.fakeTunnelOS.Remove(ctx, u)
+}
+
+func TestOSActionsCommitIntentFirst(t *testing.T) {
+	for _, desired := range []string{DesiredActive, DesiredDisabled, DesiredRetired} {
+		t.Run(desired, func(t *testing.T) {
+			server, store, _ := newReliabilityTestServer(t)
+			ros := &recordingOS{store: store}
+			server.prov.osOps = ros
+			insertRetireFixture(t, server, "m_i", "i-box", "rt-ibox1111", 9251)
+			if desired == DesiredActive {
+				if _, err := store.db.Exec(`UPDATE machines SET desired_state='disabled',status='disabled'`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := server.prov.SetDesiredState(context.Background(), "m_i", desired, "t"); err != nil {
+				t.Fatal(err)
+			}
+			if len(ros.sawRows) == 0 {
+				t.Fatal("no OS call observed")
+			}
+			for _, n := range ros.sawRows {
+				if n < 1 {
+					t.Fatalf("OS side effect ran before its intent was committed (%v)", ros.sawRows)
+				}
+			}
+			var state string
+			_ = store.db.QueryRow(`SELECT state FROM durable_actions ORDER BY id DESC LIMIT 1`).Scan(&state)
+			if state != durableDone {
+				t.Fatalf("journal state after success = %q", state)
+			}
+		})
+	}
+	t.Run("journal failure blocks the OS step", func(t *testing.T) {
+		server, store, _ := newReliabilityTestServer(t)
+		ros := &recordingOS{store: store}
+		server.prov.osOps = ros
+		insertRetireFixture(t, server, "m_j", "j-box", "rt-jbox1111", 9252)
+		failJournal(t, store)
+		if _, err := server.prov.SetDesiredState(context.Background(), "m_j", DesiredDisabled, "t"); err == nil {
+			t.Fatal("disable succeeded without a journal intent")
+		}
+		if len(ros.sawRows) != 0 {
+			t.Fatal("OS side effect ran although the intent could not be recorded")
+		}
+	})
+}
+
+// An intent that never settled (crash between OS step and DB record) must
+// block the restore like a finished action.
+func TestDeployFenceBlocksOnOpenIntent(t *testing.T) {
+	server, store, _ := newReliabilityTestServer(t)
+	f := fenceNow(t, server)
+	if _, err := recordDurable(context.Background(), store.db, "machine.desired.active", "m_x", "t", durableIntent); err != nil {
+		t.Fatal(err)
+	}
+	w := durable(t, server, f)
+	if !strings.Contains(strings.Join(w, "\n"), "(intent)") {
+		t.Fatalf("open intent not reported: %v", w)
+	}
+}
+
+// A fence recorded on the pre-deploy schema (no journal yet) still works:
+// the new binary creates the table and every row in it is after the fence.
+func TestDeployFenceOnPreJournalSchema(t *testing.T) {
+	server, store, _ := newReliabilityTestServer(t)
+	if _, err := store.db.Exec(`DROP TABLE durable_actions`); err != nil {
+		t.Fatal(err)
+	}
+	f, err := recordDeployFence(context.Background(), store.db, time.Now().Add(-time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.JournalMaxID != 0 || !f.JournalPresent {
+		t.Fatalf("fence = %+v", f)
+	}
+	if w := durable(t, server, f); len(w) != 0 {
+		t.Fatalf("empty pre-journal DB reported writes: %v", w)
+	}
+	if _, err := store.db.Exec(`CREATE TABLE durable_actions (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, machine_id TEXT, actor TEXT, state TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := recordDurable(context.Background(), store.db, "sessions.revoke_all", "", "t", durableDone); err != nil {
+		t.Fatal(err)
+	}
+	if w := durable(t, server, f); len(w) == 0 {
+		t.Fatal("journal row after a pre-journal fence not reported")
+	}
+	// Old fence files (no journal fields) fail closed.
+	if _, err := durableWritesSince(context.Background(), store.db, deployFence{RecordedAt: f.RecordedAt}); err == nil {
+		t.Fatal("fence without journal information was accepted")
+	}
+}

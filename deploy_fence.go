@@ -29,15 +29,32 @@ import (
 //     revoke, logout and revoke-all, process title / update policy changes.
 //
 // `deploy-fence record` stores high-water marks before the new binary
-// starts; `deploy-fence check` lists durable writes made after them. The
+// starts; `deploy-fence check` lists durable actions made after them. The
 // deploy script restores the snapshot only when check reports none.
-// Every durable action above either writes audit_log or one of the
-// timestamped columns checked below; the classification is unit-tested
-// against the real handlers.
+//
+// The decision rests on the durable_actions journal (durable.go): every
+// durable action writes its row in the same transaction as the mutation,
+// or as an intent before an OS side effect, so a successful action always
+// leaves a row (daybreak round 3 P1-A, astra R2-02). The older audit and
+// timestamp probes are kept as an extra, never as the only, signal: they
+// can add blockers, they cannot clear one.
 
 type deployFence struct {
 	RecordedAt string `json:"recorded_at"`
 	AuditMaxID int64  `json:"audit_max_id"`
+	// JournalMaxID is MAX(durable_actions.id) at record time; 0 when the
+	// table did not exist yet (the fence is recorded on the pre-deploy
+	// schema, before the new binary migrates it).
+	JournalMaxID int64 `json:"journal_max_id"`
+	// JournalPresent is false when the fence was recorded without the
+	// journal; check then fails closed if the table is missing too.
+	JournalPresent bool `json:"journal_present"`
+}
+
+func tableExists(ctx context.Context, db *sql.DB, table string) (bool, error) {
+	var n int
+	err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&n)
+	return n > 0, err
 }
 
 // discardableAudit are audit actions written by automatic processes whose
@@ -47,9 +64,18 @@ var discardableAudit = map[string]bool{
 }
 
 func recordDeployFence(ctx context.Context, db *sql.DB, now time.Time) (deployFence, error) {
-	f := deployFence{RecordedAt: now.UTC().Format(time.RFC3339)}
+	f := deployFence{RecordedAt: now.UTC().Format(time.RFC3339), JournalPresent: true}
 	if err := db.QueryRowContext(ctx, `SELECT COALESCE(MAX(id),0) FROM audit_log`).Scan(&f.AuditMaxID); err != nil {
 		return f, err
+	}
+	ok, err := tableExists(ctx, db, "durable_actions")
+	if err != nil {
+		return f, err
+	}
+	if ok {
+		if err := db.QueryRowContext(ctx, `SELECT COALESCE(MAX(id),0) FROM durable_actions`).Scan(&f.JournalMaxID); err != nil {
+			return f, err
+		}
 	}
 	return f, nil
 }
@@ -76,6 +102,37 @@ func columnExists(ctx context.Context, db *sql.DB, table, column string) bool {
 // that matters.
 func durableWritesSince(ctx context.Context, db *sql.DB, f deployFence) ([]string, error) {
 	var out []string
+	if !f.JournalPresent {
+		return nil, errors.New("fence predates the durable action journal; cannot prove the snapshot is safe")
+	}
+	ok, err := tableExists(ctx, db, "durable_actions")
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		// The new binary never migrated the DB, so it cannot have taken a
+		// durable action through reachd.
+		if f.JournalMaxID != 0 {
+			return nil, errors.New("durable_actions table disappeared after the fence")
+		}
+	} else {
+		jr, err := db.QueryContext(ctx, `SELECT id,kind,COALESCE(actor,''),COALESCE(machine_id,''),state,created_at FROM durable_actions WHERE id>? ORDER BY id`, f.JournalMaxID)
+		if err != nil {
+			return nil, err
+		}
+		for jr.Next() {
+			var id int64
+			var kind, actor, machine, state, at string
+			if err := jr.Scan(&id, &kind, &actor, &machine, &state, &at); err != nil {
+				_ = jr.Close()
+				return nil, err
+			}
+			out = append(out, fmt.Sprintf("journal #%d %s (%s) by %s machine=%s at %s", id, kind, state, actor, machine, at))
+		}
+		if err := jr.Close(); err != nil {
+			return nil, err
+		}
+	}
 	rows, err := db.QueryContext(ctx, `SELECT id,action,COALESCE(actor,''),COALESCE(machine_id,''),created_at FROM audit_log WHERE id>? ORDER BY id`, f.AuditMaxID)
 	if err != nil {
 		return nil, err

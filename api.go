@@ -432,6 +432,15 @@ func (s *Server) insertRequestClaimingInvite(ctx context.Context, requestID, nam
 		if n, _ := res.RowsAffected(); n != 1 {
 			return errInviteAlreadyClaimed
 		}
+		if _, err := recordDurable(ctx, tx, "invite.claim", "", requestID, durableDone); err != nil {
+			return err
+		}
+	}
+	if approvedAt != nil {
+		// God-code registrations are approved on arrival.
+		if _, err := recordDurable(ctx, tx, "request.auto_approve", "", requestID, durableDone); err != nil {
+			return err
+		}
 	}
 	// Release reservations held by requests that have quietly expired, so
 	// an abandoned request does not block its slug until maintenance runs.
@@ -1433,18 +1442,27 @@ func (s *Server) handleRevokeAllSessions(w http.ResponseWriter, r *http.Request)
 			return
 		}
 	}
-	if _, err := s.store.db.ExecContext(r.Context(), `UPDATE users SET session_version=session_version+1 WHERE id=?`, claims.UserID); err != nil {
+	revokedServices := int64(0)
+	// The bump, the service-token revocation and the journal row commit
+	// together; if the journal row fails nothing is revoked and the caller
+	// sees 500, so a deploy rollback can never resurrect these sessions.
+	err := s.store.durableTx(r.Context(), "sessions.revoke_all", "", claims.Username, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(r.Context(), `UPDATE users SET session_version=session_version+1 WHERE id=?`, claims.UserID); err != nil {
+			return err
+		}
+		if req.IncludeServiceTokens {
+			res, err := tx.ExecContext(r.Context(), `UPDATE service_tokens SET revoked_at=? WHERE revoked_at IS NULL`, nowUTC())
+			if err != nil {
+				return err
+			}
+			revokedServices, _ = res.RowsAffected()
+		}
+		return nil
+	})
+	if err != nil {
+		log.Printf("revoke-all: %v", err)
 		writeErr(w, 500, "revoke failed")
 		return
-	}
-	revokedServices := int64(0)
-	if req.IncludeServiceTokens {
-		res, err := s.store.db.ExecContext(r.Context(), `UPDATE service_tokens SET revoked_at=? WHERE revoked_at IS NULL`, nowUTC())
-		if err != nil {
-			writeErr(w, 500, "revoke failed")
-			return
-		}
-		revokedServices, _ = res.RowsAffected()
 	}
 	s.revocations.notify()
 	s.store.Audit(r.Context(), "sessions.revoke_all", claims.Username, "", fmt.Sprintf("service_tokens=%d", revokedServices))
@@ -1492,7 +1510,10 @@ func (s *Server) handleCreateServiceToken(w http.ResponseWriter, r *http.Request
 		return
 	}
 	now := nowUTC()
-	_, err = s.store.db.ExecContext(r.Context(), `INSERT INTO service_tokens (id,label,token_hash,role,created_by,created_at) VALUES (?,?,?,?,?,?)`, id, label, TokenHash(tok), role, claims.Username, now)
+	err = s.store.durableTx(r.Context(), "service_token.create", "", claims.Username, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(r.Context(), `INSERT INTO service_tokens (id,label,token_hash,role,created_by,created_at) VALUES (?,?,?,?,?,?)`, id, label, TokenHash(tok), role, claims.Username, now)
+		return err
+	})
 	if err != nil {
 		writeErr(w, 500, "could not persist token")
 		return
@@ -1558,28 +1579,44 @@ func (s *Server) handleAdminRequestAction(w http.ResponseWriter, r *http.Request
 	case "approve":
 		// An expired request cannot be approved even before maintenance
 		// marks it (daybreak P2-4).
-		res, err := s.store.db.ExecContext(r.Context(), `UPDATE requests SET status='approved', setup_token_hash=NULL, setup_token_expires_at=NULL, approved_at=? WHERE id=? AND status='pending' AND expires_at>?`, now, id, now)
-		if err != nil {
-			writeErr(w, 500, "approve failed")
+		err := s.store.durableTx(r.Context(), "request.approve", "", claims.Username, func(tx *sql.Tx) error {
+			res, err := tx.ExecContext(r.Context(), `UPDATE requests SET status='approved', setup_token_hash=NULL, setup_token_expires_at=NULL, approved_at=? WHERE id=? AND status='pending' AND expires_at>?`, now, id, now)
+			if err != nil {
+				return err
+			}
+			if n, _ := res.RowsAffected(); n == 0 {
+				return sql.ErrNoRows
+			}
+			return nil
+		})
+		if errors.Is(err, sql.ErrNoRows) {
+			writeErr(w, 404, "pending, unexpired request not found")
 			return
 		}
-		n, _ := res.RowsAffected()
-		if n == 0 {
-			writeErr(w, 404, "pending, unexpired request not found")
+		if err != nil {
+			writeErr(w, 500, "approve failed")
 			return
 		}
 		s.store.Audit(r.Context(), "request.approve", claims.Username, "", "request="+id)
 		s.publishEvent(r.Context(), "request.approved", "", map[string]any{"request_id": id})
 		writeJSON(w, 200, map[string]any{"request_id": id, "status": "approved"})
 	case "deny":
-		res, err := s.store.db.ExecContext(r.Context(), `UPDATE requests SET status='denied', denied_at=? WHERE id=? AND status='pending'`, now, id)
-		if err != nil {
-			writeErr(w, 500, "deny failed")
+		err := s.store.durableTx(r.Context(), "request.deny", "", claims.Username, func(tx *sql.Tx) error {
+			res, err := tx.ExecContext(r.Context(), `UPDATE requests SET status='denied', denied_at=? WHERE id=? AND status='pending'`, now, id)
+			if err != nil {
+				return err
+			}
+			if n, _ := res.RowsAffected(); n == 0 {
+				return sql.ErrNoRows
+			}
+			return nil
+		})
+		if errors.Is(err, sql.ErrNoRows) {
+			writeErr(w, 404, "pending request not found")
 			return
 		}
-		n, _ := res.RowsAffected()
-		if n == 0 {
-			writeErr(w, 404, "pending request not found")
+		if err != nil {
+			writeErr(w, 500, "deny failed")
 			return
 		}
 		s.store.Audit(r.Context(), "request.deny", claims.Username, "", "request="+id)
@@ -1711,11 +1748,28 @@ func (s *Server) handleAdminMachineUpdatePolicy(w http.ResponseWriter, r *http.R
 	}
 	m, err := s.prov.SetUpdatePolicy(r.Context(), id, policy, actor)
 	if err != nil {
-		writeErr(w, 400, err.Error())
+		writeMachineSettingErr(w, "update policy", err)
 		return
 	}
 	s.publishEvent(r.Context(), "machine.update_policy_changed", m.ID, map[string]any{"machine_id": m.ID, "slug": m.Slug, "update_policy": m.UpdatePolicy})
 	writeJSON(w, 200, map[string]any{"machine": m})
+}
+
+// writeMachineSettingErr maps setting errors: bad input 400, unknown
+// machine 404, concurrent change 409, storage/journal failure 500 (the
+// change was not made).
+func writeMachineSettingErr(w http.ResponseWriter, what string, err error) {
+	switch {
+	case errors.Is(err, errInvalidInput):
+		writeErr(w, 400, err.Error())
+	case errors.Is(err, sql.ErrNoRows):
+		writeErr(w, 404, "machine not found")
+	case errors.Is(err, errConcurrentTransition):
+		writeErr(w, 409, err.Error())
+	default:
+		log.Printf("%s: %v", what, err)
+		writeErr(w, 500, what+" change failed")
+	}
 }
 
 func (s *Server) handleAdminMachineProcessTitle(w http.ResponseWriter, r *http.Request, id, actor string) {
@@ -1728,7 +1782,7 @@ func (s *Server) handleAdminMachineProcessTitle(w http.ResponseWriter, r *http.R
 	}
 	m, err := s.prov.SetProcessTitleConfig(r.Context(), id, req.ProcessTitleConfig, actor)
 	if err != nil {
-		writeErr(w, 400, err.Error())
+		writeMachineSettingErr(w, "process title", err)
 		return
 	}
 	s.publishEvent(r.Context(), "machine.desired_changed", m.ID, map[string]any{"machine_id": m.ID, "desired_state": m.DesiredState, "generation": m.DesiredGeneration, "reason": "process_title"})
@@ -1897,14 +1951,18 @@ func (s *Server) parseServiceToken(ctx context.Context, token string) (*Claims, 
 }
 
 func (s *Server) revokeServiceToken(ctx context.Context, token string) error {
-	_, err := s.store.db.ExecContext(ctx, `UPDATE service_tokens SET revoked_at=? WHERE token_hash=? AND revoked_at IS NULL`, nowUTC(), TokenHash(token))
-	return err
+	return s.store.durableTx(ctx, "service_token.revoke", "", "", func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE service_tokens SET revoked_at=? WHERE token_hash=? AND revoked_at IS NULL`, nowUTC(), TokenHash(token))
+		return err
+	})
 }
 
 func (s *Server) blacklistJWT(ctx context.Context, token string, expiresAt time.Time) error {
 	now := time.Now().UTC()
-	_, err := s.store.db.ExecContext(ctx, `INSERT OR REPLACE INTO jwt_blacklist (token_hash,expires_at,created_at) VALUES (?,?,?)`, TokenHash(token), expiresAt.UTC().Format(time.RFC3339), now.Format(time.RFC3339))
-	return err
+	return s.store.durableTx(ctx, "session.logout", "", "", func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO jwt_blacklist (token_hash,expires_at,created_at) VALUES (?,?,?)`, TokenHash(token), expiresAt.UTC().Format(time.RFC3339), now.Format(time.RFC3339))
+		return err
+	})
 }
 
 func (s *Server) isJWTBlacklisted(ctx context.Context, token string) (bool, error) {

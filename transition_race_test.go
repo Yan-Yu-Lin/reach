@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"net/http"
 	"sync"
@@ -156,5 +157,136 @@ func TestEnableCompensatesWhenRecordFails(t *testing.T) {
 	_ = store.db.QueryRow(`SELECT desired_state FROM machines WHERE id='m_comp'`).Scan(&desired)
 	if desired != DesiredDisabled {
 		t.Fatalf("desired_state = %s", desired)
+	}
+}
+
+// pauseRemoveOS pauses retire inside Remove.
+type pauseRemoveOS struct {
+	fakeTunnelOS
+	entered chan struct{}
+	proceed chan struct{}
+}
+
+func (o *pauseRemoveOS) Remove(ctx context.Context, u string) error {
+	o.entered <- struct{}{}
+	<-o.proceed
+	return o.fakeTunnelOS.Remove(ctx, u)
+}
+
+// Astra R2-04: a process-title change during a paused retire must not let
+// the retire commit retired tunnels under a machine that stays active.
+// The title change waits for the machine lock; either way, machine and
+// tunnel rows must agree.
+func TestProcessTitleCannotSplitRetire(t *testing.T) {
+	server, store, _ := newReliabilityTestServer(t)
+	insertRetireFixture(t, server, "m_pt", "pt-box", "rt-ptbox111", 9280)
+	ops := &pauseRemoveOS{entered: make(chan struct{}, 1), proceed: make(chan struct{})}
+	server.prov.osOps = ops
+	retireErr := make(chan error, 1)
+	go func() {
+		_, err := server.prov.SetDesiredState(context.Background(), "m_pt", DesiredRetired, "retirer")
+		retireErr <- err
+	}()
+	<-ops.entered
+	titleErr := make(chan error, 1)
+	go func() {
+		_, err := server.prov.SetProcessTitleConfig(context.Background(), "m_pt", &ProcessTitleConfig{ProcessTitle: "x"}, "editor")
+		titleErr <- err
+	}()
+	select {
+	case err := <-titleErr:
+		t.Fatalf("process-title ran while retire held the machine (err=%v)", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(ops.proceed)
+	if err := <-retireErr; err != nil {
+		t.Fatalf("retire: %v", err)
+	}
+	if err := <-titleErr; err == nil {
+		t.Fatal("process-title on a retired machine succeeded")
+	}
+	assertMachineTunnelAgree(t, store, "m_pt")
+}
+
+// Cross-process writers do not share the in-process lock: if the
+// generation changes under a retire (e.g. reachd CLI), the finalize must
+// roll back as a whole.
+type bumpOnRemoveOS struct {
+	fakeTunnelOS
+	store *Store
+}
+
+func (o *bumpOnRemoveOS) Remove(ctx context.Context, u string) error {
+	_, err := o.store.db.Exec(`UPDATE machines SET desired_generation=desired_generation+1`)
+	if err != nil {
+		return err
+	}
+	return o.fakeTunnelOS.Remove(ctx, u)
+}
+
+func TestRetireFinalizeIsAtomicAgainstOtherWriters(t *testing.T) {
+	server, store, _ := newReliabilityTestServer(t)
+	insertRetireFixture(t, server, "m_x", "x-box", "rt-xbox1111", 9281)
+	server.prov.osOps = &bumpOnRemoveOS{store: store}
+	_, err := server.prov.SetDesiredState(context.Background(), "m_x", DesiredRetired, "retirer")
+	if !errors.Is(err, errConcurrentTransition) {
+		t.Fatalf("retire error = %v", err)
+	}
+	assertMachineTunnelAgree(t, store, "m_x")
+}
+
+func assertMachineTunnelAgree(t *testing.T, store *Store, id string) {
+	t.Helper()
+	var desired, mstatus string
+	var token sql.NullString
+	if err := store.db.QueryRow(`SELECT desired_state,status,agent_token_hash FROM machines WHERE id=?`, id).Scan(&desired, &mstatus, &token); err != nil {
+		t.Fatal(err)
+	}
+	var tstatus string
+	var port int
+	if err := store.db.QueryRow(`SELECT status,remote_port FROM tunnels WHERE machine_id=?`, id).Scan(&tstatus, &port); err != nil {
+		t.Fatal(err)
+	}
+	machineRetired := desired == DesiredRetired && mstatus == "retired" && !token.Valid
+	tunnelRetired := tstatus == "retired" && port < 0
+	if machineRetired != tunnelRetired {
+		t.Fatalf("split state: desired=%s machine=%s token=%v tunnel=%s port=%d", desired, mstatus, token.Valid, tstatus, port)
+	}
+}
+
+// Astra R2 note: a failed compensation must be visible, not only logged.
+type compFailOS struct {
+	fakeTunnelOS
+	calls int
+}
+
+func (o *compFailOS) EnableAuth(context.Context, string) error {
+	o.calls++
+	if o.calls == 2 {
+		return errors.New("second enable failed")
+	}
+	return nil
+}
+func (o *compFailOS) DisableAuth(context.Context, string) error {
+	return errors.New("compensation failed")
+}
+
+func TestFailedCompensationIsRecorded(t *testing.T) {
+	server, store, _ := newReliabilityTestServer(t)
+	insertRetireFixture(t, server, "m_c", "c-box", "rt-cbox1111", 9282)
+	if _, err := store.db.Exec(`INSERT INTO tunnels(id,machine_id,hub_id,unix_user,original_unix_user,remote_port,original_remote_port,tunnel_pubkey,status,created_at) VALUES ('t_c2','m_c','primary','rt-cbox2222','rt-cbox2222',9283,9283,'ssh-ed25519 x','disabled',?)`, nowUTC()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`UPDATE machines SET desired_state='disabled',status='disabled' WHERE id='m_c'`); err != nil {
+		t.Fatal(err)
+	}
+	server.prov.osOps = &compFailOS{}
+	if _, err := server.prov.SetDesiredState(context.Background(), "m_c", DesiredActive, "t"); !errors.Is(err, ErrCleanupFailed) {
+		t.Fatalf("enable error = %v", err)
+	}
+	var status string
+	_ = store.db.QueryRow(`SELECT status FROM machines WHERE id='m_c'`).Scan(&status)
+	if status != DisableFailed {
+		t.Fatalf("status after failed compensation = %s", status)
 	}
 }

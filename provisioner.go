@@ -164,6 +164,11 @@ func (p *Provisioner) CreateMachine(ctx context.Context, in CreateMachineInput) 
 			return res, err
 		}
 	}
+	// Intent row commits with the machine row, before any OS change.
+	journalID, err := recordDurable(ctx, tx, "machine.provision", machineID, "system", durableIntent)
+	if err != nil {
+		return res, err
+	}
 	if err := tx.Commit(); err != nil {
 		return res, err
 	}
@@ -176,6 +181,7 @@ func (p *Provisioner) CreateMachine(ctx context.Context, in CreateMachineInput) 
 			if cerr := p.ops().Remove(ctx, unixUser); cerr != nil {
 				log.Printf("cleanup after failed provision of %s: %v", unixUser, cerr)
 			}
+			p.store.settleDurable(ctx, journalID, durableFailed)
 			return res, err
 		}
 	}
@@ -183,6 +189,7 @@ func (p *Provisioner) CreateMachine(ctx context.Context, in CreateMachineInput) 
 	if err != nil {
 		return res, err
 	}
+	p.store.settleDurable(ctx, journalID, durableDone)
 	p.store.Audit(ctx, "machine.create", "system", machineID, fmt.Sprintf("slug=%s tunnel=%s port=%d", in.Slug, unixUser, port))
 	res.Machine, _ = p.GetMachine(ctx, machineID)
 	res.Tunnel, _ = p.GetTunnel(ctx, tunnelID)
@@ -363,6 +370,10 @@ func tunnelCleanupUser(t Tunnel) string {
 // machine between our read and our write.
 var errConcurrentTransition = errors.New("machine changed concurrently; retry")
 
+// errInvalidInput marks caller mistakes (HTTP 400), as opposed to storage
+// failures (HTTP 5xx).
+var errInvalidInput = errors.New("invalid input")
+
 // machineLocks serialises lifecycle transitions per machine so OS revoke /
 // restore steps and their DB records cannot interleave (daybreak P1-1).
 type machineLocks struct {
@@ -388,7 +399,14 @@ func (l *machineLocks) lock(id string) func() {
 // casMachine runs a machines UPDATE that must match the generation read at
 // the start of the transition; anything else means a concurrent writer.
 func (p *Provisioner) casMachine(ctx context.Context, oldGen int64, query string, args ...any) error {
-	res, err := p.store.db.ExecContext(ctx, query+` AND desired_generation=?`, append(args, oldGen)...)
+	return casMachineTx(ctx, p.store.db, oldGen, query, args...)
+}
+
+// casMachineTx is casMachine inside a caller's transaction. The generation
+// check is in the database, so writers in other processes (reachd CLI)
+// are caught too, not only goroutines sharing the in-process lock.
+func casMachineTx(ctx context.Context, ex sqlExecer, oldGen int64, query string, args ...any) error {
+	res, err := ex.ExecContext(ctx, query+` AND desired_generation=?`, append(args, oldGen)...)
 	if err != nil {
 		return err
 	}
@@ -410,6 +428,28 @@ func (p *Provisioner) SetDesiredState(ctx context.Context, idOrSlug, desired, ac
 	if err != nil {
 		return Machine{}, err
 	}
+	switch desired {
+	case DesiredActive, DesiredDisabled, DesiredRetiring, DesiredRetired:
+	default:
+		return Machine{}, fmt.Errorf("invalid desired state %q", desired)
+	}
+	// Commit the intent before any OS change (daybreak round 3 P1-A). If it
+	// cannot be recorded, nothing happens.
+	journalID, err := recordDurable(ctx, p.store.db, "machine.desired."+desired, m.ID, actor, durableIntent)
+	if err != nil {
+		return Machine{}, err
+	}
+	out, err := p.setDesiredStateLocked(ctx, m, tunnels, desired, actor)
+	if err != nil {
+		p.store.settleDurable(ctx, journalID, durableFailed)
+	} else {
+		p.store.settleDurable(ctx, journalID, durableDone)
+	}
+	return out, err
+}
+
+func (p *Provisioner) setDesiredStateLocked(ctx context.Context, m Machine, tunnels []Tunnel, desired, actor string) (Machine, error) {
+	var err error
 	now := nowUTC()
 	oldGen := m.DesiredGeneration
 	gen := oldGen + 1
@@ -421,21 +461,24 @@ func (p *Provisioner) SetDesiredState(ctx context.Context, idOrSlug, desired, ac
 				continue
 			}
 			if err := p.ops().EnableAuth(ctx, t.UnixUser); err != nil {
-				p.compensateEnable(ctx, enabled)
+				p.compensateEnable(ctx, m.ID, enabled)
 				p.store.Audit(ctx, "machine.enable_failed", actor, m.ID, err.Error())
 				return Machine{}, fmt.Errorf("%w: enable %s: %v", ErrCleanupFailed, t.UnixUser, err)
 			}
 			enabled = append(enabled, t.UnixUser)
 		}
-		err = p.casMachine(ctx, oldGen, `UPDATE machines SET desired_state=?, desired_generation=?, desired_changed_at=?, desired_changed_by=?, status=CASE WHEN observed_state='online' THEN 'online' ELSE 'offline' END, disabled_at=NULL, cleanup_state=NULL, updated_at=? WHERE id=?`, desired, gen, now, actor, now, m.ID)
+		err = p.inTx(ctx, func(tx *sql.Tx) error {
+			if err := casMachineTx(ctx, tx, oldGen, `UPDATE machines SET desired_state=?, desired_generation=?, desired_changed_at=?, desired_changed_by=?, status=CASE WHEN observed_state='online' THEN 'online' ELSE 'offline' END, disabled_at=NULL, cleanup_state=NULL, updated_at=? WHERE id=?`, desired, gen, now, actor, now, m.ID); err != nil {
+				return err
+			}
+			_, err := tx.ExecContext(ctx, `UPDATE tunnels SET status='offline' WHERE machine_id=? AND status='disabled'`, m.ID)
+			return err
+		})
 		if err != nil {
 			// Access was restored but not recorded: take it away again
 			// so DB and hub never disagree in the permissive direction.
-			p.compensateEnable(ctx, enabled)
+			p.compensateEnable(ctx, m.ID, enabled)
 			return Machine{}, err
-		}
-		if err == nil {
-			_, _ = p.store.db.ExecContext(ctx, `UPDATE tunnels SET status='offline' WHERE machine_id=? AND status='disabled'`, m.ID)
 		}
 		_ = p.QueueCommand(ctx, m.ID, gen, "sync_keys", map[string]any{"enabled": true}, time.Hour)
 		_ = p.QueueCommand(ctx, m.ID, gen, "start_tunnel", nil, time.Hour)
@@ -450,13 +493,21 @@ func (p *Provisioner) SetDesiredState(ctx context.Context, idOrSlug, desired, ac
 			p.publish("machine.cleanup_failed", m.ID, map[string]any{"machine_id": m.ID, "cleanup_state": DisableFailed, "desired_state": desired})
 			return Machine{}, fmt.Errorf("%w: %s", ErrCleanupFailed, msg)
 		}
-		if desired == DesiredDisabled {
-			err = p.casMachine(ctx, oldGen, `UPDATE machines SET desired_state=?, desired_generation=?, desired_changed_at=?, desired_changed_by=?, status='disabled', disabled_at=?, cleanup_state=NULL, provision_error=NULL, updated_at=? WHERE id=?`, desired, gen, now, actor, now, now, m.ID)
-		} else {
-			err = p.casMachine(ctx, oldGen, `UPDATE machines SET desired_state=?, desired_generation=?, desired_changed_at=?, desired_changed_by=?, status='retiring', cleanup_state=?, provision_error=NULL, updated_at=? WHERE id=?`, desired, gen, now, actor, CleanupPending, now, m.ID)
-		}
-		if err == nil {
-			_, _ = p.store.db.ExecContext(ctx, `UPDATE tunnels SET status='disabled' WHERE machine_id=? AND status NOT IN ('retired','cleanup_failed')`, m.ID)
+		err = p.inTx(ctx, func(tx *sql.Tx) error {
+			var err error
+			if desired == DesiredDisabled {
+				err = casMachineTx(ctx, tx, oldGen, `UPDATE machines SET desired_state=?, desired_generation=?, desired_changed_at=?, desired_changed_by=?, status='disabled', disabled_at=?, cleanup_state=NULL, provision_error=NULL, updated_at=? WHERE id=?`, desired, gen, now, actor, now, now, m.ID)
+			} else {
+				err = casMachineTx(ctx, tx, oldGen, `UPDATE machines SET desired_state=?, desired_generation=?, desired_changed_at=?, desired_changed_by=?, status='retiring', cleanup_state=?, provision_error=NULL, updated_at=? WHERE id=?`, desired, gen, now, actor, CleanupPending, now, m.ID)
+			}
+			if err != nil {
+				return err
+			}
+			_, err = tx.ExecContext(ctx, `UPDATE tunnels SET status='disabled' WHERE machine_id=? AND status NOT IN ('retired','cleanup_failed')`, m.ID)
+			return err
+		})
+		if err != nil {
+			return Machine{}, err
 		}
 		if desired == DesiredDisabled {
 			_ = p.QueueCommand(ctx, m.ID, gen, "stop_tunnel", nil, time.Hour)
@@ -477,13 +528,26 @@ func (p *Provisioner) SetDesiredState(ctx context.Context, idOrSlug, desired, ac
 }
 
 // compensateEnable revokes access re-enabled by a transition that could not
-// be recorded. Failures are logged; the next disable/retire retries.
-func (p *Provisioner) compensateEnable(ctx context.Context, users []string) {
+// be recorded. If revoking fails too, the machine is marked disable_failed
+// (whatever its generation) so the UI shows that hub auth may be on while
+// the DB says otherwise; the next disable/retire retries.
+func (p *Provisioner) compensateEnable(ctx context.Context, machineID string, users []string) {
+	var failed []string
 	for _, u := range users {
 		if err := p.ops().DisableAuth(ctx, u); err != nil {
 			log.Printf("compensating disable of %s failed: %v", u, err)
+			failed = append(failed, u+": "+err.Error())
 		}
 	}
+	if len(failed) == 0 {
+		return
+	}
+	msg := "enable was not recorded and revoking it again failed: " + strings.Join(failed, "; ")
+	if _, err := p.store.db.ExecContext(ctx, `UPDATE machines SET status=?, cleanup_state=?, provision_error=?, updated_at=? WHERE id=?`, DisableFailed, DisableFailed, msg, nowUTC(), machineID); err != nil {
+		log.Printf("record failed compensation for %s: %v", machineID, err)
+	}
+	p.store.Audit(ctx, "machine.disable_failed", "system", machineID, msg)
+	p.publish("machine.cleanup_failed", machineID, map[string]any{"machine_id": machineID, "cleanup_state": DisableFailed})
 }
 
 func (p *Provisioner) disableTunnels(ctx context.Context, tunnels []Tunnel) []string {
@@ -527,19 +591,14 @@ func (p *Provisioner) retire(ctx context.Context, m Machine, tunnels []Tunnel, o
 	}
 	if len(failures) > 0 {
 		msg := strings.Join(failures, "; ")
+		// Tombstone: the tunnels stay reserved even if the machine CAS
+		// loses, so their user/port are never handed out while residue
+		// may remain on the hub.
 		_, _ = p.store.db.ExecContext(ctx, `UPDATE tunnels SET status='cleanup_failed' WHERE machine_id=? AND status<>'retired'`, m.ID)
 		_ = p.casMachine(ctx, oldGen, `UPDATE machines SET desired_state=?, desired_generation=?, desired_changed_at=?, desired_changed_by=?, status=?, cleanup_state=?, provision_error=?, updated_at=? WHERE id=?`, DesiredRetiring, gen, now, actor, CleanupFailed, CleanupFailed, msg, now, m.ID)
 		p.store.Audit(ctx, "machine.cleanup_failed", actor, m.ID, msg)
 		p.publish("machine.cleanup_failed", m.ID, map[string]any{"machine_id": m.ID, "cleanup_state": CleanupFailed, "desired_state": DesiredRetiring})
 		return Machine{}, fmt.Errorf("%w: %s", ErrCleanupFailed, msg)
-	}
-	for _, t := range tunnels {
-		if t.Status == "retired" {
-			continue
-		}
-		if _, err := p.retireTunnelRow(ctx, t); err != nil {
-			return Machine{}, err
-		}
 	}
 	original := m.Slug
 	if m.OriginalSlug != nil && *m.OriginalSlug != "" {
@@ -549,12 +608,29 @@ func (p *Provisioner) retire(ctx context.Context, m Machine, tunnels []Tunnel, o
 	if err != nil {
 		return Machine{}, err
 	}
-	// The agent token is revoked: a retired agent can no longer heartbeat or
-	// report results (daybreak P2-5).
-	if err := p.casMachine(ctx, oldGen, `UPDATE machines SET slug=?, original_slug=COALESCE(NULLIF(original_slug,''),?), desired_state=?, desired_generation=?, desired_changed_at=?, desired_changed_by=?, status='retired', cleanup_state=?, provision_error=NULL, agent_token_hash=NULL, retired_at=COALESCE(retired_at,?), updated_at=? WHERE id=?`, retiredSlug, original, DesiredRetired, gen, now, actor, CleanupComplete, now, now, m.ID); err != nil {
+	// Machine, tunnels and commands finalize in one transaction guarded by
+	// the generation CAS: a concurrent writer makes the whole finalize roll
+	// back, never leaving retired tunnels under an active machine (astra
+	// R2-04). The agent token is revoked: a retired agent can no longer
+	// heartbeat or report results (daybreak P2-5).
+	err = p.inTx(ctx, func(tx *sql.Tx) error {
+		if err := casMachineTx(ctx, tx, oldGen, `UPDATE machines SET slug=?, original_slug=COALESCE(NULLIF(original_slug,''),?), desired_state=?, desired_generation=?, desired_changed_at=?, desired_changed_by=?, status='retired', cleanup_state=?, provision_error=NULL, agent_token_hash=NULL, retired_at=COALESCE(retired_at,?), updated_at=? WHERE id=?`, retiredSlug, original, DesiredRetired, gen, now, actor, CleanupComplete, now, now, m.ID); err != nil {
+			return err
+		}
+		for _, t := range tunnels {
+			if t.Status == "retired" {
+				continue
+			}
+			if _, err := retireTunnelRowTx(ctx, tx, t); err != nil {
+				return err
+			}
+		}
+		_, err := tx.ExecContext(ctx, `UPDATE agent_commands SET status='cancelled', last_error='machine retired' WHERE machine_id=? AND status IN ('pending','sent')`, m.ID)
+		return err
+	})
+	if err != nil {
 		return Machine{}, err
 	}
-	_, _ = p.store.db.ExecContext(ctx, `UPDATE agent_commands SET status='cancelled', last_error='machine retired' WHERE machine_id=? AND status IN ('pending','sent')`, m.ID)
 	p.store.Audit(ctx, "machine.desired."+DesiredRetired, actor, m.ID, "")
 	return p.GetMachine(ctx, m.ID)
 }
@@ -569,14 +645,17 @@ func (p *Provisioner) retiringTimeout() time.Duration {
 func (p *Provisioner) SetUpdatePolicy(ctx context.Context, idOrSlug, policy, actor string) (Machine, error) {
 	policy, err := normalizeUpdatePolicy(policy)
 	if err != nil {
-		return Machine{}, err
+		return Machine{}, fmt.Errorf("%w: %v", errInvalidInput, err)
 	}
 	m, err := p.GetMachine(ctx, idOrSlug)
 	if err != nil {
 		return Machine{}, err
 	}
 	now := nowUTC()
-	if _, err := p.store.db.ExecContext(ctx, `UPDATE machines SET update_policy=?, updated_at=? WHERE id=?`, policy, now, m.ID); err != nil {
+	if err := p.store.durableTx(ctx, "machine.update_policy", m.ID, actor, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE machines SET update_policy=?, updated_at=? WHERE id=?`, policy, now, m.ID)
+		return err
+	}); err != nil {
 		return Machine{}, err
 	}
 	p.store.Audit(ctx, "machine.update_policy.update", actor, m.ID, "policy="+policy)
@@ -584,15 +663,26 @@ func (p *Provisioner) SetUpdatePolicy(ctx context.Context, idOrSlug, policy, act
 }
 
 func (p *Provisioner) SetProcessTitleConfig(ctx context.Context, idOrSlug string, cfg *ProcessTitleConfig, actor string) (Machine, error) {
-	m, err := p.GetMachine(ctx, idOrSlug)
+	first, err := p.GetMachine(ctx, idOrSlug)
 	if err != nil {
 		return Machine{}, err
+	}
+	// Bumps desired_generation, so it takes the same per-machine lock as
+	// lifecycle transitions and writes with a generation CAS (astra R2-04).
+	unlock := p.transitions.lock(first.ID)
+	defer unlock()
+	m, err := p.GetMachine(ctx, first.ID)
+	if err != nil {
+		return Machine{}, err
+	}
+	if m.DesiredState == DesiredRetired || m.DesiredState == DesiredRetiring {
+		return Machine{}, fmt.Errorf("%w: machine is %s", errInvalidInput, m.DesiredState)
 	}
 	var raw any
 	if cfg != nil {
 		clean, err := normalizeDesiredProcessTitleConfig(*cfg)
 		if err != nil {
-			return Machine{}, err
+			return Machine{}, fmt.Errorf("%w: %v", errInvalidInput, err)
 		}
 		if clean != nil {
 			b, err := json.Marshal(clean)
@@ -604,7 +694,9 @@ func (p *Provisioner) SetProcessTitleConfig(ctx context.Context, idOrSlug string
 	}
 	now := nowUTC()
 	gen := m.DesiredGeneration + 1
-	if _, err := p.store.db.ExecContext(ctx, `UPDATE machines SET process_title_config_json=?, desired_generation=?, desired_changed_at=?, desired_changed_by=?, updated_at=? WHERE id=?`, raw, gen, now, actor, now, m.ID); err != nil {
+	if err := p.store.durableTx(ctx, "machine.process_title", m.ID, actor, func(tx *sql.Tx) error {
+		return casMachineTx(ctx, tx, m.DesiredGeneration, `UPDATE machines SET process_title_config_json=?, desired_generation=?, desired_changed_at=?, desired_changed_by=?, updated_at=? WHERE id=?`, raw, gen, now, actor, now, m.ID)
+	}); err != nil {
 		return Machine{}, err
 	}
 	p.store.Audit(ctx, "machine.process_title.update", actor, m.ID, "")
@@ -695,7 +787,25 @@ func (p *Provisioner) retiredSlug(ctx context.Context, original, machineID strin
 	return "", fmt.Errorf("could not generate unique retired slug for %s", original)
 }
 
-func (p *Provisioner) retireTunnelRow(ctx context.Context, t Tunnel) (Tunnel, error) {
+// inTx runs fn in one transaction.
+func (p *Provisioner) inTx(ctx context.Context, fn func(*sql.Tx) error) error {
+	tx, err := p.store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+type sqlQueryExecer interface {
+	sqlExecer
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+func retireTunnelRowTx(ctx context.Context, q sqlQueryExecer, t Tunnel) (Tunnel, error) {
 	originalUser := t.UnixUser
 	if t.OriginalUnixUser != nil && *t.OriginalUnixUser != "" {
 		originalUser = *t.OriginalUnixUser
@@ -711,7 +821,7 @@ func (p *Provisioner) retireTunnelRow(ctx context.Context, t Tunnel) (Tunnel, er
 	retiredPort := t.RemotePort
 	if retiredPort > 0 {
 		var min sql.NullInt64
-		if err := p.store.db.QueryRowContext(ctx, `SELECT MIN(remote_port) FROM tunnels WHERE hub_id=? AND remote_port<0`, t.HubID).Scan(&min); err != nil {
+		if err := q.QueryRowContext(ctx, `SELECT MIN(remote_port) FROM tunnels WHERE hub_id=? AND remote_port<0`, t.HubID).Scan(&min); err != nil {
 			return t, err
 		}
 		retiredPort = -1
@@ -719,7 +829,7 @@ func (p *Provisioner) retireTunnelRow(ctx context.Context, t Tunnel) (Tunnel, er
 			retiredPort = int(min.Int64) - 1
 		}
 	}
-	_, err := p.store.db.ExecContext(ctx, `UPDATE tunnels SET status='retired', original_unix_user=COALESCE(NULLIF(original_unix_user,''),?), original_remote_port=COALESCE(NULLIF(original_remote_port,0),?), unix_user=?, remote_port=?, cleanup_verified_at=? WHERE id=?`, originalUser, originalPort, retiredUser, retiredPort, nowUTC(), t.ID)
+	_, err := q.ExecContext(ctx, `UPDATE tunnels SET status='retired', original_unix_user=COALESCE(NULLIF(original_unix_user,''),?), original_remote_port=COALESCE(NULLIF(original_remote_port,0),?), unix_user=?, remote_port=?, cleanup_verified_at=? WHERE id=?`, originalUser, originalPort, retiredUser, retiredPort, nowUTC(), t.ID)
 	if err != nil {
 		return t, err
 	}
