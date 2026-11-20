@@ -4,13 +4,13 @@
 - 依據：`~/30-39-Research/34-tech-research/2026-11-20-reach-dashboard-frontend.md` 的 A 表和 B 部分、兩份安全報告裡跟前端有關的項目（Opus P2-4、P2-7、P3-5；daybreak P2-1、P3-1），以及後端的 `docs/EVENTS.md`（`fix/hardening-2026-11` 的 41fbbff）。
 - 新截圖：`~/30-39-Research/34-tech-research/2026-11-21-reach-dashboard-v2-shots/`
 - 量測原始資料：同一個資料夾下的 `measurements/`（`before-all.json`、`after-all.json`、`after-oldsrv-all.json`、`summary.md`）
-- 驗證（第 4 輪後，HEAD 以 git log 為準）：
+- 驗證（第 5 輪後，HEAD 以 git log 為準）：
   - `npm run build`、`npm run generate` 都通過。
   - `nuxt typecheck` 0 個錯誤。
-  - `vitest` 82/82 通過。
-  - 瀏覽器回歸測試 `test-harness/regress.mjs` 38/38 通過。
-  - 對真實 reachd（hardening `d260ae6`）的 revoke e2e 通過。
-  - 審查意見的處理見「astra round 1／daybreak」、「astra round 2」、「astra round 3」三節。
+  - `vitest` 87/87 通過。
+  - 瀏覽器回歸測試 `test-harness/regress.mjs` 40/40 通過。
+  - 對真實 reachd（hardening `48438ad`）的 revoke e2e 通過。
+  - 審查意見的處理見「astra round 1／daybreak」到「astra round 4」各節。
 
 ---
 
@@ -361,6 +361,48 @@ astra 要求補的回歸案例，除了「後端 revoke-all 關掉既有 stream�
 
 - Disable all 在「按下確認之後」才發生的網路競態，要等後端提供帶條件的 bulk API。
 - R3-05：在一直持續的高事件率下，畫面會顯示「可能落後」，並定期用 backoff 重讀，但不保證能追上最新狀態。要追上，需要做 per-machine 欄位合併。目前 Arthur 的機群規模碰不到這個情況，所以先不做。
+
+---
+
+## astra round 4
+
+- **審查報告：** `~/30-39-Research/34-tech-research/2026-11-21-reach-dashboard-astra-review-r4.md`，審的是 `8be92d3`，判定 FIX。唯一的 blocker 是 R4-01，其他項目都已經修好，或屬於可以接受的已知限制。
+- **commit：** `bb0f97c`
+
+### R4-01 P2：保留比較新的 live heartbeat 之後再重播 patch，whole-event guard 把必要的 probe 丟掉
+
+**事件順序：**
+1. T0：HTTP 讀取還在途中。
+2. T1：health 事件被接受，畫面顯示 Failed。
+3. T2：heartbeat 到達。
+4. T0 的 response 回來。
+
+**原因：** `fromServer()` 把 T2 的 live heartbeat 帶進了 T0 的 base，接著重播 T1 的 health 事件時，state clock 已經是 T2，於是 T1 被當成歷史資料丟掉，probe 退回 OK。full snapshot 和 single machine 兩條路徑都會這樣。
+
+**怎麼修：** 照 astra 建議的第一條路，把「HTTP 回應加上在途事件」當成**一次有順序的重建**，新增 `rebuildMachines` 和 `rebuildMachine`：
+1. 用 server 回傳的 row 原樣當 base，不帶入任何 client 端的標記（`live_heartbeat_at`、`state_at`、`probe_unverified`）。
+2. 把在途的 patch 按收到的順序，透過 `applyPatch` 重播一遍。所以 T1 的 health 是跟「T0 base 加上它之前的事件」比，會被接受；之後的 T2 heartbeat 也照順序套用。
+3. 最後才把重播窗口之外、比較新的存活時間併回來。這一步只更新 liveness，不會被拿來當 guard。
+
+**哪些保護沒有動：**
+- whole-event guard 本身沒有改，也沒有刪。
+- 沒有靠多發 GET 來掩蓋問題。
+- R3-04（舊事件不會回滾整體狀態）和 R3-03（沒帶時間的 probe 保留整組並顯示 Unknown），兩項都另外在重建路徑上加了測試鎖住。
+
+**證明：**
+
+- **vitest：** 新增「ordered rebuild」5 個案例。
+  - full 和 single 兩條路徑：probe tuple 維持 `unreachable/T1`、狀態維持 degraded、liveness 是 T2、Connection check 顯示 Failed。
+  - 重播窗口之前就到的 T2 heartbeat 仍然保留，而且不會擋住 T1。
+  - 比 HTTP base row 還舊的重播事件仍然被丟掉（R3-04）。
+  - 沒帶時間的重播 probe 仍然是整組保留，並標成 unverified（R3-03）。
+- **regress：** 新增「R4-01 HTTP in flight -> newer health (Failed) -> later heartbeat -> HTTP lands」，full 和 single 各一個案例，照 astra 的 `probe-http-rollback` 流程改寫。
+  - **在 `8be92d3` 上兩個都失敗**，畫面顯示 `Hub probe OK`。
+  - **現在兩個都通過。**
+  - 第一次的慢讀取開始之後，後續的 GET 都設成回 500，所以畫面上的結果只取決於那次 T0 的 200 response 和事件本身。
+- **全部測試：** vitest 87/87、regress 40/40（含既有的 historical replay 案例）、typecheck 0 個錯誤、build 通過。
+- **真實 reachd（hardening `48438ad`）的 revoke e2e：** 通過。
+- 紀錄存在 `measurements/regress-round5.txt` 和 `measurements/real-reachd-revoke-round5.json`。
 
 ---
 
