@@ -277,7 +277,7 @@ import { setupCommand, websocketSetupCommand, windowsSetupCommand } from '~/util
 import { requestSlug, requestWarnings } from '~/utils/requests'
 import { STATUS_LABEL, type UiStatus } from '~/utils/status'
 import { mapSettledLimited } from '~/utils/concurrency'
-import { goToLoginOnce, parseSignOutBroadcast, SIGNOUT_KEY, tokenFingerprint } from '~/composables/useReachApi'
+import { goToLoginOnce, parseSignOutBroadcast, SIGNOUT_KEY } from '~/composables/useReachApi'
 
 type Tab = 'machines' | 'requests' | 'settings'
 type Dialog =
@@ -576,23 +576,26 @@ async function enableNotifications() {
   }
 }
 
-async function logout() {
-  const sentWith = api.currentToken()
+// The user's intent is fixed at the tap (astra R3-02): the logout request is started first
+// (it captures this tab's token synchronously), then this browser signs out everywhere
+// immediately. A 401 or a peer's 'expired' that arrives later can no longer swallow 'all'.
+function logout() {
+  const pending = api.logout().catch(() => { /* the server forgets the token on expiry anyway */ })
   fleet.dispose()
-  try { await api.logout() } catch { /* clear locally anyway */ }
-  if (api.signOutLocally(sentWith, 'all')) navigateTo('/login')
+  api.signOutLocally(undefined, 'all')
+  void pending
+  navigateTo('/login')
 }
 
 // Another tab of this browser signed out. An explicit sign-out ends every tab; a rejected
 // (expired/revoked) token only ends tabs that still hold that same token, so a tab that
-// signed in on its own keeps working (astra R2-01).
-function onStorage(e: StorageEvent) {
+// signed in on its own keeps working (astra R2-01, R3-01).
+async function onStorage(e: StorageEvent) {
   if (e.key !== SIGNOUT_KEY) return
   const msg = parseSignOutBroadcast(e.newValue)
-  if (!msg || !api.currentToken()) return
-  if (msg.reason === 'expired' && msg.fp !== tokenFingerprint(api.currentToken())) return
+  if (!msg) return
+  if (!(await api.receiveSignOut(msg))) return
   fleet.dispose()
-  api.setToken(null)
   void goToLoginOnce()
 }
 

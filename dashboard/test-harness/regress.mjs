@@ -579,6 +579,136 @@ await test('R2-01 a late revoke-all success does not sign out a session started 
   await ctx.close()
 })
 
+// ---------------------------------------------------------------- astra round 3: auth edges
+const tok = (sub, sfx) => `${b64({ alg: 'none' })}.${b64({ sub, sv: 0, exp: 4102444800 })}.${sfx}`
+async function seededTab(ctx, t, path, where = 'session') {
+  const p = await ctx.newPage()
+  await p.addInitScript(([t, where]) => {
+    if (sessionStorage.getItem('seeded')) return
+    sessionStorage.setItem('seeded', '1')
+    if (where === 'local') localStorage.setItem('reach-token', t)
+    else sessionStorage.setItem('reach-token', t)
+  }, [t, where])
+  await p.goto(BASE + path)
+  await p.locator('.live-live').waitFor({ timeout: 6000 })
+  return p
+}
+const onLogin = (p) => new URL(p.url()).pathname === '/login'
+
+await test('R3-01 a rejected session-only token does not delete another tab\'s remembered login', async () => {
+  await reset('auth=1')
+  const A = tok('tab-a', 'a'), B = tok('tab-b', 'b')
+  const ctx = await browser.newContext()
+  const b = await seededTab(ctx, B, '/?tab=settings', 'local') // remembered (localStorage)
+  const a = await seededTab(ctx, A, '/?tab=requests', 'session')
+  await ctl('/__reject-token', { token: A })
+  await a.locator('input[name="username"]').waitFor({ timeout: 7000 })
+  await sleep(800)
+  expect(await b.evaluate(() => localStorage.getItem('reach-token')) === B, 'B\'s remembered token was deleted from localStorage')
+  expect(!onLogin(b), `B was signed out: ${b.url()}`)
+  await b.reload()
+  await b.locator('.live-live').waitFor({ timeout: 6000 })
+  expect(!onLogin(b), `B lost its login on reload: ${b.url()}`)
+  await ctx.close()
+})
+
+await test('R3-01 a tab that signed out does not pick up another tab\'s remembered token', async () => {
+  await reset('auth=1')
+  const A = tok('tab-a', 'a'), B = tok('tab-b', 'b')
+  const ctx = await browser.newContext()
+  await seededTab(ctx, B, '/', 'local')
+  const a = await seededTab(ctx, A, '/?tab=requests', 'session')
+  await ctl('/__reject-token', { token: A })
+  await a.locator('input[name="username"]').waitFor({ timeout: 7000 })
+  await sleep(1500)
+  expect(onLogin(a), `A silently continued with B's token: ${a.url()}`)
+  await ctx.close()
+})
+
+await test('R3-02 Sign out reaches every tab even when the logout request answers 401', async () => {
+  await reset('auth=1')
+  const A = tok('tab-a', 'a'), B = tok('tab-b', 'b')
+  const ctx = await browser.newContext()
+  const a = await seededTab(ctx, A, '/?tab=settings')
+  const b = await seededTab(ctx, B, '/?tab=requests')
+  await ctl('/__fail?key=POST /api/admin/logout&status=401&error=expired&times=1')
+  await a.locator('.btn', { hasText: /^\s*Sign out\s*$/ }).click()
+  await a.locator('input[name="username"]').waitFor({ timeout: 5000 })
+  await b.locator('input[name="username"]').waitFor({ timeout: 5000 })
+  expect(!(await tokens(b))[1], 'B kept its token')
+  await ctx.close()
+})
+
+await test('R3-02 three tabs: a peer\'s expiry overtakes a slow logout, the other login still leaves', async () => {
+  await reset('auth=1')
+  const A = tok('tab-a', 'a'), B = tok('tab-b', 'b')
+  const ctx = await browser.newContext()
+  const a = await seededTab(ctx, A, '/?tab=settings')
+  const peer = await seededTab(ctx, A, '/')
+  const b = await seededTab(ctx, B, '/?tab=requests')
+  // reachd blacklists A and closes A's streams at once, but the 2xx takes 7 s
+  await ctl('/__latency?key=POST /api/admin/logout&ms=7000&times=1')
+  await a.locator('.btn', { hasText: /^\s*Sign out\s*$/ }).click()
+  await peer.locator('input[name="username"]').waitFor({ timeout: 7000 })
+  await b.locator('input[name="username"]').waitFor({ timeout: 4000 })
+  await sleep(7500) // the slow 2xx lands; nothing may change afterwards
+  for (const [name, p] of [['a', a], ['peer', peer], ['b', b]]) {
+    expect(onLogin(p), `${name} not on login: ${p.url()}`)
+    const [l, sess] = await tokens(p)
+    expect(!l && !sess, `${name} still has a token`)
+  }
+  await ctx.close()
+})
+
+await test('R3-02 a slow logout reply does not sign out a login made after it', async () => {
+  await reset('auth=1')
+  const A = tok('tab-a', 'a')
+  const ctx = await browser.newContext()
+  const a = await seededTab(ctx, A, '/?tab=settings')
+  await ctl('/__latency?key=POST /api/admin/logout&ms=5000&times=1')
+  await a.locator('.btn', { hasText: /^\s*Sign out\s*$/ }).click()
+  await login(a)
+  await a.locator('.live-live').waitFor({ timeout: 6000 })
+  await sleep(5500)
+  expect(!onLogin(a), `new login ended by the old logout reply: ${a.url()}`)
+  expect(!!(await tokens(a))[1], 'new token cleared')
+  await ctx.close()
+})
+
+await test('R3-06 two tokens with the same 32-bit FNV hash are told apart', async () => {
+  await reset('auth=1')
+  // astra's constructed collision (fnv1a32 = 9vgc57 for both)
+  const CA = 'eyJhbGciOiJub25lIn0.eyJzdWIiOiJjb2xsaXNpb24iLCJzdiI6MCwiZXhwIjo0MTAyNDQ0ODAwfQ.joetia18yf5x5'
+  const CB = 'eyJhbGciOiJub25lIn0.eyJzdWIiOiJjb2xsaXNpb24iLCJzdiI6MCwiZXhwIjo0MTAyNDQ0ODAwfQ.1mdoh25rohonv'
+  const ctx = await browser.newContext()
+  const a = await seededTab(ctx, CA, '/')
+  const b = await seededTab(ctx, CB, '/?tab=settings')
+  await ctl('/__reject-token', { token: CA })
+  await a.locator('input[name="username"]').waitFor({ timeout: 7000 })
+  await sleep(1000)
+  expect(!onLogin(b), `B signed out by A's expiry: ${b.url()}`)
+  expect((await tokens(b))[1] === CB, 'B lost its token')
+  await ctx.close()
+})
+
+await test('targeted expiry still ends every tab holding the SAME token', async () => {
+  await reset('auth=1')
+  const A = tok('tab-a', 'a'), B = tok('tab-b', 'b')
+  const ctx = await browser.newContext()
+  const a1 = await seededTab(ctx, A, '/?tab=requests')
+  const a2 = await seededTab(ctx, A, '/?tab=settings')
+  const b = await seededTab(ctx, B, '/')
+  await ctl('/__reject-token', { token: A, close: '0' })
+  // only a1 notices (its next request); a2 must follow through the broadcast
+  await a1.evaluate(() => fetch('/api/admin/machines'))
+  await a1.reload()
+  await a1.locator('input[name="username"]').waitFor({ timeout: 7000 })
+  await a2.locator('input[name="username"]').waitFor({ timeout: 5000 })
+  await sleep(500)
+  expect(!onLogin(b), `B (different token) signed out: ${b.url()}`)
+  await ctx.close()
+})
+
 // ---------------------------------------------------------------- daybreak P3-7
 await test('P3-7 login keeps the token in sessionStorage unless "keep me signed in" is ticked', async () => {
   await reset('auth=1')

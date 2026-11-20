@@ -48,6 +48,7 @@ let failures // [{ key, status, error, times }]
 let latencies // [{ key, ms, times }]
 let sessionVersion
 let sseRefusedUntil
+let rejectedTokens // tokens the server no longer accepts (logout, targeted expiry)
 let pendingRows
 
 const iso = (msAgo) => new Date(Date.now() - msAgo).toISOString().replace(/\.\d+Z$/, 'Z')
@@ -152,6 +153,7 @@ function resetAll(overrides = {}) {
   latencies = []
   sessionVersion = 0
   sseRefusedUntil = 0
+  rejectedTokens = new Set()
   makeFleet(state.n)
   makePending()
 }
@@ -191,13 +193,21 @@ const b64 = (o) => Buffer.from(JSON.stringify(o)).toString('base64url')
 function issueToken(username) {
   return `${b64({ alg: 'none' })}.${b64({ sub: username, sv: sessionVersion, exp: Math.floor(Date.now() / 1000) + 3600 })}.mock`
 }
+function requestToken(req) {
+  const m = /^Bearer (.+)$/.exec(req.headers.authorization || '')
+  return m ? m[1] : ''
+}
+/** Reject one token (like reachd's per-token logout blacklist) and close its streams. */
+function rejectToken(token, { close = true } = {}) {
+  rejectedTokens.add(token)
+  if (close) for (const c of [...sseClients]) if (c.token === token) { c.res.destroy(); sseClients.delete(c) }
+}
 function tokenOk(req) {
   if (!state.auth) return true
-  const h = req.headers.authorization || ''
-  const m = /^Bearer (.+)$/.exec(h)
-  if (!m) return false
+  const token = requestToken(req)
+  if (!token || rejectedTokens.has(token)) return false
   try {
-    const payload = JSON.parse(Buffer.from(m[1].split('.')[1], 'base64url').toString())
+    const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString())
     return (payload.sv ?? 0) === sessionVersion
   } catch { return false }
 }
@@ -340,6 +350,7 @@ async function control(req, res, url) {
     publish('request.created', { request_id: row.id, name: row.name, status: 'pending' })
     return send(req, res, 200, row)
   }
+  if (p === '/__reject-token') { const b = await readBody(req); rejectToken(b.token, { close: q.close !== '0' }); return send(req, res, 200, { ok: 1 }) }
   if (p === '/__revoke') { revokeAll({ close: q.close !== '0' }); return send(req, res, 200, { sessionVersion }) }
   if (p === '/__ssepause') { // refuse /events for ms (client reconnects later, with its cursor)
     sseRefusedUntil = Date.now() + Number(q.ms || 3000)
@@ -366,7 +377,7 @@ async function events(req, res) {
   if (Date.now() < sseRefusedUntil) return send(req, res, 503, { error: 'unavailable' })
   res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' })
   res.write('retry: 2000\n\n')
-  const client = { res, live: false }
+  const client = { res, live: false, token: requestToken(req) }
   sseClients.add(client)
   req.on('close', () => { clearInterval(client.ka); sseClients.delete(client) })
   if (state.sseDelayMs) await sleep(state.sseDelayMs) // events published now are not seen by this stream
@@ -455,7 +466,12 @@ function handle(req, p, url, key, body) {
     publish(`request.${row.status}`, { request_id: row.id })
     return [200, { request_id: row.id, status: row.status }]
   }
-  if (p === '/api/admin/logout' && req.method === 'POST') return [200, { ok: true }]
+  if (p === '/api/admin/logout' && req.method === 'POST') {
+    // reachd: blacklists the caller's token and closes ITS streams (other tokens unaffected)
+    const token = requestToken(req)
+    if (state.auth) queueMicrotask(() => rejectToken(token))
+    return [200, { ok: true }]
+  }
   if (p === '/api/admin/sessions/revoke-all' && req.method === 'POST') {
     if (!state.v2) return [404, { error: 'not found' }]
     queueMicrotask(() => revokeAll({ close: true }))

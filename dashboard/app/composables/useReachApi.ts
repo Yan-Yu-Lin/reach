@@ -136,22 +136,21 @@ const TOKEN_KEY = 'reach-token'
 export const SIGNOUT_KEY = 'reach-signout'
 
 /**
- * Short non-secret fingerprint of a token (FNV-1a), so a sign-out broadcast can say WHICH
- * session ended without putting the token itself into the message.
+ * SHA-256 of a token (hex), so a sign-out broadcast can say WHICH session ended without
+ * putting the token itself into the message (astra R3-06: the earlier 32-bit hash could
+ * collide). Returns '' when WebCrypto is unavailable (non-secure context); receivers then
+ * ignore targeted messages instead of guessing.
  */
-export function tokenFingerprint(t: string | null | undefined): string {
-  if (!t) return ''
-  let h = 0x811c9dc5
-  for (let i = 0; i < t.length; i++) {
-    h ^= t.charCodeAt(i)
-    h = Math.imul(h, 0x01000193)
-  }
-  return (h >>> 0).toString(36)
+export async function tokenFingerprint(t: string | null | undefined): Promise<string> {
+  if (!t || typeof crypto === 'undefined' || !crypto.subtle) return ''
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(t))
+  return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('')
 }
 
 /**
  * all:     the user signed out on purpose (Sign out, Sign out everywhere): every tab leaves.
- * expired: the server rejected token `fp`: only tabs still holding that same token leave.
+ * expired: the server rejected the token whose fingerprint is `fp`: only tabs still holding
+ *          that same token leave, and only that token is removed from storage.
  */
 export type SignOutBroadcast = { at: number; reason: 'all' | 'expired'; fp: string }
 
@@ -169,44 +168,104 @@ function readStoredToken(): string | null {
   return sessionStorage.getItem(TOKEN_KEY) || localStorage.getItem(TOKEN_KEY)
 }
 
+/**
+ * Remove `t` from storage only where it is still the stored value (astra R3-01): the
+ * localStorage slot is shared by every tab, and may hold ANOTHER tab's remembered login.
+ */
+export function forgetStoredToken(t: string | null | undefined) {
+  if (!t || typeof window === 'undefined') return
+  if (sessionStorage.getItem(TOKEN_KEY) === t) sessionStorage.removeItem(TOKEN_KEY)
+  if (localStorage.getItem(TOKEN_KEY) === t) localStorage.removeItem(TOKEN_KEY)
+}
+
+function broadcast(msg: SignOutBroadcast) {
+  try { localStorage.setItem(SIGNOUT_KEY, JSON.stringify(msg)) } catch { /* private mode */ }
+}
+
 export function useReachApi() {
   const config = useRuntimeConfig()
   const apiBase = config.public.apiBase || '/api'
   const token = useState<string | null>('reach-token', () => null)
+  // "Not loaded yet" vs "signed out": once this tab has signed out it must not silently pick
+  // up another tab's remembered login from storage (astra R3-01).
+  const loadedFromStorage = useState<boolean>('reach-token-loaded', () => false)
 
-  if (import.meta.client && token.value === null) {
+  if (import.meta.client && !loadedFromStorage.value) {
     token.value = readStoredToken()
+    loadedFromStorage.value = true
   }
 
   /**
-   * remember=true keeps the token in localStorage (survives closing the browser, what a
-   * phone needs). remember=false keeps it in sessionStorage only, so it is gone when the
-   * tab closes. Either way an XSS could read it; see docs/review/2026-11-21-dashboard.md.
+   * Sign this tab in with `next` (or out, with null). remember=true keeps the token in
+   * localStorage (survives closing the browser); remember=false keeps it in sessionStorage
+   * only. The tab's previous token is removed from storage only where it is still the stored
+   * value, so another tab's remembered login is not touched. Either way an XSS could read
+   * it; see docs/review/2026-11-21-dashboard.md.
    */
   function setToken(next: string | null, remember = false) {
+    const previous = token.value
     token.value = next
+    loadedFromStorage.value = true
     if (!import.meta.client) return
-    localStorage.removeItem(TOKEN_KEY)
-    sessionStorage.removeItem(TOKEN_KEY)
-    if (next) (remember ? localStorage : sessionStorage).setItem(TOKEN_KEY, next)
+    forgetStoredToken(previous)
+    if (next && remember) {
+      sessionStorage.removeItem(TOKEN_KEY) // must not shadow the remembered one in this tab
+      localStorage.setItem(TOKEN_KEY, next)
+    } else if (next) {
+      sessionStorage.setItem(TOKEN_KEY, next)
+    }
   }
 
   /**
-   * Forget the session here and tell the other tabs of this browser.
+   * End this tab's session and tell the other tabs of this browser.
    *
-   * `sentWith` is the token the failed/finished operation used. If the user has signed in
-   * again since then (token changed), the result is about an old session: nothing is
-   * cleared and false is returned (astra R2-01). Pass `undefined` only for an explicit
-   * sign-out of whatever session is current.
+   * reason 'expired' (the server rejected `sentWith`): only if `sentWith` is still this tab's
+   * token (astra R2-01) - a reply about a session the user already replaced changes nothing.
+   * Only that token is removed from storage; tabs holding it follow, others stay.
+   *
+   * reason 'all' (the user pressed Sign out / Sign out everywhere): decided at the moment of
+   * the tap, so it never depends on a callback that a 401 could have overtaken (astra
+   * R3-02). Clears this browser's stored logins and every tab leaves. Pass sentWith to
+   * guard against acting after a newer sign-in (late revoke-all reply).
+   *
+   * Returns whether anything was ended.
    */
   function signOutLocally(sentWith?: string | null, reason: SignOutBroadcast['reason'] = 'all'): boolean {
     if (sentWith !== undefined && token.value !== sentWith) return false
-    const fp = tokenFingerprint(token.value)
-    setToken(null)
-    if (import.meta.client) {
-      const msg: SignOutBroadcast = { at: Date.now(), reason, fp }
-      try { localStorage.setItem(SIGNOUT_KEY, JSON.stringify(msg)) } catch { /* private mode */ }
+    const ended = token.value
+    if (!ended && reason === 'expired') return false
+    token.value = null
+    loadedFromStorage.value = true
+    if (!import.meta.client) return true
+    if (reason === 'all') {
+      sessionStorage.removeItem(TOKEN_KEY)
+      localStorage.removeItem(TOKEN_KEY)
+      broadcast({ at: Date.now(), reason: 'all', fp: '' })
+    } else {
+      forgetStoredToken(ended)
+      // The fingerprint is async (WebCrypto). The decision above was already made
+      // synchronously against this tab's token, so waiting here cannot reopen R2-01.
+      void tokenFingerprint(ended).then(fp => { if (fp) broadcast({ at: Date.now(), reason: 'expired', fp }) })
     }
+    return true
+  }
+
+  /**
+   * Another tab broadcast a sign-out. 'all' ends this tab; 'expired' ends it only if it still
+   * holds exactly that token (checked again after the async digest). Returns true if ended.
+   */
+  async function receiveSignOut(msg: SignOutBroadcast): Promise<boolean> {
+    const mine = token.value
+    if (!mine) return false
+    if (msg.reason === 'expired') {
+      if (!msg.fp || msg.fp !== await tokenFingerprint(mine)) return false
+      if (token.value !== mine) return false // signed in again meanwhile
+      forgetStoredToken(mine)
+    } else {
+      sessionStorage.removeItem(TOKEN_KEY)
+    }
+    token.value = null
+    loadedFromStorage.value = true
     return true
   }
 
@@ -275,9 +334,12 @@ export function useReachApi() {
     token,
     setToken,
     signOutLocally,
+    receiveSignOut,
     currentToken,
     login,
-    logout: () => request<{ ok: boolean }>('/admin/logout', { method: 'POST' }),
+    // The caller signs out locally right away (R3-02); the server's answer changes nothing
+    // here, so no automatic 401 handling either.
+    logout: () => request<{ ok: boolean }>('/admin/logout', { method: 'POST', skipAuthRedirect: true }),
     /** Invalidates every dashboard login (and optionally Mac service tokens). Newer servers only. */
     // A 401 here means the handler never ran; the caller handles it (no silent redirect).
     revokeAllSessions: (includeServiceTokens = false) => request<{ ok: boolean }>('/admin/sessions/revoke-all', {

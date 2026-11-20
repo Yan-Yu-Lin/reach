@@ -6,7 +6,8 @@ export default defineNuxtRouteMiddleware((to) => {
   const api = useReachApi()
   if (!api.token.value) return navigateTo(loginLocation(to.fullPath))
   if (isJWTExpired(api.token.value)) {
-    api.setToken(null)
+    // Only this tab's own (expired) token; another tab's remembered login stays (R3-01).
+    api.signOutLocally(api.token.value, 'expired')
     return navigateTo(loginLocation(to.fullPath, 'session-expired'))
   }
 })
