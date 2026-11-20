@@ -209,3 +209,92 @@ func TestProvisionFinalizeLosesToRecovery(t *testing.T) {
 		t.Fatal("machine created for a reclaimed request")
 	}
 }
+
+// Astra R3-05: the retire intent of a recovered provision fails once. The
+// request carries the durable cleanup_pending marker, so the next run
+// retires the machine anyway.
+func TestRecoveryRetriesWhenRetireIntentFails(t *testing.T) {
+	server, store, _ := newReliabilityTestServer(t)
+	ops := &fakeTunnelOS{}
+	server.prov.osOps = ops
+	insertRetireFixture(t, server, "m_retrygap", "retrygap-box", "rt-retrygap", 9292)
+	old := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)
+	future := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+	if _, err := store.db.Exec(`INSERT INTO requests(id,name,client_secret_hash,status,created_at,expires_at,slug,provisioning_started_at,machine_id,provision_phase) VALUES ('r_retrygap','retrygap-box','sha256:x','provisioning',?,?,'retrygap-box',?,'m_retrygap','os_created')`, old, future, old); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`CREATE TRIGGER fail_retire_intent BEFORE INSERT ON durable_actions WHEN NEW.kind='machine.desired.retired' BEGIN SELECT RAISE(ABORT,'injected'); END;`); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.prov.recoverStuckProvisioning(context.Background(), time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	var phase string
+	_ = store.db.QueryRow(`SELECT provision_phase FROM requests WHERE id='r_retrygap'`).Scan(&phase)
+	if phase != phaseCleanupPending {
+		t.Fatalf("phase after failed retire = %s", phase)
+	}
+	if _, err := store.db.Exec(`DROP TRIGGER fail_retire_intent`); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.prov.recoverStuckProvisioning(context.Background(), time.Now().UTC().Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	var desired, tstatus string
+	_ = store.db.QueryRow(`SELECT desired_state FROM machines WHERE id='m_retrygap'`).Scan(&desired)
+	_ = store.db.QueryRow(`SELECT status FROM tunnels WHERE machine_id='m_retrygap'`).Scan(&tstatus)
+	_ = store.db.QueryRow(`SELECT provision_phase FROM requests WHERE id='r_retrygap'`).Scan(&phase)
+	if desired != DesiredRetired || tstatus != "retired" || phase != phaseCleaned || len(ops.removed) == 0 {
+		t.Fatalf("after retry: desired=%s tunnel=%s phase=%s removed=%v", desired, tstatus, phase, ops.removed)
+	}
+}
+
+// Daybreak round 4 P2-02 window 1: the request was committed as provisioned
+// but the agent never got the response (no heartbeat). After the response
+// lease the machine is revoked and retired; a delivered machine is not.
+func TestUndeliveredProvisionIsCleanedUp(t *testing.T) {
+	server, store, _ := newReliabilityTestServer(t)
+	ops := &fakeTunnelOS{}
+	server.prov.osOps = ops
+	insertRetireFixture(t, server, "m_lost", "lost-box", "rt-lostbox1", 9293)
+	insertRetireFixture(t, server, "m_ok", "ok-box", "rt-okbox111", 9294)
+	old := time.Now().UTC().Add(-2 * time.Hour).Format(time.RFC3339)
+	future := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+	for _, r := range [][3]string{{"r_lost", "m_lost", "response_pending"}, {"r_ok", "m_ok", "delivered"}} {
+		if _, err := store.db.Exec(`INSERT INTO requests(id,name,client_secret_hash,status,created_at,expires_at,slug,provisioning_started_at,machine_id,provision_phase) VALUES (?,?,'sha256:x','provisioned',?,?,?,?,?,?)`, r[0], r[0], old, future, r[0], old, r[1], r[2]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := server.prov.recoverStuckProvisioning(context.Background(), time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	var lostDesired, okDesired string
+	var lostToken, okToken sql.NullString
+	_ = store.db.QueryRow(`SELECT desired_state,agent_token_hash FROM machines WHERE id='m_lost'`).Scan(&lostDesired, &lostToken)
+	_ = store.db.QueryRow(`SELECT desired_state,agent_token_hash FROM machines WHERE id='m_ok'`).Scan(&okDesired, &okToken)
+	if lostDesired != DesiredRetired || lostToken.Valid {
+		t.Fatalf("undelivered machine: desired=%s token=%v", lostDesired, lostToken.Valid)
+	}
+	if okDesired != DesiredActive || !okToken.Valid {
+		t.Fatalf("delivered machine touched: desired=%s token=%v", okDesired, okToken.Valid)
+	}
+}
+
+// The first heartbeat marks the provision delivered.
+func TestHeartbeatMarksProvisionDelivered(t *testing.T) {
+	server, store, _ := newReliabilityTestServer(t)
+	insertRetireFixture(t, server, "m_hb", "hb-box", "rt-hbbox111", 9295)
+	future := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+	if _, err := store.db.Exec(`INSERT INTO requests(id,name,client_secret_hash,status,created_at,expires_at,slug,provisioning_started_at,machine_id,provision_phase) VALUES ('r_hb','hb','sha256:x','provisioned',?,?,'hb-box',?,'m_hb','response_pending')`, nowUTC(), future, nowUTC()); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"machine_id":"m_hb","agent_version":"t","applied_generation":1,"observed":{"local_ssh":{"state":"healthy"},"tunnel":{"state":"connected"},"persistence":{},"keys":{}}}`
+	if rec := doJSON(t, server, http.MethodPost, "/api/client/agent/heartbeat", body, "at_m_hb"); rec.Code != 200 {
+		t.Fatalf("heartbeat %d %s", rec.Code, rec.Body.String())
+	}
+	var phase string
+	_ = store.db.QueryRow(`SELECT provision_phase FROM requests WHERE id='r_hb'`).Scan(&phase)
+	if phase != phaseDelivered {
+		t.Fatalf("phase = %s", phase)
+	}
+}

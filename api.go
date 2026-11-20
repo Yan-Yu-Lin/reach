@@ -698,9 +698,12 @@ func (s *Server) handleClientProvision(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := s.prov.CreateMachine(r.Context(), CreateMachineInput{RequestID: requestID, Slug: req.Slug, DisplayName: firstNonEmpty(req.DisplayName, name), TargetUser: req.TargetUser, Pubkey: req.Pubkey, Mode: req.Mode, LocalPort: req.LocalPort, Persistence: req.Persistence, Distro: req.Distro, Arch: req.Arch, OwnerUserID: owner})
 	if err != nil {
-		// Back to approved without a setup token: the agent must poll for
-		// a new one, so a retry cannot reuse the consumed token.
-		_, _ = s.store.db.ExecContext(r.Context(), `UPDATE requests SET status='approved', provisioning_started_at=NULL, machine_id=NULL WHERE id=? AND status='provisioning'`, requestID)
+		// Nothing was created (no machine linked): back to approved
+		// without a setup token, so the agent polls for a new one. If a
+		// machine exists, its account may exist too: hand it to cleanup
+		// instead of dropping the link (daybreak round 4 P2-02).
+		_, _ = s.store.db.ExecContext(r.Context(), `UPDATE requests SET status='approved', provision_phase=NULL, provisioning_started_at=NULL WHERE id=? AND status='provisioning' AND (machine_id IS NULL OR machine_id='')`, requestID)
+		_, _ = s.store.db.ExecContext(r.Context(), `UPDATE requests SET status='expired', provision_phase='cleanup_pending' WHERE id=? AND status='provisioning' AND machine_id IS NOT NULL AND machine_id<>''`, requestID)
 		// Details (sshd -t output, paths) stay in the server log (Opus P3-3).
 		log.Printf("provision %s failed: %v", requestID, err)
 		if errors.Is(err, errProvisioningLeaseLost) {
@@ -719,7 +722,7 @@ func (s *Server) handleClientProvision(w http.ResponseWriter, r *http.Request) {
 	// must not be handed out (astra R2-10). The invite is consumed in the
 	// same transaction (only the claim this request holds).
 	err = s.store.durableTx(r.Context(), "request.provisioned", res.Machine.ID, "system", func(tx *sql.Tx) error {
-		up, err := tx.ExecContext(r.Context(), `UPDATE requests SET status='provisioned', machine_id=? WHERE id=? AND status='provisioning'`, res.Machine.ID, requestID)
+		up, err := tx.ExecContext(r.Context(), `UPDATE requests SET status='provisioned', provision_phase='response_pending', provisioning_started_at=?, machine_id=? WHERE id=? AND status='provisioning'`, nowUTC(), res.Machine.ID, requestID)
 		if err != nil {
 			return err
 		}
@@ -908,7 +911,7 @@ func (s *Server) consumeSetupToken(ctx context.Context, requestID, token string)
 	// restore must not make it valid again (daybreak round 4 P2-01). The
 	// state change, the cleared hash and the journal row commit together.
 	err = s.store.durableTx(ctx, "request.provision.start", "", requestID, func(tx *sql.Tx) error {
-		res, err := tx.ExecContext(ctx, `UPDATE requests SET status='provisioning', setup_token_hash=NULL, provisioning_started_at=? WHERE id=? AND status='approved' AND setup_token_hash=?`, nowUTC(), requestID, hash.String)
+		res, err := tx.ExecContext(ctx, `UPDATE requests SET status='provisioning', provision_phase='claimed', setup_token_hash=NULL, provisioning_started_at=? WHERE id=? AND status='approved' AND setup_token_hash=?`, nowUTC(), requestID, hash.String)
 		if err != nil {
 			return err
 		}
@@ -1074,6 +1077,7 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	if hb.Observed.Tunnel.State == "connected" || hb.Observed.Tunnel.State == "running" {
 		// Only write when the status flips or last_seen_at is getting stale.
 		staleBefore := time.Now().UTC().Add(-tunnelSeenWriteInterval).Format(time.RFC3339)
+		_, _ = s.store.db.ExecContext(r.Context(), `UPDATE requests SET provision_phase='delivered' WHERE machine_id=? AND provision_phase='response_pending'`, hb.MachineID)
 		_, _ = s.store.db.ExecContext(r.Context(), `UPDATE tunnels SET status='online', last_seen_at=? WHERE machine_id=? AND status NOT IN ('disabled','retired','failed','cleanup_failed') AND (status<>'online' OR last_seen_at IS NULL OR last_seen_at<?)`, now, hb.MachineID, staleBefore)
 	}
 	old := m.ObservedState

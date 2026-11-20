@@ -210,6 +210,9 @@ func (p *Provisioner) CreateMachine(ctx context.Context, in CreateMachineInput) 
 	if err != nil {
 		return res, err
 	}
+	if in.RequestID != "" {
+		_, _ = p.store.db.ExecContext(ctx, `UPDATE requests SET provision_phase='os_created' WHERE id=? AND status='provisioning'`, in.RequestID)
+	}
 	if n, _ := up.RowsAffected(); n != 1 {
 		// Someone changed the machine without holding its lock (an older
 		// binary, a manual DB edit). Undo what this provision created,
@@ -1672,23 +1675,48 @@ var errProvisioningLeaseLost = errors.New("provisioning lease lost")
 // maintenance keeps retrying their cleanup.
 const provisionRecoveryActor = "system-provision-recovery"
 
-// recoverStuckProvisioning handles a reachd crash in the middle of a
-// provision (daybreak P2-7, round 3 P2-A, astra R2-10). The setup token was
-// consumed and the agent token only ever existed in the lost response, so
-// the attempt cannot be resumed:
+// Provisioning phases (requests.provision_phase), daybreak round 4 P2-02:
 //
-//  1. claim the expired lease with a CAS on the request (expired), and in
-//     the same transaction revoke the never-delivered agent token of the
-//     linked machine and journal the action;
-//  2. retire that machine through the normal locked path, whatever its
-//     status (provisioning, offline, failed): DisableAuth/Remove, verify no
-//     residue, free the port only then. A failure leaves a cleanup_failed
-//     tombstone (port and user stay reserved) that maintenance retries.
+//	claimed           setup token consumed, nothing created yet
+//	os_created        machine/tunnel rows and the hub account exist
+//	response_pending  request provisioned; the agent may not have the token
+//	delivered         the agent heartbeated with its token
+//	cleanup_pending   recovery took over: revoke and retire the machine
+//	cleaned           the machine is retired (or nothing was created)
 //
-// The invite claim is released by the next maintenance step.
+// Every transition before delivered is resumable: recovery picks up any
+// phase whose lease expired, and cleanup_pending until it is cleaned.
+const (
+	phaseClaimed         = "claimed"
+	phaseOSCreated       = "os_created"
+	phaseResponsePending = "response_pending"
+	phaseDelivered       = "delivered"
+	phaseCleanupPending  = "cleanup_pending"
+	phaseCleaned         = "cleaned"
+)
+
+// responseLease is how long an agent has to heartbeat after its provision
+// response was committed. Agents heartbeat within seconds of installing.
+const responseLease = time.Hour
+
+// recoverStuckProvisioning handles a reachd crash (or a lost response) in
+// the middle of a provision (daybreak P2-7, round 3 P2-A, round 4 P2-02,
+// astra R2-10, R3-05). The attempt cannot be resumed: the agent token only
+// ever existed in the response. So:
+//
+//  1. claim: with a CAS on the request (status and phase), move it to
+//     cleanup_pending, revoke the machine's agent token and journal it,
+//     all in one transaction. cleanup_pending is the durable retry marker.
+//  2. cleanup: every cleanup_pending request with a machine is retired
+//     through the normal locked, verified path; only when the machine is
+//     retired does the request become cleaned. Failures are retried by
+//     the next maintenance run, forever, never dropped.
 func (p *Provisioner) recoverStuckProvisioning(ctx context.Context, now time.Time) error {
 	cutoff := now.Add(-provisioningLease).Format(time.RFC3339)
-	rows, err := p.store.db.QueryContext(ctx, `SELECT id FROM requests WHERE status='provisioning' AND (provisioning_started_at IS NULL OR provisioning_started_at<?)`, cutoff)
+	respCutoff := now.Add(-responseLease).Format(time.RFC3339)
+	rows, err := p.store.db.QueryContext(ctx, `SELECT id FROM requests WHERE
+		(status='provisioning' AND (provisioning_started_at IS NULL OR provisioning_started_at<?))
+		OR (status='provisioned' AND provision_phase='response_pending' AND provisioning_started_at<?)`, cutoff, respCutoff)
 	if err != nil {
 		return err
 	}
@@ -1708,7 +1736,9 @@ func (p *Provisioner) recoverStuckProvisioning(ctx context.Context, now time.Tim
 		var machineID string
 		claimed := false
 		err := p.inTx(ctx, func(tx *sql.Tx) error {
-			res, err := tx.ExecContext(ctx, `UPDATE requests SET status='expired' WHERE id=? AND status='provisioning' AND (provisioning_started_at IS NULL OR provisioning_started_at<?)`, id, cutoff)
+			res, err := tx.ExecContext(ctx, `UPDATE requests SET status='expired', provision_phase=? WHERE id=? AND (
+				(status='provisioning' AND (provisioning_started_at IS NULL OR provisioning_started_at<?))
+				OR (status='provisioned' AND provision_phase='response_pending' AND provisioning_started_at<?))`, phaseCleanupPending, id, cutoff, respCutoff)
 			if err != nil {
 				return err
 			}
@@ -1732,41 +1762,54 @@ func (p *Provisioner) recoverStuckProvisioning(ctx context.Context, now time.Tim
 		if err != nil {
 			return err
 		}
-		if !claimed {
-			continue
-		}
-		p.store.Audit(ctx, "request.provisioning_interrupted", "system", machineID, "request="+id)
-		if machineID != "" {
-			if _, err := p.SetDesiredState(ctx, machineID, DesiredRetired, provisionRecoveryActor); err != nil {
-				log.Printf("provisioning recovery: retire %s: %v (left as cleanup_failed; retried by maintenance)", machineID, err)
-			}
+		if claimed {
+			p.store.Audit(ctx, "request.provisioning_interrupted", "system", machineID, "request="+id)
 		}
 	}
-	return p.retryRecoveryCleanup(ctx)
+	return p.runProvisionCleanup(ctx)
 }
 
-// retryRecoveryCleanup retries the retire of machines that provisioning
-// recovery could not clean up.
-func (p *Provisioner) retryRecoveryCleanup(ctx context.Context) error {
-	rows, err := p.store.db.QueryContext(ctx, `SELECT id FROM machines WHERE desired_changed_by=? AND desired_state<>'retired' AND cleanup_state=?`, provisionRecoveryActor, CleanupFailed)
+// runProvisionCleanup retires the machine of every cleanup_pending request
+// until it is retired, then marks the request cleaned.
+func (p *Provisioner) runProvisionCleanup(ctx context.Context) error {
+	// Requests recovered by the previous release carry no phase; put their
+	// unfinished machines into the phase machine.
+	if _, err := p.store.db.ExecContext(ctx, `UPDATE requests SET provision_phase=? WHERE status='expired' AND (provision_phase IS NULL OR provision_phase='') AND machine_id IN (SELECT id FROM machines WHERE desired_changed_by=? AND desired_state<>'retired')`, phaseCleanupPending, provisionRecoveryActor); err != nil {
+		return err
+	}
+	rows, err := p.store.db.QueryContext(ctx, `SELECT id,COALESCE(machine_id,'') FROM requests WHERE provision_phase=?`, phaseCleanupPending)
 	if err != nil {
 		return err
 	}
-	var ids []string
+	type pending struct{ req, machine string }
+	var list []pending
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var pd pending
+		if err := rows.Scan(&pd.req, &pd.machine); err != nil {
 			_ = rows.Close()
 			return err
 		}
-		ids = append(ids, id)
+		list = append(list, pd)
 	}
 	if err := rows.Close(); err != nil {
 		return err
 	}
-	for _, id := range ids {
-		if _, err := p.SetDesiredState(ctx, id, DesiredRetired, provisionRecoveryActor); err != nil {
-			log.Printf("provisioning recovery retry: retire %s: %v", id, err)
+	for _, pd := range list {
+		if pd.machine != "" {
+			m, err := p.GetMachine(ctx, pd.machine)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				log.Printf("provisioning cleanup %s: %v", pd.req, err)
+				continue
+			}
+			if err == nil && m.DesiredState != DesiredRetired {
+				if _, err := p.SetDesiredState(ctx, pd.machine, DesiredRetired, provisionRecoveryActor); err != nil {
+					log.Printf("provisioning cleanup: retire %s: %v (retried by the next maintenance run)", pd.machine, err)
+					continue
+				}
+			}
+		}
+		if _, err := p.store.db.ExecContext(ctx, `UPDATE requests SET provision_phase=? WHERE id=? AND provision_phase=?`, phaseCleaned, pd.req, phaseCleanupPending); err != nil {
+			return err
 		}
 	}
 	return nil
