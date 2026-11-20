@@ -1255,10 +1255,50 @@ func probeSSH(ctx context.Context, host string, port int, timeout time.Duration)
 	return nil
 }
 
+// errNoValidDesiredKeys: the hub sent keys but none can be installed.
+var errNoValidDesiredKeys = errors.New("hub sent admin keys but none is valid for this target; keeping the installed keys")
+
+// syncKeys replaces this machine's Reach admin keys. The candidate set is
+// built and checked BEFORE the old marker lines are touched (astra R2-11):
+// a non-empty desired list with zero usable keys is an error and leaves
+// the file unchanged. Only an explicit disable (enabled=false) or an empty
+// desired list removes every Reach key.
 func (d *Daemon) syncKeys(keys []DesiredPubkey, enabled bool) error {
 	auth := d.cfg.LocalSSH.AuthFile
 	if auth == "" {
 		return nil
+	}
+	var candidates []string
+	desired := 0
+	if enabled {
+		supportedKeyTypes := d.cfg.Tunnel.SSHCompat.SupportedAuthorizedKeyTypes
+		if d.cfg.LocalSSH.InternalSSHD {
+			supportedKeyTypes = internalSSHDSupportedKeyTypes
+		}
+		for _, k := range keys {
+			if strings.TrimSpace(k.PublicKey) == "" {
+				continue
+			}
+			desired++
+			pub, err := canonicalAdminKey(k.PublicKey)
+			if err != nil {
+				d.logger.Printf("skipping invalid admin key from hub: %v", err)
+				continue
+			}
+			fields := strings.Fields(pub)
+			if len(supportedKeyTypes) > 0 && (len(fields) == 0 || !keyTypeSupported(fields[0], supportedKeyTypes)) {
+				d.logger.Printf("skipping admin key type %s not supported by the local sshd", fields[0])
+				continue
+			}
+			if d.cfg.LocalSSH.InternalSSHD {
+				candidates = append(candidates, fmt.Sprintf("%s reach:%s", pub, d.cfg.MachineID))
+			} else {
+				candidates = append(candidates, fmt.Sprintf("from=\"127.0.0.1,::1\",no-agent-forwarding,no-X11-forwarding,no-port-forwarding %s reach:%s", pub, d.cfg.MachineID))
+			}
+		}
+		if desired > 0 && len(candidates) == 0 {
+			return errNoValidDesiredKeys
+		}
 	}
 	b, err := readAuthorizedKeysFile(auth)
 	if err != nil {
@@ -1272,31 +1312,7 @@ func (d *Daemon) syncKeys(keys []DesiredPubkey, enabled bool) error {
 		}
 		kept = append(kept, line)
 	}
-	if enabled {
-		for _, k := range keys {
-			if strings.TrimSpace(k.PublicKey) == "" {
-				continue
-			}
-			pub, err := canonicalAdminKey(k.PublicKey)
-			if err != nil {
-				d.logger.Printf("skipping invalid admin key from hub: %v", err)
-				continue
-			}
-			fields := strings.Fields(pub)
-			supportedKeyTypes := d.cfg.Tunnel.SSHCompat.SupportedAuthorizedKeyTypes
-			if d.cfg.LocalSSH.InternalSSHD {
-				supportedKeyTypes = internalSSHDSupportedKeyTypes
-			}
-			if len(supportedKeyTypes) > 0 && (len(fields) == 0 || !keyTypeSupported(fields[0], supportedKeyTypes)) {
-				continue
-			}
-			if d.cfg.LocalSSH.InternalSSHD {
-				kept = append(kept, fmt.Sprintf("%s reach:%s", pub, d.cfg.MachineID))
-			} else {
-				kept = append(kept, fmt.Sprintf("from=\"127.0.0.1,::1\",no-agent-forwarding,no-X11-forwarding,no-port-forwarding %s reach:%s", pub, d.cfg.MachineID))
-			}
-		}
-	}
+	kept = append(kept, candidates...)
 	return writeAuthorizedKeysFile(auth, d.authKeysAccount(), []byte(strings.Join(kept, "\n")+"\n"))
 }
 
