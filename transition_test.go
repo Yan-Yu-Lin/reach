@@ -68,3 +68,49 @@ func TestUsedSetupTokenIsUnauthorizedNotBusy(t *testing.T) {
 		t.Fatalf("reused token = %d", rec.Code)
 	}
 }
+
+// Daybreak P2-7: a reachd crash mid-provision must not leave the request
+// (and its invite claim) stuck in "provisioning" forever, and a half-made
+// machine must be visible as failed.
+func TestStuckProvisioningIsRecovered(t *testing.T) {
+	server, store, _ := newReliabilityTestServer(t)
+	hash, _ := HashSecret("inv-stuck")
+	if _, err := store.db.Exec(`INSERT INTO invites (code_hash,type,expires_at,created_at) VALUES (?,'friend',?,?)`, hash, time.Now().Add(time.Hour).UTC().Format(time.RFC3339), nowUTC()); err != nil {
+		t.Fatal(err)
+	}
+	rec := doJSON(t, server, http.MethodPost, "/api/client/register", `{"name":"stuck-box","auth_code":"inv-stuck"}`, "")
+	if rec.Code != 200 {
+		t.Fatalf("register %d", rec.Code)
+	}
+	var id string
+	_ = store.db.QueryRow(`SELECT id FROM requests`).Scan(&id)
+	// Simulate the crash: consumed token, machine row in provisioning state.
+	old := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)
+	insertTestMachine(t, store, "m_stuck", "stuck-box")
+	if _, err := store.db.Exec(`UPDATE machines SET status='provisioning' WHERE id='m_stuck'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`UPDATE requests SET status='provisioning', setup_token_hash=NULL, provisioning_started_at=?, machine_id='m_stuck' WHERE id=?`, old, id); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.prov.ExpireOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var reqStatus, mStatus string
+	var claimed *string
+	_ = store.db.QueryRow(`SELECT status FROM requests WHERE id=?`, id).Scan(&reqStatus)
+	_ = store.db.QueryRow(`SELECT status FROM machines WHERE id='m_stuck'`).Scan(&mStatus)
+	_ = store.db.QueryRow(`SELECT claimed_by_request_id FROM invites`).Scan(&claimed)
+	if reqStatus != "expired" || mStatus != "failed" || claimed != nil {
+		t.Fatalf("after recovery: request=%s machine=%s invite claim=%v", reqStatus, mStatus, claimed)
+	}
+	// A provision still inside its lease is left alone.
+	if _, err := store.db.Exec(`UPDATE requests SET status='provisioning', provisioning_started_at=? WHERE id=?`, nowUTC(), id); err != nil {
+		t.Fatal(err)
+	}
+	_ = server.prov.ExpireOnce(context.Background())
+	_ = store.db.QueryRow(`SELECT status FROM requests WHERE id=?`, id).Scan(&reqStatus)
+	if reqStatus != "provisioning" {
+		t.Fatalf("in-lease provision was recovered: %s", reqStatus)
+	}
+}

@@ -43,6 +43,9 @@ type Provisioner struct {
 }
 
 type CreateMachineInput struct {
+	// RequestID links the machine to its enrollment so a crashed provision
+	// can be detected and cleaned up (daybreak P2-7).
+	RequestID   string
 	Slug        string
 	DisplayName string
 	TargetUser  string
@@ -155,6 +158,11 @@ func (p *Provisioner) CreateMachine(ctx context.Context, in CreateMachineInput) 
 	}
 	if in.OwnerUserID != "" {
 		_, _ = tx.ExecContext(ctx, `INSERT OR IGNORE INTO machine_grants (machine_id,user_id,role,expires_at) VALUES (?,?,?,?)`, machineID, in.OwnerUserID, "owner", nullable(in.ExpiresAt))
+	}
+	if in.RequestID != "" {
+		if _, err := tx.ExecContext(ctx, `UPDATE requests SET machine_id=? WHERE id=? AND status='provisioning'`, machineID, in.RequestID); err != nil {
+			return res, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return res, err
@@ -1418,6 +1426,9 @@ func (p *Provisioner) ExpireOnce(ctx context.Context) error {
 	if _, err := p.store.db.ExecContext(ctx, `UPDATE requests SET status='expired' WHERE status='approved' AND setup_token_expires_at IS NOT NULL AND setup_token_expires_at < ?`, now); err != nil {
 		return err
 	}
+	if err := p.recoverStuckProvisioning(ctx, nowTime); err != nil {
+		return err
+	}
 	// Release invite claims whose request expired or was denied without
 	// provisioning, so a legitimate invite is not burned by a failed attempt.
 	if _, err := p.store.db.ExecContext(ctx, `UPDATE invites SET claimed_by_request_id=NULL, claimed_at=NULL WHERE used_by IS NULL AND claimed_by_request_id IN (SELECT id FROM requests WHERE status IN ('expired','denied'))`); err != nil {
@@ -1451,6 +1462,51 @@ func (p *Provisioner) ExpireOnce(ctx context.Context) error {
 	for _, id := range ids {
 		if err := p.DisableMachine(ctx, id, "system-expire"); err != nil {
 			log.Printf("auto-expire disable %s: %v", id, err)
+		}
+	}
+	return nil
+}
+
+// provisioningLease bounds how long a request may stay "provisioning".
+const provisioningLease = 10 * time.Minute
+
+// recoverStuckProvisioning handles a reachd crash in the middle of a
+// provision (daybreak P2-7). The setup token was already consumed and the
+// agent token only ever existed in the lost response, so the attempt cannot
+// be resumed: the request is expired (the installer registers again), its
+// invite claim is released by the next maintenance step, and a machine row
+// it created is marked failed so its port and user stay reserved until an
+// operator retires it.
+func (p *Provisioner) recoverStuckProvisioning(ctx context.Context, now time.Time) error {
+	cutoff := now.Add(-provisioningLease).Format(time.RFC3339)
+	rows, err := p.store.db.QueryContext(ctx, `SELECT id,COALESCE(machine_id,'') FROM requests WHERE status='provisioning' AND (provisioning_started_at IS NULL OR provisioning_started_at<?)`, cutoff)
+	if err != nil {
+		return err
+	}
+	type stuck struct{ id, machine string }
+	var list []stuck
+	for rows.Next() {
+		var st stuck
+		if err := rows.Scan(&st.id, &st.machine); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		list = append(list, st)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, st := range list {
+		if st.machine != "" {
+			_, _ = p.store.db.ExecContext(ctx, `UPDATE machines SET status='failed', provision_error=COALESCE(provision_error,'provision interrupted; retire this machine and register again'), updated_at=? WHERE id=? AND status IN ('provisioning','failed')`, nowUTC(), st.machine)
+			_, _ = p.store.db.ExecContext(ctx, `UPDATE tunnels SET status='failed' WHERE machine_id=? AND status IN ('offline','pending')`, st.machine)
+		}
+		res, err := p.store.db.ExecContext(ctx, `UPDATE requests SET status='expired' WHERE id=? AND status='provisioning'`, st.id)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 1 {
+			p.store.Audit(ctx, "request.provisioning_interrupted", "system", st.machine, "request="+st.id)
 		}
 	}
 	return nil

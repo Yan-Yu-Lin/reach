@@ -659,9 +659,11 @@ func (s *Server) handleClientProvision(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "no admin user configured")
 		return
 	}
-	res, err := s.prov.CreateMachine(r.Context(), CreateMachineInput{Slug: req.Slug, DisplayName: firstNonEmpty(req.DisplayName, name), TargetUser: req.TargetUser, Pubkey: req.Pubkey, Mode: req.Mode, LocalPort: req.LocalPort, Persistence: req.Persistence, Distro: req.Distro, Arch: req.Arch, OwnerUserID: owner})
+	res, err := s.prov.CreateMachine(r.Context(), CreateMachineInput{RequestID: requestID, Slug: req.Slug, DisplayName: firstNonEmpty(req.DisplayName, name), TargetUser: req.TargetUser, Pubkey: req.Pubkey, Mode: req.Mode, LocalPort: req.LocalPort, Persistence: req.Persistence, Distro: req.Distro, Arch: req.Arch, OwnerUserID: owner})
 	if err != nil {
-		_, _ = s.store.db.ExecContext(r.Context(), `UPDATE requests SET status='approved' WHERE id=? AND status='provisioning'`, requestID)
+		// Back to approved without a setup token: the agent must poll for
+		// a new one, so a retry cannot reuse the consumed token.
+		_, _ = s.store.db.ExecContext(r.Context(), `UPDATE requests SET status='approved', provisioning_started_at=NULL, machine_id=NULL WHERE id=? AND status='provisioning'`, requestID)
 		// Details (sshd -t output, paths) stay in the server log (Opus P3-3).
 		log.Printf("provision %s failed: %v", requestID, err)
 		if isUniqueSlugErr(err) {
@@ -671,7 +673,7 @@ func (s *Server) handleClientProvision(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "provisioning failed; ask the operator to check the reachd log")
 		return
 	}
-	_, _ = s.store.db.ExecContext(r.Context(), `UPDATE requests SET status='provisioned' WHERE id=?`, requestID)
+	_, _ = s.store.db.ExecContext(r.Context(), `UPDATE requests SET status='provisioned', machine_id=? WHERE id=?`, res.Machine.ID, requestID)
 	// Consume only the claim this request holds; never overwrite used_by.
 	if _, err := s.store.db.ExecContext(r.Context(), `UPDATE invites SET used_by=?, consumed_at=? WHERE claimed_by_request_id=? AND used_by IS NULL`, res.Machine.ID, nowUTC(), requestID); err != nil {
 		log.Printf("consume invite for %s: %v", requestID, err)
@@ -840,7 +842,7 @@ func (s *Server) consumeSetupToken(ctx context.Context, requestID, token string)
 	if t, err := time.Parse(time.RFC3339, reqExpires); err != nil || time.Now().UTC().After(t) {
 		return "", "", errSetupTokenExpired
 	}
-	res, err := s.store.db.ExecContext(ctx, `UPDATE requests SET status='provisioning', setup_token_hash=NULL WHERE id=? AND status='approved' AND setup_token_hash=?`, requestID, hash.String)
+	res, err := s.store.db.ExecContext(ctx, `UPDATE requests SET status='provisioning', setup_token_hash=NULL, provisioning_started_at=? WHERE id=? AND status='approved' AND setup_token_hash=?`, nowUTC(), requestID, hash.String)
 	if err != nil {
 		return "", "", err
 	}

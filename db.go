@@ -324,6 +324,8 @@ func (s *Store) Migrate(ctx context.Context, cfg Config) error {
 		{"requests", "metadata_json", "TEXT"},
 		{"requests", "observed_ip", "TEXT"},
 		{"requests", "slug", "TEXT"},
+		{"requests", "provisioning_started_at", "TEXT"},
+		{"requests", "machine_id", "TEXT"},
 	} {
 		if err := s.ensureColumn(ctx, col.table, col.name, col.decl); err != nil {
 			return err
