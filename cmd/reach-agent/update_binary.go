@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -32,9 +33,13 @@ var releaseManifestPublicKeys = []string{
 }
 
 type releaseManifest struct {
-	Schema    int                     `json:"schema"`
-	Project   string                  `json:"project"`
-	Version   string                  `json:"version"`
+	Schema  int    `json:"schema"`
+	Project string `json:"project"`
+	Version string `json:"version"`
+	// Sequence is a monotonically increasing release number inside the
+	// signed manifest. Manifests published before it existed fall back to
+	// their signed created_at.
+	Sequence  int64                   `json:"sequence,omitempty"`
 	GitCommit string                  `json:"git_commit,omitempty"`
 	CreatedAt string                  `json:"created_at"`
 	Assets    map[string]releaseAsset `json:"assets"`
@@ -53,6 +58,9 @@ type updateBinaryOptions struct {
 	RollbackAfter time.Duration
 	Foreground    bool
 	Confirm       bool
+	// AllowDowngrade is a local break-glass flag. Remote update_agent
+	// commands never pass it.
+	AllowDowngrade bool
 
 	rollbackWatcher bool
 	confirmFlag     string
@@ -84,6 +92,7 @@ func updateBinaryCommand(ctx context.Context, args []string) error {
 	fs.StringVar(&opt.InstallEnv, "install-env", "", "path to existing install.env")
 	fs.BoolVar(&opt.Foreground, "foreground", false, "perform the update in this process instead of spawning a detached worker")
 	fs.BoolVar(&opt.Confirm, "confirm", false, "confirm the current manual update and cancel rollback")
+	fs.BoolVar(&opt.AllowDowngrade, "allow-downgrade", false, "local break-glass: accept a signed release older than the last confirmed one")
 	fs.BoolVar(&opt.rollbackWatcher, "rollback-watcher", false, "internal: run rollback watcher")
 	fs.StringVar(&opt.confirmFlag, "confirm-flag", "", "internal: confirmation flag path")
 	fs.StringVar(&opt.backupPath, "backup", "", "internal: backup binary path")
@@ -261,16 +270,19 @@ func performBinaryUpdate(ctx context.Context, st reachInstallState, opt updateBi
 	if err != nil {
 		return err
 	}
+	var manifest releaseManifest
 	if candidatePath == "" {
-		path, done, err := downloadAgentCandidate(ctx, apiURL, opt.Version, asset)
+		path, m, done, err := downloadAgentCandidate(ctx, apiURL, opt.Version, asset, st.DataDir, opt.AllowDowngrade)
 		if err != nil {
 			return err
 		}
-		candidatePath, cleanup = path, done
+		candidatePath, cleanup, manifest = path, done, m
 	} else {
-		if err := verifyCandidateManifest(ctx, apiURL, opt.Version, asset, candidatePath); err != nil {
+		m, err := verifyCandidateManifest(ctx, apiURL, opt.Version, asset, candidatePath, st.DataDir, opt.AllowDowngrade)
+		if err != nil {
 			return err
 		}
+		manifest = m
 	}
 	defer cleanup()
 
@@ -295,7 +307,7 @@ func performBinaryUpdate(ctx context.Context, st reachInstallState, opt updateBi
 	fmt.Printf("[reach] backed up current binary to %s\n", backupPath)
 
 	confirmFlag := filepath.Join(st.DataDir, "update-confirm-required")
-	if err := os.WriteFile(confirmFlag, []byte(fmt.Sprintf("backup=%s\ninstalled_at=%s\ncandidate_version=%s\n", backupPath, time.Now().UTC().Format(time.RFC3339), candidateVersion)), 0o600); err != nil {
+	if err := os.WriteFile(confirmFlag, []byte(fmt.Sprintf("backup=%s\ninstalled_at=%s\ncandidate_version=%s\ncandidate_sequence=%d\n", backupPath, time.Now().UTC().Format(time.RFC3339), candidateVersion, manifestSequence(manifest))), 0o600); err != nil {
 		return fmt.Errorf("write confirmation flag: %w", err)
 	}
 
@@ -363,35 +375,42 @@ func agentAssetForOSArch(goos, arch string) (string, error) {
 	return "", fmt.Errorf("unsupported platform %s/%s", goos, arch)
 }
 
-func verifyCandidateManifest(ctx context.Context, apiURL, version, asset, candidatePath string) error {
+func verifyCandidateManifest(ctx context.Context, apiURL, version, asset, candidatePath, dataDir string, allowDowngrade bool) (releaseManifest, error) {
 	if apiURL == "" {
-		return fmt.Errorf("--api-url is required to verify --candidate")
+		return releaseManifest{}, fmt.Errorf("--api-url is required to verify --candidate")
 	}
 	baseURL := strings.TrimRight(apiURL, "/") + "/downloads/reach-agent/v" + version
 	manifest, releaseAsset, err := downloadAndVerifyReleaseManifest(ctx, baseURL, version, asset)
 	if err != nil {
-		return err
+		return releaseManifest{}, err
+	}
+	if err := checkReleaseFloor(dataDir, manifest, allowDowngrade); err != nil {
+		return releaseManifest{}, err
 	}
 	actual, err := verifyFileSHA256(candidatePath, releaseAsset)
 	if err != nil {
-		return fmt.Errorf("candidate verification failed for %s: %w", asset, err)
+		return releaseManifest{}, fmt.Errorf("candidate verification failed for %s: %w", asset, err)
 	}
 	fmt.Printf("[reach] signed release manifest verified: version=%s created_at=%s\n", manifest.Version, manifest.CreatedAt)
 	fmt.Printf("[reach] candidate checksum verified from signed manifest: %s\n", actual)
-	return nil
+	return manifest, nil
 }
 
-func downloadAgentCandidate(ctx context.Context, apiURL, version, asset string) (string, func(), error) {
+func downloadAgentCandidate(ctx context.Context, apiURL, version, asset, dataDir string, allowDowngrade bool) (string, releaseManifest, func(), error) {
 	tmpDir, err := os.MkdirTemp("", "reach-agent-update-*")
 	if err != nil {
-		return "", nil, err
+		return "", releaseManifest{}, nil, err
 	}
 	cleanup := func() { _ = os.RemoveAll(tmpDir) }
 	baseURL := strings.TrimRight(apiURL, "/") + "/downloads/reach-agent/v" + version
 	manifest, releaseAsset, err := downloadAndVerifyReleaseManifest(ctx, baseURL, version, asset)
 	if err != nil {
 		cleanup()
-		return "", nil, err
+		return "", releaseManifest{}, nil, err
+	}
+	if err := checkReleaseFloor(dataDir, manifest, allowDowngrade); err != nil {
+		cleanup()
+		return "", releaseManifest{}, nil, err
 	}
 	binURL := baseURL + "/" + asset
 	binPath := filepath.Join(tmpDir, "reach-agent")
@@ -399,19 +418,19 @@ func downloadAgentCandidate(ctx context.Context, apiURL, version, asset string) 
 	fmt.Printf("[reach] downloading %s\n", binURL)
 	if err := downloadFile(ctx, binURL, binPath, maxDownloadBytes(releaseAsset.Size)); err != nil {
 		cleanup()
-		return "", nil, err
+		return "", releaseManifest{}, nil, err
 	}
 	actual, err := verifyFileSHA256(binPath, releaseAsset)
 	if err != nil {
 		cleanup()
-		return "", nil, fmt.Errorf("download verification failed for %s: %w", asset, err)
+		return "", releaseManifest{}, nil, fmt.Errorf("download verification failed for %s: %w", asset, err)
 	}
 	if err := os.Chmod(binPath, 0o755); err != nil {
 		cleanup()
-		return "", nil, err
+		return "", releaseManifest{}, nil, err
 	}
 	fmt.Printf("[reach] checksum verified from signed manifest: %s\n", actual)
-	return binPath, cleanup, nil
+	return binPath, manifest, cleanup, nil
 }
 
 func downloadAndVerifyReleaseManifest(ctx context.Context, baseURL, version, asset string) (releaseManifest, releaseAsset, error) {
@@ -749,6 +768,16 @@ func restoreBinary(backupPath, agentPath string) error {
 
 func confirmUpdate(st reachInstallState) error {
 	flag := filepath.Join(st.DataDir, "update-confirm-required")
+	if b, err := os.ReadFile(flag); err == nil {
+		// Raise the anti-rollback floor only once the new binary has proven
+		// itself, so an unconfirmed (rolled back) update does not lock the
+		// agent out of reinstalling the previous release.
+		if seq := confirmFlagSequence(string(b)); seq > 0 {
+			if err := raiseReleaseFloor(st.DataDir, seq); err != nil {
+				fmt.Printf("[reach warning] could not record release floor: %v\n", err)
+			}
+		}
+	}
 	if err := os.Remove(flag); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			fmt.Printf("[reach] no pending update confirmation found at %s\n", flag)
@@ -831,4 +860,94 @@ func restartDetachedAgent(st reachInstallState) error {
 	}
 	_ = os.Remove(st.PIDFile)
 	return startDetached(st.AgentPath, st.ConfigPath, st.LogPath, st.PIDFile)
+}
+
+// --- anti-rollback (daybreak P2-6) ---
+
+const releaseFloorFile = "release-floor.json"
+
+type releaseFloor struct {
+	Sequence  int64  `json:"sequence"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+// manifestSequence returns the signed ordering key of a manifest.
+func manifestSequence(m releaseManifest) int64 {
+	if m.Sequence > 0 {
+		return m.Sequence
+	}
+	if t, err := time.Parse(time.RFC3339, m.CreatedAt); err == nil {
+		return t.Unix()
+	}
+	return 0
+}
+
+func readReleaseFloor(dataDir string) (int64, error) {
+	if dataDir == "" {
+		return 0, nil
+	}
+	b, err := os.ReadFile(filepath.Join(dataDir, releaseFloorFile))
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	var f releaseFloor
+	if err := json.Unmarshal(b, &f); err != nil {
+		return 0, fmt.Errorf("corrupt %s: %w", releaseFloorFile, err)
+	}
+	return f.Sequence, nil
+}
+
+// checkReleaseFloor refuses a signed manifest older than the highest release
+// this agent has confirmed. A compromised hub can only offer validly signed
+// releases; this stops it from downgrading to one with known bugs.
+func checkReleaseFloor(dataDir string, m releaseManifest, allowDowngrade bool) error {
+	seq := manifestSequence(m)
+	if seq <= 0 {
+		return fmt.Errorf("release manifest %s has no usable sequence or created_at", m.Version)
+	}
+	floor, err := readReleaseFloor(dataDir)
+	if err != nil {
+		return err
+	}
+	if seq < floor {
+		if allowDowngrade {
+			fmt.Printf("[reach warning] --allow-downgrade: accepting release %s (sequence %d < floor %d)\n", m.Version, seq, floor)
+			return nil
+		}
+		return fmt.Errorf("refusing downgrade to %s: release sequence %d is older than the last confirmed release (%d); rerun locally with --allow-downgrade if intended", m.Version, seq, floor)
+	}
+	return nil
+}
+
+func raiseReleaseFloor(dataDir string, seq int64) error {
+	if dataDir == "" || seq <= 0 {
+		return nil
+	}
+	cur, err := readReleaseFloor(dataDir)
+	if err != nil {
+		return err
+	}
+	if seq <= cur {
+		return nil
+	}
+	b, _ := json.Marshal(releaseFloor{Sequence: seq, UpdatedAt: time.Now().UTC().Format(time.RFC3339)})
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		return err
+	}
+	return writeFileAtomic(filepath.Join(dataDir, releaseFloorFile), b, 0o600)
+}
+
+func confirmFlagSequence(flag string) int64 {
+	for _, line := range strings.Split(flag, "\n") {
+		if v, ok := strings.CutPrefix(strings.TrimSpace(line), "candidate_sequence="); ok {
+			n, err := strconv.ParseInt(v, 10, 64)
+			if err == nil {
+				return n
+			}
+		}
+	}
+	return 0
 }

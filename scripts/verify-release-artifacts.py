@@ -75,6 +75,10 @@ def main() -> None:
     if manifest.get("git_commit") != args.commit:
         fail(f"manifest commit is {manifest.get('git_commit')!r}, expected {args.commit!r}")
 
+    sequence = manifest.get("sequence")
+    if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence <= 0:
+        fail("manifest sequence must be a positive integer (agent anti-rollback)")
+
     assets = manifest.get("assets")
     if not isinstance(assets, dict) or set(assets) != ASSET_NAMES:
         fail("manifest asset set is incomplete or contains unexpected entries")

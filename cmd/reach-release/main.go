@@ -50,6 +50,7 @@ type releaseManifest struct {
 	Schema    int                     `json:"schema"`
 	Project   string                  `json:"project"`
 	Version   string                  `json:"version"`
+	Sequence  int64                   `json:"sequence,omitempty"`
 	GitCommit string                  `json:"git_commit,omitempty"`
 	CreatedAt string                  `json:"created_at"`
 	Assets    map[string]releaseAsset `json:"assets"`
@@ -84,6 +85,7 @@ func manifestCommand(args []string) error {
 	dir := fs.String("dir", ".", "directory containing release assets")
 	version := fs.String("version", "", "release version")
 	commit := fs.String("commit", "", "git commit")
+	sequence := fs.Int64("sequence", 0, "monotonic release sequence (default: current Unix time)")
 	outPath := fs.String("out", "", "manifest output path (default: DIR/manifest.json)")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -109,7 +111,11 @@ func manifestCommand(args []string) error {
 		sum := sha256.Sum256(b)
 		assets[name] = releaseAsset{SHA256: hex.EncodeToString(sum[:]), Size: st.Size()}
 	}
-	manifest := releaseManifest{Schema: 1, Project: "reach-agent", Version: *version, GitCommit: *commit, CreatedAt: nowUTC(), Assets: assets}
+	seq := *sequence
+	if seq <= 0 {
+		seq = time.Now().UTC().Unix()
+	}
+	manifest := releaseManifest{Schema: 1, Project: "reach-agent", Version: *version, Sequence: seq, GitCommit: *commit, CreatedAt: nowUTC(), Assets: assets}
 	b, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
 		return err
