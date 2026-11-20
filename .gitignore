@@ -2,6 +2,11 @@
 /reach
 /reachd
 /reachctl
+/cmd/*/reach-agent
+/cmd/*/reach-agent.exe
+/cmd/*/reach-mac-agent
+/cmd/*/reach-ws-carrier
+/cmd/*/reach-release
 
 # Node/Nuxt
 node_modules/
