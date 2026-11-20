@@ -4,13 +4,13 @@
 - 依據：`~/30-39-Research/34-tech-research/2026-11-20-reach-dashboard-frontend.md` 的 A 表和 B 部分、兩份安全報告裡跟前端有關的項目（Opus P2-4、P2-7、P3-5；daybreak P2-1、P3-1），以及後端的 `docs/EVENTS.md`（`fix/hardening-2026-11` 的 41fbbff）。
 - 新截圖：`~/30-39-Research/34-tech-research/2026-11-21-reach-dashboard-v2-shots/`
 - 量測原始資料：同一個資料夾下的 `measurements/`（`before-all.json`、`after-all.json`、`after-oldsrv-all.json`、`summary.md`）
-- 驗證（第 3 輪後，HEAD 以 git log 為準）：
+- 驗證（第 4 輪後，HEAD 以 git log 為準）：
   - `npm run build`、`npm run generate` 都通過。
   - `nuxt typecheck` 0 個錯誤。
-  - `vitest` 73/73 通過。
-  - 瀏覽器回歸測試 `test-harness/regress.mjs` 26/26 通過。
-  - 對真實 reachd（hardening `4ac35da`）的 revoke e2e 通過。
-  - 審查意見的處理見「astra round 1／daybreak」和「astra round 2」兩節。
+  - `vitest` 82/82 通過。
+  - 瀏覽器回歸測試 `test-harness/regress.mjs` 38/38 通過。
+  - 對真實 reachd（hardening `d260ae6`）的 revoke e2e 通過。
+  - 審查意見的處理見「astra round 1／daybreak」、「astra round 2」、「astra round 3」三節。
 
 ---
 
@@ -318,6 +318,49 @@ astra 要求補的回歸案例，除了「後端 revoke-all 關掉既有 stream�
 
 - Disable all 在「按下確認之後」才發生的網路競態，要等後端提供帶條件的 bulk API。
 - 舊版 reachd 沒有 probe 時間，所以重播事件只能靠補一次 GET 來修正。如果那次 GET 也失敗，畫面會保持 Unknown，而不是 OK，這是刻意選擇保守的做法。
+
+---
+
+## astra round 3
+
+- **審查報告：** `~/30-39-Research/34-tech-research/2026-11-21-reach-dashboard-astra-review-r3.md`，審的是 `8a680f6`，判定 FIX。剩下 4 項 P2（R3-01～R3-04）和 2 項 P3（R3-05、R3-06）。
+- **daybreak 另提的一項：** 「health/probe 事件重播的順序，可能讓比較舊的 machine row 蓋掉比較新的 probe」，併在 R3-04 一起處理。
+- **commit：**
+  - `7326972`：R3-03、R3-04（含 daybreak）
+  - `3b65e3b`：R3-05
+  - `f9e1e01`：R3-01、R3-02、R3-06
+- **每個 commit 都可以單獨 build：** 我在另一個暫時的 worktree 裡逐一 checkout，每個 commit 的 typecheck 都是 0 個錯誤，vitest 82/82 通過。
+
+### 驗證
+
+- `vitest`：82/82 通過。
+- `nuxt typecheck`：0 個錯誤。
+- `npm run build`、`npm run generate`：都通過。
+- **`regress.mjs`：38/38 通過**，比上一輪多 12 個案例。
+  - 同一套案例跑 astra 審的 `8a680f6` bundle（用 astra 在 `/tmp/reach-astra-r3-20261121/current` build 的版本），**結果是 29/38**。沒過的 9 個，全部是這輪新加、對應 R3-01～R3-06 的案例。
+  - 紀錄存在 `measurements/regress-8a680f6.txt` 和 `measurements/regress-round4.txt`。
+- **真實 reachd 的 revoke e2e：** 用 hardening `d260ae6` 重跑一次，結果仍然通過，被撤銷的分頁 1.6 秒後回到登入頁。紀錄存在 `measurements/real-reachd-revoke-round4.json`。
+
+### 逐項處理
+
+| # | 問題 | 怎麼修 | 證明 |
+|---|---|---|---|
+| R3-01 P2 | 一個分頁的 token 過期時，會把 localStorage 裡另一個分頁不同的 remembered token 一起刪掉 | **「結束這個分頁」和「清 storage」分開處理：**<br>- `forgetStoredToken(t)` 只刪「目前存的值還等於 t」的那一格，sessionStorage 和 localStorage 都一樣。<br>- `setToken`、`signOutLocally('expired')`、收到廣播的分頁、JWT 過期的 middleware，全部改用這條路徑。<br>- 只有使用者主動按 `all` 時，才把這個瀏覽器存的登入全部清掉。<br><br>**另外區分「還沒載入」和「已經登出」**（`reach-token-loaded`），登出過的分頁不會再從 storage 自動撿到別的分頁的 token。 | regress「R3-01 a rejected session-only token does not delete another tab's remembered login」：A 用 sessionStorage，B 用 localStorage。A 被拒絕之後，B 的 localStorage 還在，reload 之後仍然是登入狀態。<br>regress「R3-01 a tab that signed out does not pick up another tab's remembered token」 |
+| R3-02 P2 | 如果 expired 先到，主動 Sign out 要廣播的 `all` 會被吞掉 | **按下的那一刻就決定**：<br>1. 先發出 logout 請求，請求會在送出時記下這個分頁的 token。<br>2. 馬上在本機執行 `all`：清掉 storage、廣播、導向登入頁。<br><br>logout 請求的回應不管回 401 還是很晚才回，都不會再影響本機狀態。因為 `all` 只在使用者點擊時送一次，不會在使用者重新登入之後才補發。 | regress（照 astra 的 `auth-edges.mjs` 改寫）：<br>- 「R3-02 Sign out reaches every tab even when the logout request answers 401」<br>- 「…three tabs: a peer's expiry overtakes a slow logout…」：A、A、B 三個分頁，logout 延遲 7 秒才回，三個分頁最後都在登入頁，token 都清空了。<br>- 「…a slow logout reply does not sign out a login made after it」 |
+| R3-03 P2 | 沒帶時間（欄位不存在）和時間是空字串被當成同一種情況，新的 probe 會借用舊的時間和錯誤訊息 | **probe 的狀態、時間、錯誤訊息當成一組。** planner 用 `strOrEmpty` 分出三種情況：<br>- **欄位不存在**（舊版 reachd）：保留整組舊資料，標成 `probe_unverified`，畫面顯示「Unknown: a newer probe result could not be dated」，再去抓一次權威資料。server 回應之後清掉這個標記。<br>- **空字串**：代表「沒有 observation」，舊的時間和錯誤都不保留，畫面顯示「Not probed yet」。<br>- **有時間**：比較新就整組換掉。錯誤訊息只有在是「同一筆 observation」時才保留。 | regress「R3-03 an undated reachable replayed over a FRESH failure…」：從一筆剛剛的失敗開始，重播一筆沒帶時間的 reachable，同時讓所有 refresh 都失敗。結果顯示 Unknown，不是 OK。<br>regress「…explicit empty probe time…」<br>vitest 另有 6 個案例。 |
+| R3-04 P2 + daybreak | 舊的 health event 只擋住 probe 欄位，還是會把機器的整體狀態蓋掉 | **`applyPatch` 先判斷整個 event 收不收：**<br>- event 的時間（`event_at`，沒有的話用 `heartbeat_at`）跟機器的 state clock 比。state clock 取最後一次套用的 event_at、row 的 `updated_at`、最新 heartbeat 三者中最晚的。<br>- 比較舊的就是歷史：機器狀態和 probe **都不套用**，只有比較新的存活時間仍然算數。<br><br>**收下的 event 裡，機器狀態和 probe 各用自己的時間比較**，所以舊的機器狀態不會蓋掉新的 probe，反過來也一樣（daybreak 的那一項）。<br><br>**舊版 reachd 的 event 沒帶時間：**<br>- 重播的（在這條連線的 `hello` 之前到的；照 EVENTS.md，hello 標示重播結束，這是協定上的位置，不是用 SSE id 推測）：狀態部分不套用，改抓權威資料。<br>- 即時的：照常套用，因為它就是伺服器最新的狀態。 | regress「R3-04 an old dated health event with a DIFFERENT state…」：一天前的 Offline/Unreachable 重播進來，同時讓所有 refresh 都失敗，badge 仍然是 Online，probe 仍然是 OK。<br>regress「…undated REPLAYED state change…」<br>vitest 另有 4 個案例，包括 `+08:00` 時區的比較。 |
+| R3-05 P3 | overflow 時沒有 backoff，而且被當成成功 | overflow 改算**失敗**：<br>- 用跟讀取失敗一樣的 backoff，1、2、4… 秒，最多 30 秒。<br>- 顯示「Too many live updates to keep up; the list may be behind」，並提供 `overflowCount` 給外部讀取。<br>- 畫面上完全沒資料時，先把那份作廢的清單顯示出來，並標成「可能落後」，不讓頁面一直空白。<br>- 單台批次 overflow 時，也走同一套 backoff。 | regress「R3-05 every read overflows…」：mock 設定每秒 10,000 個 heartbeat、讀取 1.5 秒。12 秒內快照讀取 ≤5 次（舊版是 8 次），有提示、有列表；風暴停止後收斂，之後不再重抓。 |
+| R3-06 P3 | 32-bit 的 fingerprint 可能讓不同 token 被誤判成同一個 | 改用 WebCrypto 的 SHA-256。<br>- 結束本機 session 的判斷仍然是同步的，直接比對這個分頁自己的 token，所以 R2-01 的保護不受 async 影響。<br>- 只有廣播要等 digest 算完。<br>- 收到廣播的分頁算完 digest 之後，會再檢查一次自己的 token 有沒有換過。<br>- 沒有 WebCrypto（非 secure context）時，fingerprint 是空字串，收到的分頁會忽略這種指定 token 的廣播，不會亂猜。 | regress「R3-06 two tokens with the same 32-bit FNV hash are told apart」：用 astra 造出來的碰撞 token 對測試，A 被拒絕後 B 仍然保持登入。<br>regress「targeted expiry still ends every tab holding the SAME token」：拿同一個 token 的分頁仍然會一起登出。 |
+
+### mock 的調整
+
+- 新增 `/__reject-token`，可以只讓某一個 token 失效，並關掉它的 SSE。
+- logout 改成跟 reachd 一樣：只 blacklist 呼叫者自己的 token，也只關掉那個 token 的 stream。
+
+### 還沒處理的
+
+- Disable all 在「按下確認之後」才發生的網路競態，要等後端提供帶條件的 bulk API。
+- R3-05：在一直持續的高事件率下，畫面會顯示「可能落後」，並定期用 backoff 重讀，但不保證能追上最新狀態。要追上，需要做 per-machine 欄位合併。目前 Arthur 的機群規模碰不到這個情況，所以先不做。
 
 ---
 
