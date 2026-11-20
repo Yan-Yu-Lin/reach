@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -33,8 +34,14 @@ func run(ctx context.Context, args []string) error {
 		maxConns := fs.Int("max-conns", 64, "global concurrent connection limit")
 		maxPerIP := fs.Int("max-conns-per-ip", 8, "concurrent connections per client IP")
 		idle := fs.Duration("idle-timeout", 10*time.Minute, "close carried connections idle this long")
+		allowAnyPath := fs.Bool("allow-any-path", false, "start without --path-prefix (development only)")
 		if err := fs.Parse(args); err != nil {
 			return err
+		}
+		// Fail closed: without the path the carrier would hand raw sshd to
+		// any WebSocket client that reaches it (daybreak P2-11).
+		if strings.TrimSpace(*pathPrefix) == "" && !*allowAnyPath {
+			return fmt.Errorf("refusing to start without --path-prefix or REACH_WS_PATH_PREFIX (use --allow-any-path for development)")
 		}
 		return wscarrier.ServeWithOptions(ctx, *listen, *target, log.Default(), wscarrier.ServerOptions{PathPrefix: *pathPrefix, MaxConns: *maxConns, MaxConnsPerIP: *maxPerIP, IdleTimeout: *idle})
 	}

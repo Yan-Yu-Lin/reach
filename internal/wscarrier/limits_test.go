@@ -58,7 +58,7 @@ func TestCarrierEnforcesExactPathBeforeDial(t *testing.T) {
 	srv := httptest.NewServer(NewHandler(target, log.New(io.Discard, "", 0), ServerOptions{PathPrefix: "/ws/tunnel/secret"}))
 	defer srv.Close()
 	addr := strings.TrimPrefix(srv.URL, "http://")
-	for _, p := range []string{"/", "/ws/tunnel/guess/", "/ws/tunnel/secretx/", "/other"} {
+	for _, p := range []string{"/", "/ws/tunnel/guess/", "/ws/tunnel/secretx/", "/other", "/ws/tunnel/secret/attacker-chosen-suffix"} {
 		c, code := rawUpgrade(t, addr, p)
 		c.Close()
 		if code != http.StatusNotFound {
@@ -151,6 +151,25 @@ func TestCarrierClosesIdleConnections(t *testing.T) {
 	for {
 		if _, err := c.Read(buf); err != nil {
 			return // closed by the carrier
+		}
+	}
+}
+
+// The exact path the agent dials (carrierURL) must be accepted by a
+// carrier configured with the same prefix, for both config spellings.
+func TestAgentPathMatchesExactCarrierPath(t *testing.T) {
+	target, _ := echoServer(t)
+	for _, prefix := range []string{"ws/tunnel/secret", "/ws/tunnel/secret/"} {
+		u, err := carrierURL("wss://tunnels.example.com", prefix)
+		if err != nil {
+			t.Fatal(err)
+		}
+		srv := httptest.NewServer(NewHandler(target, log.New(io.Discard, "", 0), ServerOptions{PathPrefix: prefix}))
+		c, code := rawUpgrade(t, strings.TrimPrefix(srv.URL, "http://"), u.Path)
+		c.Close()
+		srv.Close()
+		if code != http.StatusSwitchingProtocols {
+			t.Fatalf("prefix %q: agent path %q got %d", prefix, u.Path, code)
 		}
 	}
 }

@@ -105,8 +105,8 @@ func (c *wsConn) Close() error {
 // ServerOptions bounds the carrier (daybreak P2-4). Zero values select the
 // defaults below.
 type ServerOptions struct {
-	// PathPrefix, when set, is the only accepted URL path prefix (the shared
-	// /ws/tunnel/<secret>/ route). Requests for any other path get 404
+	// PathPrefix, when set, is the only accepted URL path (the shared
+	// /ws/tunnel/<secret>/ route), matched exactly. Requests for any other path get 404
 	// before the backend is dialled.
 	PathPrefix string
 	// MaxConns is the global concurrent connection limit.
@@ -205,7 +205,9 @@ func NewHandler(targetAddr string, logger *log.Logger, opts ServerOptions) http.
 	opts = opts.withDefaults()
 	limiter := &connLimiter{perIP: map[string]int{}, max: opts.MaxConns, maxIP: opts.MaxConnsPerIP}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if opts.PathPrefix != "" && !strings.HasPrefix(r.URL.Path, opts.PathPrefix) {
+		// Exact match: clients always connect to "<prefix>/"; descendant
+		// paths (".../secret/anything") are not accepted (daybreak P2-11).
+		if opts.PathPrefix != "" && r.URL.Path != opts.PathPrefix && r.URL.Path != strings.TrimSuffix(opts.PathPrefix, "/") {
 			http.NotFound(w, r)
 			return
 		}

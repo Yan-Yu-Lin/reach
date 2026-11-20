@@ -582,6 +582,21 @@ echo "[deploy] ensuring Go WebSocket carrier service..."
 if ! id reach-wstunnel >/dev/null 2>&1; then
   sudo useradd --system --no-create-home --shell /usr/sbin/nologin reach-wstunnel
 fi
+# The carrier fails closed without its path (daybreak P2-11): derive it from
+# websocket_tunnel.path_prefix in config.yaml. If the WebSocket fallback is
+# not configured, the carrier is not started.
+WS_PREFIX="$(sudo "$UV_BIN" run --script scripts/read-reach-config.py --config /etc/reach/config.yaml websocket_tunnel.path_prefix || true)"
+CARRIER_ENABLED=1
+if [ -z "$WS_PREFIX" ]; then
+  echo "[deploy] websocket_tunnel.path_prefix not set; WebSocket carrier will be disabled"
+  CARRIER_ENABLED=0
+else
+  case "$WS_PREFIX" in *[!A-Za-z0-9/_.-]*) echo "[deploy] ERROR: unexpected characters in websocket_tunnel.path_prefix" >&2; false ;; esac
+  # Same normalisation as the agent (carrierURL): "/" + trim("/") + "/".
+  ws_path="/${WS_PREFIX#/}"
+  ws_path="${ws_path%/}/"
+  printf 'REACH_WS_PATH_PREFIX=%s\n' "$ws_path" | sudo install -m 0640 -o root -g reach-wstunnel /dev/stdin /etc/reach/ws-carrier.env
+fi
 sudo tee /etc/systemd/system/reach-ws-carrier.service >/dev/null <<'EOF'
 [Unit]
 Description=Reach Go WebSocket SSH carrier
@@ -592,9 +607,10 @@ Wants=network-online.target
 Type=simple
 User=reach-wstunnel
 Group=reach-wstunnel
-# Optional: REACH_WS_PATH_PREFIX=/ws/tunnel/<secret>/ makes the carrier refuse
-# every other path itself (kept out of argv and out of git).
-EnvironmentFile=-/etc/reach/ws-carrier.env
+# REACH_WS_PATH_PREFIX=/ws/tunnel/<secret>/ (written by deploy from
+# websocket_tunnel.path_prefix; kept out of argv and git). The carrier
+# refuses to start without it and accepts only that exact path.
+EnvironmentFile=/etc/reach/ws-carrier.env
 ExecStart=/opt/reach/reach-ws-carrier server --listen 127.0.0.1:9401 --target 127.0.0.1:22
 Restart=always
 RestartSec=5
@@ -611,7 +627,11 @@ WantedBy=multi-user.target
 EOF
 sudo systemctl daemon-reload
 sudo systemctl disable --now reach-wstunnel.service 2>/dev/null || true
-sudo systemctl enable --now reach-ws-carrier.service
+if [ "$CARRIER_ENABLED" = 1 ]; then
+  sudo systemctl enable --now reach-ws-carrier.service
+else
+  sudo systemctl disable --now reach-ws-carrier.service 2>/dev/null || true
+fi
 
 echo "[deploy] swapping dashboard into place..."
 if sudo test -d /opt/reach-dashboard; then
@@ -727,9 +747,11 @@ done
 echo "[deploy] running reachd database readiness check..."
 sudo /opt/reach/reachd db-check --config /etc/reach/config.yaml
 
-echo "[deploy] restarting WebSocket carrier..."
-sudo systemctl restart reach-ws-carrier.service
-systemctl is-active reach-ws-carrier.service
+if [ "$CARRIER_ENABLED" = 1 ]; then
+  echo "[deploy] restarting WebSocket carrier..."
+  sudo systemctl restart reach-ws-carrier.service
+  systemctl is-active reach-ws-carrier.service
+fi
 
 if [ "$PUBLISH_AGENT_RELEASE" = 1 ]; then
   echo "[deploy] staging reach-agent v${AGENT_VERSION} publication..."
