@@ -83,7 +83,7 @@ write_checksums() {
 
 create_manifest() {
   local dir="$1"
-  go run ./cmd/reach-release manifest --dir "$dir" --version "$AGENT_VERSION" --commit "$(git rev-parse HEAD)"
+  go run ./cmd/reach-release manifest --dir "$dir" --version "$AGENT_VERSION" --commit "$(git rev-parse HEAD)" --sequence "$RELEASE_SEQUENCE"
 }
 
 sign_manifest_if_configured() {
@@ -169,7 +169,11 @@ bash scripts/validate-release-version.sh "$AGENT_VERSION" || {
   echo "[deploy] ERROR: invalid agent version" >&2
   exit 1
 }
-AGENT_LDFLAGS=("-X" "main.version=${AGENT_VERSION}")
+# One release sequence (Unix seconds) shared by the binaries and the signed
+# manifest; agents seed their anti-rollback floor from the embedded value
+# on first start (daybreak P2-1).
+RELEASE_SEQUENCE="${REACH_RELEASE_SEQUENCE:-$(date -u +%s)}"
+AGENT_LDFLAGS=("-X" "main.version=${AGENT_VERSION}" "-X" "main.releaseSequence=${RELEASE_SEQUENCE}")
 AGENT_DOWNLOAD_ROOT="/var/lib/reach/downloads/reach-agent"
 AGENT_DOWNLOAD_DIR="${AGENT_DOWNLOAD_ROOT}/v${AGENT_VERSION}"
 AGENT_STAGING_DIR="${AGENT_DOWNLOAD_ROOT}/.v${AGENT_VERSION}.tmp.$$"

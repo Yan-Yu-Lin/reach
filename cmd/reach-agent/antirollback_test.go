@@ -117,3 +117,41 @@ func TestSequenceSpaceIsUnixSeconds(t *testing.T) {
 		t.Fatal("small counter passed the floor check")
 	}
 }
+
+// Daybreak P2-1: a fresh install (no floor yet) seeds the floor from its
+// own embedded release on start, so an older signed release is refused.
+func TestFreshInstallSeedsFloorFromEmbeddedRelease(t *testing.T) {
+	dir := t.TempDir()
+	old := releaseSequence
+	releaseSequence = "1795000000"
+	defer func() { releaseSequence = old }()
+	cfg := defaultConfig()
+	cfg.Install.DataDir = dir
+	d := NewDaemon(cfg)
+	d.seedReleaseFloor()
+	if f, _ := readReleaseFloor(dir); f != 1795000000 {
+		t.Fatalf("floor after first start = %d", f)
+	}
+	if err := checkReleaseFloor(dir, releaseManifest{Version: "old", Sequence: 1790000000}, false); err == nil {
+		t.Fatal("older signed release accepted on a fresh install")
+	}
+	// While an update awaits confirmation the floor is not raised, so the
+	// rollback to the previous binary stays possible.
+	dir2 := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir2, "update-confirm-required"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Install.DataDir = dir2
+	NewDaemon(cfg).seedReleaseFloor()
+	if f, _ := readReleaseFloor(dir2); f != 0 {
+		t.Fatalf("floor raised during pending update: %d", f)
+	}
+	// Dev builds (no embedded sequence) do nothing.
+	releaseSequence = ""
+	dir3 := t.TempDir()
+	cfg.Install.DataDir = dir3
+	NewDaemon(cfg).seedReleaseFloor()
+	if f, _ := readReleaseFloor(dir3); f != 0 {
+		t.Fatalf("dev build seeded floor %d", f)
+	}
+}

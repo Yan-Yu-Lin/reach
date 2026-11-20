@@ -67,7 +67,11 @@ bash scripts/validate-release-version.sh "$AGENT_VERSION" || {
   echo "[mac] ERROR: invalid agent version" >&2
   exit 1
 }
-AGENT_LDFLAGS=("-X" "main.version=${AGENT_VERSION}")
+# One release sequence (Unix seconds) shared by the binaries and the signed
+# manifest; agents seed their anti-rollback floor from the embedded value
+# on first start (daybreak P2-1).
+RELEASE_SEQUENCE="${REACH_RELEASE_SEQUENCE:-$(date -u +%s)}"
+AGENT_LDFLAGS=("-X" "main.version=${AGENT_VERSION}" "-X" "main.releaseSequence=${RELEASE_SEQUENCE}")
 RELEASE_KEY="${REACH_RELEASE_KEY:-$HOME/.minisign/reach-release.key}"
 RELEASE_PASSWORD_FILE="${REACH_RELEASE_KEY_PASSWORD_FILE:-}"
 if [ -z "$RELEASE_PASSWORD_FILE" ] && [ -f "$HOME/.minisign/reach-release.pass" ]; then
@@ -124,7 +128,7 @@ build_agent "$ARTIFACT_DIR/reach-agent_windows_arm64.exe" windows arm64
   cd "$ARTIFACT_DIR"
   shasum -a 256 reach-agent_* | awk '{print $1 "  " $2}' > checksums.txt
 )
-go run ./cmd/reach-release manifest --dir "$ARTIFACT_DIR" --version "$AGENT_VERSION" --commit "$DEPLOY_COMMIT"
+go run ./cmd/reach-release manifest --dir "$ARTIFACT_DIR" --version "$AGENT_VERSION" --commit "$DEPLOY_COMMIT" --sequence "$RELEASE_SEQUENCE"
 uv run --script scripts/verify-release-artifacts.py --dir "$ARTIFACT_DIR" --version "$AGENT_VERSION" --commit "$DEPLOY_COMMIT"
 SIGN_ARGS=(--key "$RELEASE_KEY")
 if [ -n "$RELEASE_PASSWORD_FILE" ]; then

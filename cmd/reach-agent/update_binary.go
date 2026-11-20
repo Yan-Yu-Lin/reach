@@ -1003,3 +1003,33 @@ func confirmFlagSequence(flag string) int64 {
 	}
 	return 0
 }
+
+// embeddedSequence parses the build's release sequence; 0 when unset or
+// outside the Unix-seconds space.
+func embeddedSequence() int64 {
+	n, err := strconv.ParseInt(strings.TrimSpace(releaseSequence), 10, 64)
+	if err != nil || n < minReleaseSequence {
+		return 0
+	}
+	return n
+}
+
+// seedReleaseFloor raises the anti-rollback floor to this binary's own
+// release on start, so a fresh install (no confirmed update yet) already
+// refuses older signed releases (daybreak P2-1). The floor never moves down,
+// and a binary that is running at all has been installed by the operator or
+// a verified update, so it is a safe lower bound. Skipped while an update
+// awaits confirmation: a rollback to the previous binary must stay possible.
+func (d *Daemon) seedReleaseFloor() {
+	seq := embeddedSequence()
+	dir := d.cfg.Install.DataDir
+	if seq == 0 || dir == "" {
+		return
+	}
+	if _, err := os.Stat(filepath.Join(dir, "update-confirm-required")); err == nil {
+		return
+	}
+	if err := raiseReleaseFloor(dir, seq); err != nil {
+		d.logger.Printf("could not seed release floor: %v", err)
+	}
+}

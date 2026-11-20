@@ -31,6 +31,11 @@ import (
 
 var version = "dev"
 
+// releaseSequence is the signed release ordering value of this build (Unix
+// seconds), set with -ldflags "-X main.releaseSequence=...". Empty in dev
+// builds.
+var releaseSequence = ""
+
 type Config struct {
 	MachineID      string          `yaml:"machine_id" json:"machine_id"`
 	Slug           string          `yaml:"slug" json:"slug"`
@@ -512,6 +517,7 @@ func NewDaemon(cfg Config) *Daemon {
 
 func (d *Daemon) Run(ctx context.Context) error {
 	d.logger.Printf("starting reach-agent %s for machine=%s slug=%s", version, d.cfg.MachineID, d.cfg.Slug)
+	d.seedReleaseFloor()
 	currentInterval := d.heartbeatInterval()
 	hbTicker := time.NewTicker(currentInterval)
 	defer hbTicker.Stop()
