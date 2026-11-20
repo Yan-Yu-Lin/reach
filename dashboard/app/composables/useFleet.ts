@@ -42,7 +42,35 @@ export function useFleet() {
   const patchLog = createPatchLog()
   let disposeSSE: (() => void) | null = null
   let bootstrapTimer: ReturnType<typeof setTimeout> | null = null
+  // Throttle for re-fetching the open machine on its heartbeats: leading + trailing, so the
+  // LAST heartbeat in a window is always followed by one fetch (astra R2-02).
   let lastSelectedFetch = 0
+  let selectedDirty = false
+  let selectedTimer: ReturnType<typeof setTimeout> | null = null
+
+  function clearSelectedTimer() {
+    if (selectedTimer) clearTimeout(selectedTimer)
+    selectedTimer = null
+    selectedDirty = false
+  }
+
+  function fetchSelected(id: string) {
+    clearSelectedTimer()
+    lastSelectedFetch = Date.now()
+    void refreshCoordinator.requestMachine(id).catch(() => {})
+  }
+
+  function selectedHeartbeat(id: string) {
+    const wait = selectedRefetchMinMs - (Date.now() - lastSelectedFetch)
+    if (wait <= 0) return fetchSelected(id)
+    selectedDirty = true
+    if (selectedTimer) return
+    selectedTimer = setTimeout(() => {
+      selectedTimer = null
+      if (selectedDirty && selectedId.value === id) fetchSelected(id)
+      selectedDirty = false
+    }, wait)
+  }
 
   const fullRetry = createAuthoritativeRefreshRetry(() => {
     void refreshCoordinator.requestFull(true).catch(() => {})
@@ -221,10 +249,8 @@ export function useFleet() {
           return
         }
         if (selectedId.value !== plan.machineId) return
-        if (plan.refetchIfSelected === 'now' || Date.now() - lastSelectedFetch >= selectedRefetchMinMs) {
-          lastSelectedFetch = Date.now()
-          void refreshCoordinator.requestMachine(plan.machineId).catch(() => {})
-        }
+        if (plan.refetchIfSelected === 'now') fetchSelected(plan.machineId)
+        else selectedHeartbeat(plan.machineId)
         return
       }
       default:
@@ -234,9 +260,9 @@ export function useFleet() {
 
   // Opening a machine always shows its current details, not the list snapshot's (F04).
   watch(selectedId, (id) => {
+    clearSelectedTimer()
     if (!id || !import.meta.client) return
-    lastSelectedFetch = Date.now()
-    void refreshCoordinator.requestMachine(id).catch(() => {})
+    fetchSelected(id)
   })
 
   /** Connect the event stream; its first hello loads the snapshot. */
@@ -287,6 +313,7 @@ export function useFleet() {
 
   function dispose() {
     clearBootstrapTimer()
+    clearSelectedTimer()
     disposeSSE?.()
     fullRetry.dispose()
     requestsRetry.dispose()
