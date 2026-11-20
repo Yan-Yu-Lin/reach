@@ -155,3 +155,35 @@ func TestFreshInstallSeedsFloorFromEmbeddedRelease(t *testing.T) {
 		t.Fatalf("dev build seeded floor %d", f)
 	}
 }
+
+// Daybreak P2-2: --candidate is copied privately; later changes to the
+// original path do not affect what is verified and executed.
+func TestCandidateIsCopiedPrivately(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "cand")
+	if err := os.WriteFile(src, []byte("signed bytes"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cp, cleanup, err := privateCandidateCopy(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	if err := os.WriteFile(src, []byte("swapped evil"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(cp)
+	if string(b) != "signed bytes" {
+		t.Fatalf("private copy changed: %q", b)
+	}
+	st, _ := os.Stat(filepath.Dir(cp))
+	if st.Mode().Perm() != 0o700 {
+		t.Fatalf("private dir mode %v", st.Mode().Perm())
+	}
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(src, link); err == nil {
+		if _, _, err := privateCandidateCopy(link); err == nil {
+			t.Fatal("symlink candidate accepted")
+		}
+	}
+}

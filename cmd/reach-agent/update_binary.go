@@ -283,8 +283,18 @@ func performBinaryUpdate(ctx context.Context, st reachInstallState, opt updateBi
 		}
 		candidatePath, cleanup, manifest = path, done, m
 	} else {
+		// Copy the caller's file into a private 0700 directory first and
+		// verify, preflight and install only that copy, so nobody who can
+		// write the original path can swap it between the hash check and
+		// execution (daybreak P2-2).
+		private, done, err := privateCandidateCopy(candidatePath)
+		if err != nil {
+			return err
+		}
+		candidatePath, cleanup = private, done
 		m, err := verifyCandidateManifest(ctx, apiURL, opt.Version, asset, candidatePath, st.DataDir, opt.AllowDowngrade)
 		if err != nil {
+			cleanup()
 			return err
 		}
 		manifest = m
@@ -1032,4 +1042,34 @@ func (d *Daemon) seedReleaseFloor() {
 	if err := raiseReleaseFloor(dir, seq); err != nil {
 		d.logger.Printf("could not seed release floor: %v", err)
 	}
+}
+
+// privateCandidateCopy copies a regular, non-symlink file into a fresh 0700
+// temp directory owned by the current user and returns the copy's path.
+func privateCandidateCopy(src string) (string, func(), error) {
+	st, err := os.Lstat(src)
+	if err != nil {
+		return "", nil, err
+	}
+	if !st.Mode().IsRegular() {
+		return "", nil, fmt.Errorf("--candidate %s is not a regular file", src)
+	}
+	if st.Size() > 128<<20 {
+		return "", nil, fmt.Errorf("--candidate %s is too large", src)
+	}
+	dir, err := os.MkdirTemp("", "reach-agent-candidate-*")
+	if err != nil {
+		return "", nil, err
+	}
+	cleanup := func() { _ = os.RemoveAll(dir) }
+	if err := os.Chmod(dir, 0o700); err != nil {
+		cleanup()
+		return "", nil, err
+	}
+	dst := filepath.Join(dir, "reach-agent")
+	if err := copyFileNoFollow(src, dst, 0o700); err != nil {
+		cleanup()
+		return "", nil, err
+	}
+	return dst, cleanup, nil
 }
