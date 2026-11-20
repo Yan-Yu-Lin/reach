@@ -42,15 +42,34 @@ func TestHealthCheckBatchesAndSkipsUnchangedWrites(t *testing.T) {
 	if scans != 1 {
 		t.Fatalf("listener scans per round = %d, want 1", scans)
 	}
-	var before string
-	_ = store.db.QueryRow(`SELECT last_probe_at FROM hub_observations WHERE tunnel_id='t_m_h1'`).Scan(&before)
+	// Rewind every observation to a sentinel one minute ago: inside the
+	// refresh window, but a different string from anything a rewrite this
+	// second would produce. Comparing against the first round's own
+	// timestamp could not see a rewrite in the same second (astra P3-01).
+	sentinel := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
+	if _, err := store.db.Exec(`UPDATE hub_observations SET last_probe_at=?`, sentinel); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := server.prov.RunHealthCheck(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	var obsWrites int
-	_ = store.db.QueryRow(`SELECT COUNT(*) FROM hub_observations WHERE last_probe_at<>?`, before).Scan(&obsWrites)
+	_ = store.db.QueryRow(`SELECT COUNT(*) FROM hub_observations WHERE last_probe_at<>?`, sentinel).Scan(&obsWrites)
 	if obsWrites != 0 {
 		t.Fatalf("unchanged round rewrote %d observations", obsWrites)
+	}
+	// Past the refresh window the row must be refreshed.
+	stale := time.Now().UTC().Add(-2 * dormantRefresh).Format(time.RFC3339)
+	if _, err := store.db.Exec(`UPDATE hub_observations SET last_probe_at=? WHERE tunnel_id='t_m_h1'`, stale); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.prov.RunHealthCheck(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var refreshed string
+	_ = store.db.QueryRow(`SELECT last_probe_at FROM hub_observations WHERE tunnel_id='t_m_h1'`).Scan(&refreshed)
+	if refreshed == stale {
+		t.Fatal("stale observation was not refreshed")
 	}
 	var events int
 	_ = store.db.QueryRow(`SELECT COUNT(*) FROM events WHERE type='machine.health_changed'`).Scan(&events)
