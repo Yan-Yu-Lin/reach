@@ -37,6 +37,7 @@ const DEFAULTS = {
   v2: process.env.V2 === '1',
   auth: process.env.AUTH === '1',
   sseDelayMs: 0, // wait this long between accepting /events and subscribing (snapshot gap)
+  sse401DelayMs: 0, // a rejected /events answers its 401 this late (stale-401 races)
 }
 let state = { ...DEFAULTS }
 let stats
@@ -232,9 +233,11 @@ function startStorm({ rate = 50, seconds = 10, kind = 'heartbeat' }) {
       if (kind === 'heartbeat') heartbeat(m)
       else if (kind === 'flap') { // deploy/restart: state flaps + ssh_config.changed
         m.machine.observed_state = m.machine.observed_state === 'online' ? 'degraded' : 'online'
-        broadcast('machine.observed_changed', { machine_id: m.machine.id, observed_state: m.machine.observed_state, status: m.machine.status })
+        const at = iso(0)
+        m.hub_observation = { ...(m.hub_observation || {}), probe_state: 'reachable', last_probe_at: at }
+        broadcast('machine.observed_changed', { machine_id: m.machine.id, observed_state: m.machine.observed_state, status: m.machine.status, ...(state.v2 ? { heartbeat_at: m.agent_observation.heartbeat_at, event_at: at } : {}) })
         broadcast('machine.' + m.machine.observed_state, { machine_id: m.machine.id, slug: m.machine.slug })
-        broadcast('machine.health_changed', { machine_id: m.machine.id, observed_state: m.machine.observed_state, status: m.machine.status, probe_state: 'reachable' })
+        broadcast('machine.health_changed', { machine_id: m.machine.id, observed_state: m.machine.observed_state, status: m.machine.status, probe_state: 'reachable', ...(state.v2 ? { last_probe_at: at, event_at: at } : {}) })
         if (j % 4 === 0) broadcast('ssh_config.changed', { machine_id: m.machine.id, reason: 'ssh_compat_changed' })
       }
     }
@@ -288,6 +291,7 @@ async function control(req, res, url) {
       else if (k === 'latency') state.latencyMs = Number(v)
       else if (k === 'scenario' || k === 'hbfmt') state[k] = v
       else if (k === 'sse_delay') state.sseDelayMs = Number(v)
+      else if (k === 'sse401_delay') state.sse401DelayMs = Number(v)
       else state[k] = Number(v)
     }
     if (url.searchParams.has('n') || url.searchParams.has('scenario')) makeFleet(state.n)
@@ -358,7 +362,7 @@ async function control(req, res, url) {
 
 // ---------------------------------------------------------------- SSE
 async function events(req, res) {
-  if (!tokenOk(req)) return send(req, res, 401, { error: 'unauthorized' })
+  if (!tokenOk(req)) { await sleep(state.sse401DelayMs || 0); return send(req, res, 401, { error: 'unauthorized' }) }
   if (Date.now() < sseRefusedUntil) return send(req, res, 503, { error: 'unavailable' })
   res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' })
   res.write('retry: 2000\n\n')

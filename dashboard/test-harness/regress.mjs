@@ -56,6 +56,14 @@ async function waitFor(fn, ms = 5000, what = 'condition') {
   throw new Error(`timed out waiting for ${what} (last: ${JSON.stringify(last)})`)
 }
 function expect(cond, msg) { if (!cond) throw new Error(msg) }
+async function login(page) {
+  await page.locator('input[name="username"]').waitFor()
+  await page.fill('input[name="username"]', 'arthur')
+  await page.fill('input[name="password"]', 'correct-horse')
+  await page.click('form .btn-primary')
+}
+const machineId = async (slug) => (await ctl('/__mutate', { slug })).machine.id
+const tokens = (page) => page.evaluate(() => [localStorage.getItem('reach-token'), sessionStorage.getItem('reach-token')])
 
 async function test(name, fn) {
   if (FILTER && !name.includes(FILTER)) return
@@ -166,6 +174,42 @@ await test('F04 a heartbeat does not make an old tunnel report look current', as
   await ctx.close()
 })
 
+await test('R2-02 the last heartbeat while a detail is open is followed by one fetch (trailing)', async () => {
+  for (const fmt of ['new', 'old']) {
+    await reset(`hbfmt=${fmt}&v2=${fmt === 'new' ? 1 : 0}`)
+    const id = (await ctl('/__mutate', { slug: 'omarchy', obs: { agent_version: 'r2-before', transport: 'direct', persistence_backend: 'systemd' } })).machine.id
+    const { ctx, page } = await open(undefined, { path: `/?m=${id}` })
+    await waitFor(async () => (await page.locator('.detail').innerText()).includes('r2-before'), 5000, 'initial detail')
+    await sleep(200)
+    await ctl('/__reset')
+    // the detail is OPEN; the server changes, ONE heartbeat inside the 15 s window, then silence
+    await ctl('/__mutate', { slug: 'omarchy', obs: { agent_version: 'r2-final-heartbeat', transport: 'websocket', persistence_backend: 'launchd' } })
+    await ctl('/__hb?slug=omarchy')
+    await sleep(1000)
+    expect((await calls('GET /api/admin/machines/:id')).length === 0, `${fmt}: fetched inside the window (no throttling)`)
+    await waitFor(async () => (await page.locator('.detail').innerText()).includes('r2-final-heartbeat'), 17000, `${fmt}: trailing fetch`)
+    const gets = (await calls('GET /api/admin/machines/:id')).length
+    expect(gets === 1, `${fmt}: ${gets} detail GETs, expected exactly 1`)
+    const d = await page.locator('.detail').innerText()
+    expect(d.includes('websocket') && d.includes('launchd'), `${fmt}: diagnostics not updated`)
+    await ctx.close()
+  }
+})
+
+await test('R2-02 closing the detail cancels its pending trailing fetch', async () => {
+  await reset()
+  const id = await machineId('omarchy')
+  const { ctx, page } = await open(undefined, { path: `/?m=${id}` })
+  await page.locator('.detail-name').waitFor()
+  await sleep(300)
+  await ctl('/__hb?slug=omarchy') // schedules a trailing fetch
+  await page.locator('.btn-back').click()
+  await ctl('/__reset')
+  await sleep(16000)
+  expect((await calls('GET /api/admin/machines/:id')).length === 0, 'trailing fetch fired after the detail was closed')
+  await ctx.close()
+})
+
 // ---------------------------------------------------------------- F05
 await test('F05 reconnecting with a cursor still catches up live-only heartbeats', async () => {
   await reset()
@@ -245,6 +289,45 @@ await test('F08 an active machine with a 1-day-old reachable probe shows Unknown
   await ctx.close()
 })
 
+await test('R2-03 a replayed health event (no server time) does not make a day-old probe OK, even if refresh fails', async () => {
+  await reset('v2=0') // old server: health_changed carries no last_probe_at
+  const old = new Date(Date.now() - 86400_000).toISOString()
+  const id = (await ctl('/__mutate', { slug: 'omarchy', hub: { last_probe_at: old, probe_state: 'reachable' } })).machine.id
+  const { ctx, page } = await open(undefined, { path: `/?m=${id}` })
+  await waitFor(async () => (await page.locator('.check').first().innerText()).includes('Unknown'), 5000, 'Unknown before')
+  await ctl('/__emit', { type: 'machine.process_title_changed', data: { machine_id: id } }) // gives the client a cursor
+  await sleep(300)
+  await ctl('/__fail?key=GET /api/admin/machines&status=500&times=20')
+  await ctl('/__fail?key=GET /api/admin/machines/:id&status=500&times=20')
+  await ctl('/__ssepause?ms=1500')
+  // historical durable health event, replayed on reconnect; DB probe stays a day old
+  await ctl('/__emit', { type: 'machine.health_changed', data: { machine_id: id, observed_state: 'online', status: 'online', probe_state: 'reachable' } })
+  await page.locator('.notice-error').waitFor({ timeout: 10000 }) // refresh failed, as in astra's repro
+  await sleep(1500)
+  const probe = await page.locator('.check').first().innerText()
+  expect(/Unknown/.test(probe) && !/\bOK\b/.test(probe), `replay made the probe look current: ${probe}`)
+  const asked = (await ctl('/__stats')).log.filter(([, k]) => k === 'GET /api/admin/machines/:id').length
+  expect(asked >= 1, 'no authoritative fetch after an undated probe result')
+  await ctx.close()
+})
+
+await test('R2-03 a health event with the server probe time is judged by that time', async () => {
+  await reset() // new server: last_probe_at in the payload
+  const id = await machineId('omarchy')
+  const { ctx, page } = await open(undefined, { path: `/?m=${id}` })
+  await page.locator('.checks').waitFor()
+  await ctl('/__fail?key=GET /api/admin/machines/:id&status=500&times=20')
+  const old = new Date(Date.now() - 86400_000).toISOString()
+  await ctl('/__emit', { type: 'machine.health_changed', data: { machine_id: id, observed_state: 'online', status: 'online', probe_state: 'reachable', last_probe_at: old, event_at: old } })
+  await sleep(600)
+  // the stored probe (20 s ago) is newer than the replayed one: still OK, not rolled back
+  expect(/\bOK\b/.test(await page.locator('.check').first().innerText()), 'newer probe was overwritten by an older replay')
+  const fresh = new Date().toISOString()
+  await ctl('/__emit', { type: 'machine.health_changed', data: { machine_id: id, observed_state: 'degraded', status: 'degraded', probe_state: 'unreachable', last_probe_at: fresh, event_at: fresh } })
+  await waitFor(async () => /Failed/.test(await page.locator('.check').first().innerText()), 3000, 'fresh unreachable shown')
+  await ctx.close()
+})
+
 // ---------------------------------------------------------------- F09
 await test('F09 a failed disable is reported as a failed disable, not a stuck removal', async () => {
   await reset()
@@ -273,7 +356,9 @@ await test('F10 deep link survives the login detour', async () => {
 
 await test('F10 ?next cannot send you to another site', async () => {
   await reset('auth=1')
-  for (const evil of ['//evil.example/x', 'https://evil.example', '/\\evil.example', '/%2F%2Fevil.example']) {
+  for (const evil of ['//evil.example/x', 'https://evil.example', '/\\evil.example', '/%2F%2Fevil.example',
+    // R2-04: become protocol-relative only after URL normalisation
+    '/%2e%2e//evil.example/x', '/a/%2e%2e//evil.example/x', '/.%2e//evil.example/x']) {
     const { ctx, page } = await open(undefined, { token: null, path: `/login?next=${encodeURIComponent(evil)}` })
     await page.fill('input[name="username"]', 'arthur')
     await page.fill('input[name="password"]', 'correct-horse')
@@ -281,17 +366,19 @@ await test('F10 ?next cannot send you to another site', async () => {
     await sleep(800)
     const u = new URL(page.url())
     expect(u.origin === BASE, `${evil} led to ${page.url()}`)
+    // signed in AND off the login page (astra R2-04: it used to stay stuck on /login),
+    // on a single-slash in-app path
+    expect(u.pathname !== '/login' && !u.pathname.startsWith('//'), `${evil}: ended on ${u.pathname}${u.search}`)
+    expect(!!(await tokens(page))[1], `${evil}: not signed in`)
     await ctx.close()
   }
 })
 
 // ---------------------------------------------------------------- daybreak P3-5
 await test('P3-5 revoke-all answered 401 is not shown as success; user re-confirms after login', async () => {
+  // Starts directly on Settings with a valid stored token, so it does not depend on F10.
   await reset('auth=1')
-  const { ctx, page } = await open(undefined, { token: null, path: '/?tab=settings' })
-  await page.fill('input[name="username"]', 'arthur')
-  await page.fill('input[name="password"]', 'correct-horse')
-  await page.click('form .btn-primary')
+  const { ctx, page } = await open(undefined, { token: FAKE, path: '/?tab=settings', storage: 'session' })
   await page.locator('.btn', { hasText: 'Sign out everywhere' }).waitFor()
   await ctl('/__revoke?close=0') // this login became invalid behind our back
   await ctl('/__reset')
@@ -340,6 +427,62 @@ await test('sign-out in one tab signs out the other tabs of the browser', async 
   const b = await ctx.newPage(); await b.goto(BASE + '/?tab=settings'); await b.locator('.live-live').waitFor()
   await b.locator('.btn', { hasText: /^\s*Sign out\s*$/ }).click()
   await a.locator('input[name="username"]').waitFor({ timeout: 4000 })
+  await ctx.close()
+})
+
+await test('R2-01 a late 401 for the old session does not sign out the new login (this tab or another)', async () => {
+  await reset('auth=1')
+  await ctl('/__revoke?close=0') // the stored token is already invalid
+  await ctl('/__config?sse401_delay=2600')
+  await ctl('/__latency?key=GET /api/admin/machines&ms=5000&times=1')
+  await ctl('/__latency?key=GET /api/admin/requests&ms=5000&times=1')
+  const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } })
+  const a = await ctx.newPage()
+  await a.addInitScript(t => { if (!sessionStorage.getItem('seeded')) { sessionStorage.setItem('seeded', '1'); sessionStorage.setItem('reach-token', t) } }, FAKE)
+  await a.goto(`${BASE}/?tab=requests`)
+  // first 401 (the delayed stream) sends A to login
+  await a.locator('input[name="username"]').waitFor({ timeout: 7000 })
+  expect(new URL(a.url()).searchParams.get('next') === '/?tab=requests', `first redirect lost next: ${a.url()}`)
+  await login(a)
+  await a.locator('.live-live').waitFor({ timeout: 6000 })
+  const b = await ctx.newPage()
+  await b.goto(`${BASE}/?tab=settings`)
+  await login(b)
+  await b.locator('.live-live').waitFor({ timeout: 6000 })
+  // the bootstrap GETs sent with the OLD token answer 401 now
+  await sleep(5500)
+  expect(!new URL(a.url()).pathname.startsWith('/login'), `A was signed out by a stale 401: ${a.url()}`)
+  expect(!new URL(b.url()).pathname.startsWith('/login'), `B was signed out by a stale 401: ${b.url()}`)
+  expect(!!(await tokens(a))[1] && !!(await tokens(b))[1], 'a valid token was cleared')
+  await ctx.close()
+})
+
+await test('R2-01 a second late 401 keeps the first saved return path', async () => {
+  await reset('auth=1')
+  await ctl('/__revoke?close=0')
+  await ctl('/__config?sse401_delay=2600')
+  await ctl('/__latency?key=GET /api/admin/machines&ms=5000&times=1')
+  const { ctx, page } = await open(undefined, { token: FAKE, path: '/?tab=requests', storage: 'session' })
+  await page.locator('input[name="username"]').waitFor({ timeout: 7000 })
+  await sleep(5500) // the late machines 401 arrives while we wait on the login page
+  expect(new URL(page.url()).searchParams.get('next') === '/?tab=requests', `next overwritten: ${page.url()}`)
+  await ctx.close()
+})
+
+await test('R2-01 a late revoke-all success does not sign out a session started after it', async () => {
+  await reset('auth=1')
+  const { ctx, page } = await open(undefined, { token: FAKE, path: '/?tab=settings', storage: 'session' })
+  await page.locator('.live-live').waitFor()
+  await ctl('/__latency?key=POST /api/admin/sessions/revoke-all&ms=7000&times=1')
+  await page.locator('.btn', { hasText: 'Sign out everywhere' }).click()
+  await page.locator('.dialog .btn-danger-solid').click()
+  // the mock revokes immediately but answers in 7 s; our stream is closed -> 401 -> login
+  await page.locator('input[name="username"]').waitFor({ timeout: 7000 })
+  await login(page)
+  await page.locator('.live-live').waitFor({ timeout: 6000 })
+  await sleep(6000) // the old POST's 200 lands now
+  expect(!new URL(page.url()).pathname.startsWith('/login'), `new session signed out by the old revoke reply: ${page.url()}`)
+  expect(!!(await tokens(page))[1], 'new token cleared')
   await ctx.close()
 })
 
