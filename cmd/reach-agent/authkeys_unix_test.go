@@ -141,3 +141,39 @@ func TestOversizeAuthorizedKeysIsRefusedNotTruncated(t *testing.T) {
 		t.Fatalf("file at the limit refused: %v", err)
 	}
 }
+
+// Daybreak P2-8 PoC: the hub sends "valid key\nattacker key". Neither
+// install nor sync may write the second line as a bare key.
+func TestAgentRejectsMultiLineAdminKey(t *testing.T) {
+	good := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl op"
+	evil := good + "\nssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl attacker"
+	for _, bad := range []string{evil, `command="/bin/sh" ` + good, good + " x\r", good + "\x00"} {
+		if _, err := canonicalAdminKey(bad); err == nil {
+			t.Fatalf("accepted %q", bad)
+		}
+	}
+	_, auth := fakeHome(t)
+	cfg := defaultConfig()
+	cfg.MachineID = "m_test"
+	cfg.LocalSSH.AuthFile = auth
+	d := NewDaemon(cfg)
+	if err := d.syncKeys([]DesiredPubkey{{PublicKey: evil}, {PublicKey: good}}, true); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(auth)
+	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+	if len(lines) != 1 || strings.Contains(string(b), "attacker") || !strings.HasPrefix(lines[0], `from="127.0.0.1,::1"`) {
+		t.Fatalf("authorized_keys after sync:\n%s", b)
+	}
+	prov := provisionResponse{Machine: machineInfo{ID: "m_test2"}, AdminPubkeys: []adminPubkey{{PublicKey: evil}, {PublicKey: good}}}
+	if err := installAdminKeys(auth, "", prov, false, []string{"ssh-ed25519"}, false); err != nil {
+		t.Fatal(err)
+	}
+	b, _ = os.ReadFile(auth)
+	if strings.Contains(string(b), "attacker") {
+		t.Fatalf("install wrote the injected key:\n%s", b)
+	}
+	if c, _ := canonicalAdminKey(good + " reach:m_other"); strings.Contains(c, "reach:m_other") {
+		t.Fatal("comment can forge another machine's marker")
+	}
+}

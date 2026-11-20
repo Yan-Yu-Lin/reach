@@ -810,8 +810,12 @@ func installAdminKeys(authFile, user string, prov provisionResponse, chownFiles 
 	b.WriteString(existing)
 	installed := 0
 	for _, k := range prov.AdminPubkeys {
-		pub := strings.TrimSpace(k.PublicKey)
-		if pub == "" {
+		if strings.TrimSpace(k.PublicKey) == "" {
+			continue
+		}
+		pub, err := canonicalAdminKey(k.PublicKey)
+		if err != nil {
+			fmt.Printf("[reach warning] skipping invalid admin key from hub: %v\n", err)
 			continue
 		}
 		fields := strings.Fields(pub)

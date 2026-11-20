@@ -7,6 +7,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"math/big"
+	"strings"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -163,4 +164,43 @@ func explicitDomainMatchesCurve(domain explicitECDomain, curve elliptic.Curve) b
 	gx := new(big.Int).SetBytes(domain.Base[1 : 1+pointLen])
 	gy := new(big.Int).SetBytes(domain.Base[1+pointLen:])
 	return gx.Cmp(params.Gx) == 0 && gy.Cmp(params.Gy) == 0
+}
+
+// canonicalAdminKey validates one operator public key received from the hub
+// and returns it re-encoded ("<type> <base64>") plus an optional sanitized
+// comment. The hub is not trusted to have done this: a value containing a
+// second line or authorized_keys options would otherwise be written as an
+// extra, unrestricted key line (daybreak P2-8).
+func canonicalAdminKey(pub string) (string, error) {
+	if strings.ContainsAny(pub, "\r\n\x00") {
+		return "", fmt.Errorf("admin key must be a single line")
+	}
+	pub = strings.TrimSpace(pub)
+	if pub == "" || len(pub) > 16*1024 {
+		return "", fmt.Errorf("admin key is empty or too long")
+	}
+	key, comment, options, rest, err := ssh.ParseAuthorizedKey([]byte(pub))
+	if err != nil {
+		return "", err
+	}
+	if len(options) > 0 {
+		return "", fmt.Errorf("admin key must not carry authorized_keys options")
+	}
+	if strings.TrimSpace(string(rest)) != "" {
+		return "", fmt.Errorf("admin key must be a single key")
+	}
+	out := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(key)))
+	comment = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, comment)
+	// The marker " reach:<id>" is appended by callers; a comment must not
+	// be able to look like another machine's marker.
+	comment = strings.ReplaceAll(comment, "reach:", "reach_")
+	if c := strings.TrimSpace(comment); c != "" && len(c) <= 128 {
+		out += " " + c
+	}
+	return out, nil
 }

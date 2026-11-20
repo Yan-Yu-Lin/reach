@@ -1281,8 +1281,12 @@ func (d *Daemon) syncKeys(keys []DesiredPubkey, enabled bool) error {
 	}
 	if enabled {
 		for _, k := range keys {
-			pub := strings.TrimSpace(k.PublicKey)
-			if pub == "" {
+			if strings.TrimSpace(k.PublicKey) == "" {
+				continue
+			}
+			pub, err := canonicalAdminKey(k.PublicKey)
+			if err != nil {
+				d.logger.Printf("skipping invalid admin key from hub: %v", err)
 				continue
 			}
 			fields := strings.Fields(pub)
