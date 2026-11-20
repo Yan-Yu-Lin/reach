@@ -20,7 +20,7 @@
     </header>
 
     <!-- Desktop sidebar: the fleet is always visible -->
-    <aside class="sidebar" aria-label="Machines">
+    <aside v-if="isDesktop" class="sidebar" aria-label="Machines">
       <FleetList
         ref="sidebarList"
         :groups="groups"
@@ -94,7 +94,7 @@
           </section>
 
           <!-- Phone: the fleet list is the home screen -->
-          <div class="mobile-only">
+          <div v-if="!isDesktop" class="mobile-only">
             <FleetList
               :groups="groups"
               :status-of="statusOf"
@@ -302,6 +302,10 @@ const focusedId = ref<string | null>(null)
 const dialog = ref<Dialog | null>(null)
 const dialogBusy = ref(false)
 const isDark = ref(true)
+// Render one fleet list, not two: the sidebar on desktop, the home list on phones.
+const desktopQuery = import.meta.client ? window.matchMedia('(min-width: 900px)') : null
+const isDesktop = ref(!!desktopQuery?.matches)
+const syncDesktop = () => { isDesktop.value = !!desktopQuery?.matches }
 const notifState = ref<'default' | 'granted' | 'denied' | 'unsupported'>('unsupported')
 
 const themes = [
@@ -578,6 +582,7 @@ onMounted(() => {
   document.addEventListener('keydown', onKeydown)
   mq = window.matchMedia('(prefers-color-scheme: dark)')
   mq.addEventListener('change', syncDark)
+  desktopQuery?.addEventListener('change', syncDesktop)
   syncDark()
   notifState.value = 'Notification' in window ? Notification.permission : 'unsupported'
 })
@@ -586,5 +591,6 @@ onBeforeUnmount(() => {
   fleet.dispose()
   document.removeEventListener('keydown', onKeydown)
   mq?.removeEventListener('change', syncDark)
+  desktopQuery?.removeEventListener('change', syncDesktop)
 })
 </script>
