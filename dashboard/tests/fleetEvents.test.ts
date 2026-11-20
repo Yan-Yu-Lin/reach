@@ -6,12 +6,12 @@ describe('planFleetEvent', () => {
     expect(planFleetEvent('hello', { ok: true })).toEqual({ kind: 'hello' })
   })
 
-  it('patches heartbeats locally instead of re-fetching (A5)', () => {
+  it('patches heartbeats locally; only the open machine is re-fetched, throttled (A5, F04)', () => {
     expect(planFleetEvent('agent.heartbeat', { machine_id: 'm-1', heartbeat_at: '2026-11-21T00:00:00Z' })).toEqual({
       kind: 'patch',
       machineId: 'm-1',
       patch: { heartbeat_at: '2026-11-21T00:00:00Z' },
-      refetchIfSelected: false,
+      refetchIfSelected: 'throttled',
     })
   })
 
@@ -46,7 +46,7 @@ describe('planFleetEvent', () => {
       kind: 'patch',
       machineId: 'm-1',
       patch: { observed_state: 'degraded', status: 'degraded', probe_state: 'unreachable' },
-      refetchIfSelected: true,
+      refetchIfSelected: 'now',
     })
   })
 

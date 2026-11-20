@@ -2,14 +2,15 @@
 //
 // Event contract: docs/EVENTS.md (backend). Summary of what the dashboard relies on:
 // - agent.heartbeat: live-only (no id, not replayed). data has machine_id, heartbeat_at and,
-//   on newer servers, observed_state + status. Patched locally, never re-fetched.
+//   on newer servers, observed_state + status. Patched locally. The machine whose detail is
+//   open is also re-fetched (throttled), because a heartbeat does not carry the diagnostics.
 // - machine.observed_changed / machine.health_changed: carry observed_state/status
-//   (+ probe_state). Patched locally; only the machine open in the detail view is re-fetched.
+//   (+ probe_state). Patched locally; the machine open in the detail view is re-fetched now.
 // - machine.<observed_state> (machine.online, machine.offline, ...): duplicates of
 //   observed_changed with only a slug, ignored.
 // - other machine.* and ssh_config.changed with machine_id: re-fetch that one machine.
 // - request.*: re-fetch the pending request list only.
-// - hello: the stream is (re)connected. The caller decides whether a full snapshot is needed.
+// - hello: the stream is (re)connected. Always followed by a full snapshot (see useFleet).
 // - machine.resync_required, or a machine event without machine_id: full snapshot.
 
 export type MachinePatch = {
@@ -19,14 +20,17 @@ export type MachinePatch = {
   probe_state?: string
 }
 
+/** When the machine open in the detail view should be re-fetched after a patch. */
+export type SelectedRefetch = 'now' | 'throttled'
+
 export type FleetEventPlan =
   | { kind: 'none' }
   | { kind: 'hello' }
   | { kind: 'full' }
   | { kind: 'requests'; notifyPending: boolean }
   | { kind: 'machine'; machineId: string }
-  /** Apply locally. `refetchIfSelected` re-fetches only when this machine's detail is open. */
-  | { kind: 'patch'; machineId: string; patch: MachinePatch; refetchIfSelected: boolean }
+  /** Apply locally, then re-fetch the machine if its detail is open. */
+  | { kind: 'patch'; machineId: string; patch: MachinePatch; refetchIfSelected: SelectedRefetch }
   /** Only matters for the detail view (e.g. agent command results). */
   | { kind: 'detail'; machineId: string }
 
@@ -68,7 +72,7 @@ export function planFleetEvent(event: string, rawData: unknown): FleetEventPlan 
     const status = str(data.status)
     if (observed) patch.observed_state = observed
     if (status) patch.status = status
-    return { kind: 'patch', machineId, patch, refetchIfSelected: false }
+    return { kind: 'patch', machineId, patch, refetchIfSelected: 'throttled' }
   }
 
   if (event.startsWith('agent.')) {
@@ -90,7 +94,7 @@ export function planFleetEvent(event: string, rawData: unknown): FleetEventPlan 
       if (status) patch.status = status
       if (probe) patch.probe_state = probe
       if (!observed && !status) return { kind: 'machine', machineId }
-      return { kind: 'patch', machineId, patch, refetchIfSelected: true }
+      return { kind: 'patch', machineId, patch, refetchIfSelected: 'now' }
     }
     return { kind: 'machine', machineId }
   }

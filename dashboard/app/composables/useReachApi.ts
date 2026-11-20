@@ -1,3 +1,4 @@
+import { currentAppPath, loginLocation } from '~/utils/auth'
 type LoginResponse = { token: string; expires_in: number }
 
 export class ReachApiError extends Error {
@@ -13,7 +14,7 @@ export class ReachApiError extends Error {
 }
 
 function sessionExpiredLocation() {
-  return { path: '/login', query: { reason: 'session-expired' } }
+  return loginLocation(currentAppPath(), 'session-expired')
 }
 
 export type ProcessTitleConfig = {
@@ -83,7 +84,20 @@ export type AgentObservation = {
 export type HubObservation = { probe_state: string; last_probe_at: string; last_success_at?: string; probe_error?: string }
 export type AgentCommand = { id: string; type: string; status: string; generation: number; created_at: string; last_error?: string }
 export type AgentUpdateHint = { available: boolean; current?: string; latest?: string; url?: string; sha256?: string; required?: boolean }
-export type MachineWithTunnels = { machine: Machine; tunnels: Tunnel[]; agent_observation?: AgentObservation; hub_observation?: HubObservation; commands?: AgentCommand[]; update?: AgentUpdateHint }
+export type MachineWithTunnels = {
+  machine: Machine
+  tunnels: Tunnel[]
+  agent_observation?: AgentObservation
+  hub_observation?: HubObservation
+  commands?: AgentCommand[]
+  update?: AgentUpdateHint
+  /**
+   * Client-only: time of the newest live heartbeat event. Heartbeats only prove the agent is
+   * alive; they do not carry the rest of agent_observation, whose fields stay as fresh as
+   * agent_observation.heartbeat_at.
+   */
+  live_heartbeat_at?: string
+}
 export type RequestRow = {
   id: string
   name: string
@@ -105,6 +119,8 @@ export type RequestRow = {
 }
 
 const TOKEN_KEY = 'reach-token'
+/** localStorage key whose change tells other tabs "signed out here, sign out too". */
+export const SIGNOUT_KEY = 'reach-signout'
 
 function readStoredToken(): string | null {
   // Session storage first: a "don't remember" login must win over an old remembered one.
@@ -125,7 +141,7 @@ export function useReachApi() {
    * phone needs). remember=false keeps it in sessionStorage only, so it is gone when the
    * tab closes. Either way an XSS could read it; see docs/review/2026-11-21-dashboard.md.
    */
-  function setToken(next: string | null, remember = true) {
+  function setToken(next: string | null, remember = false) {
     token.value = next
     if (!import.meta.client) return
     localStorage.removeItem(TOKEN_KEY)
@@ -133,7 +149,15 @@ export function useReachApi() {
     if (next) (remember ? localStorage : sessionStorage).setItem(TOKEN_KEY, next)
   }
 
-  async function request<T>(path: string, opts: RequestInit = {}): Promise<T> {
+  /** Forget the token here and tell other open tabs of this browser to do the same. */
+  function signOutLocally() {
+    setToken(null)
+    if (import.meta.client) {
+      try { localStorage.setItem(SIGNOUT_KEY, String(Date.now())) } catch { /* private mode */ }
+    }
+  }
+
+  async function request<T>(path: string, opts: RequestInit & { skipAuthRedirect?: boolean } = {}): Promise<T> {
     const headers = new Headers(opts.headers || {})
     if (!headers.has('Content-Type') && opts.body) headers.set('Content-Type', 'application/json')
     if (token.value) headers.set('Authorization', `Bearer ${token.value}`)
@@ -149,7 +173,8 @@ export function useReachApi() {
     let res: Response
     let text: string
     try {
-      res = await fetch(`${apiBase}${path}`, { ...opts, headers, signal: requestController.signal })
+      const { skipAuthRedirect: _skip, ...fetchOpts } = opts
+      res = await fetch(`${apiBase}${path}`, { ...fetchOpts, headers, signal: requestController.signal })
       text = await res.text()
     } catch (error) {
       if (timeoutController.signal.aborted && !opts.signal?.aborted) {
@@ -167,8 +192,8 @@ export function useReachApi() {
     if (!res.ok) {
       const msg = body && typeof body === 'object' && body.error ? body.error : text || res.statusText
       const err = new ReachApiError(msg, res.status, body)
-      if (res.status === 401 && path !== '/admin/login') {
-        setToken(null)
+      if (res.status === 401 && path !== '/admin/login' && !opts.skipAuthRedirect) {
+        signOutLocally()
         if (import.meta.client) await navigateTo(sessionExpiredLocation())
       }
       throw err
@@ -176,7 +201,7 @@ export function useReachApi() {
     return body as T
   }
 
-  async function login(username: string, password: string, remember = true) {
+  async function login(username: string, password: string, remember = false) {
     const res = await request<LoginResponse>('/admin/login', {
       method: 'POST',
       body: JSON.stringify({ username, password })
@@ -188,10 +213,13 @@ export function useReachApi() {
   return {
     token,
     setToken,
+    signOutLocally,
     login,
     logout: () => request<{ ok: boolean }>('/admin/logout', { method: 'POST' }),
     /** Invalidates every dashboard login (and optionally Mac service tokens). Newer servers only. */
+    // A 401 here means the handler never ran; the caller handles it (no silent redirect).
     revokeAllSessions: (includeServiceTokens = false) => request<{ ok: boolean }>('/admin/sessions/revoke-all', {
+      skipAuthRedirect: true,
       method: 'POST',
       body: JSON.stringify({ include_service_tokens: includeServiceTokens })
     }),
