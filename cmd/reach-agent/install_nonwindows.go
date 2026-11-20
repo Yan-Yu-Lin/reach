@@ -4,7 +4,6 @@ package main
 
 import (
 	"context"
-	"path/filepath"
 )
 
 func windowsIsElevated() bool                                             { return false }
@@ -26,9 +25,9 @@ func stopWindowsPersistence(ctx context.Context, opt installOptions) {}
 func (d *Daemon) startWindowsLocalSSH(ctx context.Context) error     { return nil }
 func windowsDistroString() string                                    { return "" }
 
+// applyAuthorizedKeysPermissions is a no-op on Unix: writeAuthorizedKeysFile
+// sets mode and owner on the exact inodes it creates. The old recursive
+// chown of the .ssh directory followed user-planted symlinks (daybreak P2-3).
 func applyAuthorizedKeysPermissions(authFile, user string, chownFiles bool) error {
-	if chownFiles {
-		chownPathToUser(filepath.Dir(authFile), user)
-	}
 	return nil
 }

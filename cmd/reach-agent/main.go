@@ -510,7 +510,8 @@ func NewDaemon(cfg Config) *Daemon {
 
 func (d *Daemon) Run(ctx context.Context) error {
 	d.logger.Printf("starting reach-agent %s for machine=%s slug=%s", version, d.cfg.MachineID, d.cfg.Slug)
-	hbTicker := time.NewTicker(d.cfg.Heartbeat.interval)
+	currentInterval := d.heartbeatInterval()
+	hbTicker := time.NewTicker(currentInterval)
 	defer hbTicker.Stop()
 	probeTicker := time.NewTicker(d.cfg.LocalSSH.probeDur)
 	defer probeTicker.Stop()
@@ -546,7 +547,41 @@ func (d *Daemon) Run(ctx context.Context) error {
 		case <-hbTicker.C:
 			d.reconcile(ctx)
 		}
+		// Apply a server-requested interval (perf #7: the ticker was never
+		// reset, so next_interval_seconds had no effect).
+		if next := d.heartbeatInterval(); next != currentInterval {
+			currentInterval = next
+			hbTicker.Reset(next)
+		}
 	}
+}
+
+const (
+	minHeartbeatInterval = 10 * time.Second
+	maxHeartbeatInterval = 10 * time.Minute
+)
+
+// setHeartbeatInterval clamps a server-provided interval so a compromised or
+// misconfigured hub cannot make agents spin or go silent.
+func (d *Daemon) setHeartbeatInterval(v time.Duration) {
+	if v < minHeartbeatInterval {
+		v = minHeartbeatInterval
+	}
+	if v > maxHeartbeatInterval {
+		v = maxHeartbeatInterval
+	}
+	d.mu.Lock()
+	d.cfg.Heartbeat.interval = v
+	d.mu.Unlock()
+}
+
+func (d *Daemon) heartbeatInterval() time.Duration {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.cfg.Heartbeat.interval <= 0 {
+		return 30 * time.Second
+	}
+	return d.cfg.Heartbeat.interval
 }
 
 func (d *Daemon) tunnelDoneChan() <-chan error {
@@ -568,7 +603,7 @@ func (d *Daemon) reconcile(ctx context.Context) {
 	d.desired = resp
 	d.applyDesiredProcessTitle(resp.DesiredConfig.ProcessTitleConfig)
 	if resp.Heartbeat.NextIntervalSeconds > 0 {
-		d.cfg.Heartbeat.interval = time.Duration(resp.Heartbeat.NextIntervalSeconds) * time.Second
+		d.setHeartbeatInterval(time.Duration(resp.Heartbeat.NextIntervalSeconds) * time.Second)
 	}
 	d.confirmPendingUpdateAfterHeartbeat()
 	for _, cmd := range resp.Commands {
@@ -1222,7 +1257,10 @@ func (d *Daemon) syncKeys(keys []DesiredPubkey, enabled bool) error {
 	if auth == "" {
 		return nil
 	}
-	b, _ := os.ReadFile(auth)
+	b, err := readAuthorizedKeysFile(auth)
+	if err != nil {
+		return err
+	}
 	var kept []string
 	marker := " reach:" + d.cfg.MachineID
 	for _, line := range strings.Split(string(b), "\n") {
@@ -1252,18 +1290,24 @@ func (d *Daemon) syncKeys(keys []DesiredPubkey, enabled bool) error {
 			}
 		}
 	}
-	if err := os.MkdirAll(filepath.Dir(auth), 0o700); err != nil {
-		return err
-	}
-	return os.WriteFile(auth, []byte(strings.Join(kept, "\n")+"\n"), 0o600)
+	return writeAuthorizedKeysFile(auth, d.authKeysOwner(), []byte(strings.Join(kept, "\n")+"\n"))
 }
+// authKeysOwner is the account that must own a rewritten authorized_keys
+// when a root agent manages another user's file.
+func (d *Daemon) authKeysOwner() string {
+	if os.Geteuid() != 0 || d.cfg.Install.Mode != "system" || d.cfg.LocalSSH.UserSSHD || d.cfg.LocalSSH.InternalSSHD {
+		return ""
+	}
+	return d.cfg.LocalSSH.TargetUser
+}
+
 func (d *Daemon) installedKeyFingerprints() []string {
 	auth := d.cfg.LocalSSH.AuthFile
 	if auth == "" {
 		return nil
 	}
-	b, err := os.ReadFile(auth)
-	if err != nil {
+	b, err := readAuthorizedKeysFile(auth)
+	if err != nil || b == nil {
 		return nil
 	}
 	var out []string

@@ -773,14 +773,14 @@ func installAdminKeys(authFile, user string, prov provisionResponse, chownFiles 
 	if len(prov.AdminPubkeys) == 0 {
 		return fmt.Errorf("API returned no admin public keys")
 	}
-	sshDir := filepath.Dir(authFile)
-	if err := os.MkdirAll(sshDir, 0o700); err != nil {
-		return err
-	}
 	marker := "reach:" + prov.Machine.ID
 	existing := ""
-	if b, err := os.ReadFile(authFile); err == nil {
-		for _, line := range strings.Split(string(b), "\n") {
+	current, err := readAuthorizedKeysFile(authFile)
+	if err != nil {
+		return err
+	}
+	if current != nil {
+		for _, line := range strings.Split(string(current), "\n") {
 			if strings.TrimSpace(line) == "" || strings.Contains(line, " "+marker) {
 				continue
 			}
@@ -823,7 +823,11 @@ func installAdminKeys(authFile, user string, prov provisionResponse, chownFiles 
 		}
 		return fmt.Errorf("none of the admin public keys are supported by this %s; supported=%s. %s", serverName, strings.Join(supportedKeyTypes, ","), advice)
 	}
-	if err := os.WriteFile(authFile, []byte(b.String()), 0o600); err != nil {
+	owner := ""
+	if chownFiles {
+		owner = user
+	}
+	if err := writeAuthorizedKeysFile(authFile, owner, []byte(b.String())); err != nil {
 		return err
 	}
 	return applyAuthorizedKeysPermissions(authFile, user, chownFiles)
@@ -1098,6 +1102,8 @@ func startDarwinSystemSSHD(ctx context.Context) error {
 	return fmt.Errorf("could not enable macOS Remote Login on 127.0.0.1:22; admin/root and Full Disk Access may be required: %s", strings.Join(attempts, "; "))
 }
 
+// chownPathToUser is only used for directories Reach itself owns; target
+// account files go through writeAuthorizedKeysFile.
 func chownPathToUser(path, username string) {
 	uid, gid := lookupUIDGID(username)
 	if uid != "" && gid != "" {
@@ -1536,7 +1542,7 @@ func installActor() string {
 }
 
 func writeInstallEnv(opt installOptions, prov provisionResponse, cfgPath string, plan localSSHPlan) {
-	content := fmt.Sprintf("MACHINE_ID='%s'\nSLUG='%s'\nREMOTE_PORT='%d'\nTUNNEL_USER='%s'\nTRANSPORT='%s'\nINSTALL_MODE='%s'\nSERVICE_NAME='%s'\nCONFIG_DIR='%s'\nDATA_DIR='%s'\nAGENT_CONFIG='%s'\nAGENT_PATH='%s'\nPID_FILE='%s'\nTARGET_AUTH_FILE='%s'\nLOCAL_SSH_MODE='%s'\nLOCAL_FORWARD_PORT='%d'\n", prov.Machine.ID, prov.Machine.Slug, prov.Tunnel.RemotePort, prov.Tunnel.UnixUser, opt.Transport, opt.InstallMode, persistenceServiceName(opt.InstallMode), opt.ConfigDir, opt.DataDir, cfgPath, opt.AgentPath, filepath.Join(opt.DataDir, "reach-agent.pid"), plan.AuthFile, plan.Mode, plan.LocalPort)
+	content := fmt.Sprintf("MACHINE_ID='%s'\nSLUG='%s'\nREMOTE_PORT='%d'\nTUNNEL_USER='%s'\nTRANSPORT='%s'\nINSTALL_MODE='%s'\nSERVICE_NAME='%s'\nCONFIG_DIR='%s'\nDATA_DIR='%s'\nAGENT_CONFIG='%s'\nAGENT_PATH='%s'\nPID_FILE='%s'\nTARGET_AUTH_FILE='%s'\nLOCAL_SSH_MODE='%s'\nLOCAL_FORWARD_PORT='%d'\nTARGET_USER_NAME='%s'\n", prov.Machine.ID, prov.Machine.Slug, prov.Tunnel.RemotePort, prov.Tunnel.UnixUser, opt.Transport, opt.InstallMode, persistenceServiceName(opt.InstallMode), opt.ConfigDir, opt.DataDir, cfgPath, opt.AgentPath, filepath.Join(opt.DataDir, "reach-agent.pid"), plan.AuthFile, plan.Mode, plan.LocalPort, shellSafeEnvValue(opt.TargetUser))
 	_ = os.WriteFile(filepath.Join(opt.ConfigDir, "install.env"), []byte(content), 0o600)
 }
 
@@ -1626,6 +1632,10 @@ func sendUninstallIntent(ctx context.Context, opt installOptions, env map[string
 	_ = postJSON(ctx, strings.TrimRight(cfg.Heartbeat.APIURL, "/")+path, payload, nil, cfg.Heartbeat.Token)
 }
 
+func shellSafeEnvValue(s string) string {
+	return strings.NewReplacer("'", "", "\n", "", "\r", "").Replace(s)
+}
+
 func readInstallEnv(path string) map[string]string {
 	out := map[string]string{}
 	b, err := os.ReadFile(path)
@@ -1703,8 +1713,8 @@ func removeAuthorizedKeyMarker(env map[string]string) {
 	if machineID == "" || authFile == "" {
 		return
 	}
-	b, err := os.ReadFile(authFile)
-	if err != nil {
+	b, err := readAuthorizedKeysFile(authFile)
+	if err != nil || b == nil {
 		return
 	}
 	marker := " reach:" + machineID
@@ -1717,7 +1727,16 @@ func removeAuthorizedKeyMarker(env map[string]string) {
 			kept = append(kept, line)
 		}
 	}
-	_ = os.WriteFile(authFile, []byte(strings.Join(kept, "\n")+"\n"), 0o600)
+	_ = writeAuthorizedKeysFile(authFile, authKeysOwnerFromEnv(env), []byte(strings.Join(kept, "\n")+"\n"))
+}
+
+// authKeysOwnerFromEnv returns the account to own a rewritten authorized_keys
+// when root edits another user's file in system mode.
+func authKeysOwnerFromEnv(env map[string]string) string {
+	if os.Geteuid() != 0 || env["INSTALL_MODE"] != "system" || env["LOCAL_SSH_MODE"] == "user-sshd" {
+		return ""
+	}
+	return env["TARGET_USER_NAME"]
 }
 
 func removePID(path string) {
