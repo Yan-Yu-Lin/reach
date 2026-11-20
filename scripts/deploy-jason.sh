@@ -306,6 +306,11 @@ rollback_reachd() {
     if [ "$LEGACY_WAS_ENABLED" = 1 ]; then sudo systemctl enable reach-wstunnel.service; else sudo systemctl disable reach-wstunnel.service 2>/dev/null || true; fi
     if [ "$LEGACY_WAS_ACTIVE" = 1 ]; then sudo systemctl start reach-wstunnel.service; else sudo systemctl stop reach-wstunnel.service 2>/dev/null || true; fi
   fi
+  if [ -n "${REACHD_UNIT_BACKUP:-}" ] && sudo test -f "$REACHD_UNIT_BACKUP"; then
+    echo "[deploy] restoring previous reachd.service" >&2
+    sudo cp -a "$REACHD_UNIT_BACKUP" /etc/systemd/system/reachd.service
+    sudo systemctl daemon-reload
+  fi
   if [ "$ROLLBACK_ARMED" = 1 ]; then
     echo "[deploy] ERROR: deployment failed; restoring previous reachd binary" >&2
     sudo systemctl stop reachd
@@ -525,6 +530,9 @@ Wants=network-online.target
 Type=simple
 User=reach-wstunnel
 Group=reach-wstunnel
+# Optional: REACH_WS_PATH_PREFIX=/ws/tunnel/<secret>/ makes the carrier refuse
+# every other path itself (kept out of argv and out of git).
+EnvironmentFile=-/etc/reach/ws-carrier.env
 ExecStart=/opt/reach/reach-ws-carrier server --listen 127.0.0.1:9401 --target 127.0.0.1:22
 Restart=always
 RestartSec=5
@@ -532,6 +540,9 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
+MemoryMax=256M
+TasksMax=128
+LimitNOFILE=1024
 
 [Install]
 WantedBy=multi-user.target
@@ -553,6 +564,23 @@ else
   DASHBOARD_MUTATED=1
   sudo "$UV_BIN" run --script scripts/atomic-directory-swap.py "$DASHBOARD_STAGE" /opt/reach-dashboard
   DASHBOARD_STAGE=""
+fi
+
+# Optional sandboxed reachd unit (deploy/systemd/reachd.service). Off by default:
+# it must be tested once with a real provision/disable/retire cycle while the
+# hub can be reached without Reach. REACH_INSTALL_REACHD_UNIT=1 enables it.
+REACHD_UNIT_BACKUP=""
+if [ "${REACH_INSTALL_REACHD_UNIT:-0}" = 1 ]; then
+  echo "[deploy] installing sandboxed reachd.service from deploy/systemd..."
+  if sudo test -f /etc/systemd/system/reachd.service; then
+    REACHD_UNIT_BACKUP="/var/lib/reach/deploy-backups/reachd.service.${DEPLOY_TS}"
+    sudo cp -a /etc/systemd/system/reachd.service "$REACHD_UNIT_BACKUP"
+  fi
+  if command -v systemd-analyze >/dev/null; then
+    systemd-analyze verify deploy/systemd/reachd.service
+  fi
+  sudo install -m 0644 deploy/systemd/reachd.service /etc/systemd/system/reachd.service
+  sudo systemctl daemon-reload
 fi
 
 echo "[deploy] stopping reachd for a consistent database backup..."
@@ -729,6 +757,7 @@ if ! sudo "$UV_BIN" run --script scripts/prune-deploy-backups.py --retain "$BACK
   '/opt/reach/reachd.rollback.*' \
   '/opt/reach/reach-ws-carrier.rollback.*' \
   '/var/lib/reach/deploy-backups/reach-ws-carrier.service.*' \
+  '/var/lib/reach/deploy-backups/reachd.service.*' \
   '/var/lib/reach/deploy-backups/agent-publication.*' \
   "$AGENT_DOWNLOAD_ROOT/v*.replaced.*" \
   "$DB_BACKUP_DIR/failed.*" \

@@ -1,0 +1,55 @@
+# SUGGESTED CHANGE ONLY. Do not apply without Arthur's review.
+#
+# Opus P1-4: HAProxy forwards SSH on :443 to 127.0.0.1:22 without the client
+# address, so sshd sees every connection as 127.0.0.1 and MaxStartups /
+# PerSourceMaxStartups / fail2ban cannot tell attackers apart. ~100 idle
+# connections can push sshd past MaxStartups and block every Reach tunnel
+# reconnect. HAProxy is the only layer that sees the real IP, so limit there.
+#
+# Context: jason /etc/haproxy/haproxy.cfg (HAProxy 2.8), frontend
+# fe_443_mux routes `is_ssh` to backend bk_ssh. The limits apply only to the
+# SSH branch, after the protocol sniff, so TLS (nginx) and Minecraft are
+# unaffected.
+#
+# Numbers: legitimate SSH over 443 is Arthur plus a handful of Reach targets,
+# each reconnecting at most every few seconds. 10 concurrent and 30 new per
+# 10 s per IP is far above that. Carrier-grade NAT (military camp, school)
+# can put several users behind one IP; raise the numbers rather than remove
+# the check if that is ever hit.
+#
+# Apply:
+#   sudo cp /etc/haproxy/haproxy.cfg /etc/haproxy/haproxy.cfg.bak-$(date +%F)
+#   (edit as below)
+#   sudo haproxy -c -f /etc/haproxy/haproxy.cfg && sudo systemctl reload haproxy
+# Roll back by restoring the .bak and reloading.
+#
+# Pair with sshd (also on jason, separate change):
+#   LoginGraceTime 20
+#   MaxStartups 30:50:200
+
+--- a/etc/haproxy/haproxy.cfg
++++ b/etc/haproxy/haproxy.cfg
+@@ frontend fe_443_mux
+ frontend fe_443_mux
+     bind 0.0.0.0:443
+     tcp-request inspect-delay 5s
+
+     acl is_ssh payload(0,4) -m str SSH-
+     acl is_tls req.ssl_hello_type 1
+
++    # Per-IP SSH connection limits (track only SSH; see bk_ssh_limits).
++    tcp-request content track-sc0 src table bk_ssh_limits if is_ssh
++    tcp-request content reject if is_ssh { sc0_conn_cur(bk_ssh_limits) gt 10 }
++    tcp-request content reject if is_ssh { sc0_conn_rate(bk_ssh_limits) gt 30 }
++
+     tcp-request content accept if is_ssh
+     tcp-request content accept if is_tls
+@@
+ backend bk_ssh
++    # Bound sshd's view of the world; queued connections wait up to 10 s.
++    timeout queue 10s
+-    server sshd 127.0.0.1:22
++    server sshd 127.0.0.1:22 maxconn 100
++
++backend bk_ssh_limits
++    stick-table type ip size 100k expire 60s store conn_cur,conn_rate(10s)

@@ -152,12 +152,15 @@ scp "$AGENT_TAR" "${DEPLOY_HOST}:${REMOTE_AGENT_TAR}"
 # Do not trust whatever deploy script the hub happened to have before this run.
 # The remote bootstrap first fetches and checks out the exact pushed commit, then
 # runs that commit's deployment script. No source files are copied from the Mac.
-ssh "${DEPLOY_HOST}" "bash -s" -- "$DEPLOY_COMMIT" "$REMOTE_ARTIFACT_DIR" "$REMOTE_AGENT_TAR" "$AGENT_VERSION" <<'REMOTE_DEPLOY'
+INSTALL_REACHD_UNIT="${REACH_INSTALL_REACHD_UNIT:-0}"
+case "$INSTALL_REACHD_UNIT" in 0|1) ;; *) echo "[mac] ERROR: REACH_INSTALL_REACHD_UNIT must be 0 or 1" >&2; exit 1 ;; esac
+ssh "${DEPLOY_HOST}" "bash -s" -- "$DEPLOY_COMMIT" "$REMOTE_ARTIFACT_DIR" "$REMOTE_AGENT_TAR" "$AGENT_VERSION" "$INSTALL_REACHD_UNIT" <<'REMOTE_DEPLOY'
 set -Eeuo pipefail
 deploy_commit="$1"
 artifact_dir="$2"
 artifact_tar="$3"
 agent_version="$4"
+install_reachd_unit="$5"
 cleanup_remote() {
   case "$artifact_dir" in /tmp/reach-agent-artifacts.*) ;; *) return 1 ;; esac
   case "$artifact_tar" in /tmp/reach-agent-artifacts.*.tar.gz) ;; *) return 1 ;; esac
@@ -208,6 +211,7 @@ REACH_PUBLISH_AGENT_RELEASE=1 \
 REACH_AGENT_VERSION="$agent_version" \
 REACH_AGENT_ARTIFACT_DIR="$artifact_dir" \
 REACH_DEPLOY_LOCK_HELD=1 \
+REACH_INSTALL_REACHD_UNIT="$install_reachd_unit" \
 CGO_ENABLED=0 \
 bash scripts/deploy-jason.sh 9>&9
 REMOTE_DEPLOY

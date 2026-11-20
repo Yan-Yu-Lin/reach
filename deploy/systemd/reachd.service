@@ -1,0 +1,65 @@
+# Reach control plane (plan A: still root, sandboxed).
+#
+# Source of truth for /etc/systemd/system/reachd.service on the hub;
+# scripts/deploy-jason.sh installs it only with REACH_INSTALL_REACHD_UNIT=1.
+# Based on Opus "方案 A" and the daybreak drop-in. Before enabling on the
+# only path home, test on a VM or while the hub can be reached another way:
+#   - register + provision a test machine (useradd, sshd -t, reload ssh)
+#   - disable / enable / retire it (rename, pkill, userdel, drop-in removal)
+#   - systemd-analyze security reachd
+# The privilege split (plan B) is in docs/design/2026-11-21-reachd-privilege-split.md.
+
+[Unit]
+Description=Reach tunnel manager API
+After=network-online.target ssh.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/reach/reachd serve
+Restart=always
+RestartSec=5
+StateDirectory=reach
+LogsDirectory=reach
+UMask=0077
+
+# --- Resource limits: a flood can at most restart reachd, not starve jason.
+MemoryHigh=768M
+MemoryMax=1G
+TasksMax=256
+LimitNOFILE=4096
+CPUQuota=150%
+
+# --- Filesystem: read-only except what provisioning must change.
+ProtectSystem=strict
+# Tunnel homes live in /var/lib/rt-* (systemd has no wildcard here).
+ReadWritePaths=/var/lib
+# useradd/userdel rewrite /etc/passwd, shadow, group, gshadow via rename and
+# lock files in /etc, so the directory itself must be writable.
+ReadWritePaths=/etc
+ReadWritePaths=/var/log/reach
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+# AF_NETLINK for `ss`, AF_UNIX for D-Bus (systemctl reload ssh).
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+# --- Capabilities: root, but only what account/tunnel management needs.
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_KILL CAP_SETUID CAP_SETGID CAP_AUDIT_WRITE
+AmbientCapabilities=
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target
