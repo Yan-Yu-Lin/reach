@@ -22,3 +22,26 @@ needs Linux and runs inside `deploy-jason.sh` before the unit is installed.
 Before turning on the sandboxed unit, test once with jason reachable another
 way (Headscale or physical): register + provision a test machine, disable,
 enable, retire, then `systemd-analyze security reachd`.
+
+## Rollback of a failed reachd deploy (`deploy-jason.sh`)
+
+The steps are the functions between `BEGIN/END reachd transaction steps` in
+`scripts/deploy-jason.sh`; `scripts/test-rollback-in-container.sh` runs those
+same functions in Ubuntu 24.04 (scenarios A–G).
+
+1. reachd is stopped and the stop is proven (unit inactive, old PID gone,
+   nobody holding the DB), then the DB snapshot and the deploy fence
+   (`MAX(durable_actions.id)`) are taken.
+2. The old binary is copied to `/opt/reach/reachd.rollback.<ts>`; a private
+   copy of the new binary goes to
+   `/var/lib/reach/deploy-backups/reachd-probe.<ts>` (readiness token and
+   `deploy-fence check`; the old binary has neither command).
+3. On failure, the snapshot is restored automatically only if: reachd is
+   provably stopped, the failed DB/WAL/SHM are fully preserved in
+   `backups/failed.<ts>`, and the journal has no row after the fence (no
+   operator/enrollment decision, no OS intent, on the new version).
+   Otherwise reachd stays stopped and the script prints what is on disk.
+4. `/etc/reach/ws-carrier.env`, the carrier unit/binary, the limits
+   drop-in and an opt-in reachd unit are restored (or removed if new).
+
+Old fence files (without journal fields) never allow an automatic restore.
