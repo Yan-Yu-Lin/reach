@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -128,5 +129,46 @@ func TestMigrationInvalidatesPreUpgradeJWTs(t *testing.T) {
 	}
 	if rec := doJSON(t, server, http.MethodGet, "/api/admin/machines", "", fresh); rec.Code != 200 {
 		t.Fatalf("second migration revoked current sessions: %d", rec.Code)
+	}
+}
+
+// Daybreak round 3 P1-C (TestR3InterruptedSessionMigrationLeavesLegacyJWTValid):
+// the process dies after the session_version column exists but before the
+// bump commits. The next start must still invalidate pre-upgrade JWTs.
+func TestInterruptedSessionMigrationIsRetried(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "reach.db")
+	store, err := OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	for _, q := range []string{
+		`CREATE TABLE users (id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, role TEXT DEFAULT 'admin', created_at TEXT NOT NULL)`,
+		`INSERT INTO users (id,username,password_hash,role,created_at) VALUES ('u_old','arthur','x','owner','2026-01-01T00:00:00Z')`,
+	} {
+		if _, err := store.db.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := DefaultConfig()
+	cfg.JWTSecret = "test-jwt-secret-with-sufficient-length"
+	cfg.ProvisioningEnabled = false
+	old, _ := SignJWT(cfg.JWTSecret, "u_old", "arthur", "owner", 365*24*time.Hour)
+	// First start: crash inside the one-shot migration (after ALTER).
+	migrationHook = func(string) error { return errors.New("simulated process death") }
+	if err := store.Migrate(context.Background(), cfg); err == nil {
+		t.Fatal("expected the simulated crash")
+	}
+	migrationHook = nil
+	if !store.columnPresent(context.Background(), "users", "session_version") {
+		t.Fatal("fixture: column should exist after the interrupted run")
+	}
+	// Second start completes it.
+	if err := store.Migrate(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(cfg, store, NewProvisioner(store, cfg))
+	if rec := doJSON(t, server, http.MethodGet, "/api/admin/machines", "", old); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("pre-upgrade JWT after interrupted+retried migration = %d", rec.Code)
 	}
 }

@@ -302,7 +302,6 @@ func (s *Store) Migrate(ctx context.Context, cfg Config) error {
 			return err
 		}
 	}
-	hadSessionVersion := s.columnPresent(ctx, "users", "session_version")
 	for _, col := range []struct{ table, name, decl string }{
 		{"machines", "agent_token_hash", "TEXT"},
 		{"machines", "original_slug", "TEXT"},
@@ -347,10 +346,16 @@ func (s *Store) Migrate(ctx context.Context, cfg Config) error {
 	// (decoded as 0) and may be valid for up to a year. Bump every account
 	// once when the column is introduced so they all stop working
 	// (daybreak P1-3). Service tokens are separate and unaffected.
-	if !hadSessionVersion {
-		if _, err := s.db.ExecContext(ctx, `UPDATE users SET session_version=session_version+1`); err != nil {
-			return err
-		}
+	// Invalidate every pre-upgrade JWT exactly once. The bump and its
+	// completion marker commit in one transaction, so a crash after the
+	// ALTER but before the bump is retried on the next start (daybreak
+	// round 3 P1-C). A deployment that already ran the earlier
+	// column-presence version bumps once more: everyone logs in again.
+	if err := s.runOnce(ctx, "2026-11-21-invalidate-pre-session-version-jwts", func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE users SET session_version=session_version+1`)
+		return err
+	}); err != nil {
+		return err
 	}
 	// Retired machines must not keep a working agent token (daybreak P2-5).
 	// Also by status: very old schemas marked retirement only in status
@@ -489,6 +494,42 @@ func (s *Store) releaseRetiredTunnels(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// migrationHook lets tests simulate a crash inside a one-shot migration.
+var migrationHook func(name string) error
+
+// runOnce runs fn and records name in schema_migrations in the same
+// transaction. If either fails, neither is committed and the next start
+// retries.
+func (s *Store) runOnce(ctx context.Context, name string, fn func(*sql.Tx) error) error {
+	if _, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)`); err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var done int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE name=?`, name).Scan(&done); err != nil {
+		return err
+	}
+	if done > 0 {
+		return nil
+	}
+	if err := fn(tx); err != nil {
+		return err
+	}
+	if migrationHook != nil {
+		if err := migrationHook(name); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations (name,applied_at) VALUES (?,?)`, name, nowUTC()); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) columnPresent(ctx context.Context, table, column string) bool {
