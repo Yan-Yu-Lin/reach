@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -32,6 +33,9 @@ type Server struct {
 	agentMachL   *rateLimiter
 	uninstallIPL *rateLimiter
 	argon        *argonGate
+	// revocations wakes open SSE streams so they re-authenticate at once
+	// after logout, revoke-all or service-token revocation (astra F01).
+	revocations *revocationNotifier
 }
 
 const (
@@ -55,6 +59,7 @@ func NewServer(cfg Config, store *Store, prov *Provisioner) *Server {
 		agentMachL:   newRateLimiter(agentPerMachinePerMinute, time.Minute),
 		uninstallIPL: newRateLimiter(uninstallPerIPPerMinute, time.Minute),
 		argon:        defaultArgonGate,
+		revocations:  newRevocationNotifier(),
 	}
 	if prov != nil {
 		prov.argon = s.argon
@@ -793,10 +798,24 @@ func (s *Server) handleAdminEvents(w http.ResponseWriter, r *http.Request) {
 	flusher.Flush()
 	tick := time.NewTicker(25 * time.Second)
 	defer tick.Stop()
+	token := tokenFrom(r.Context())
+	revoked := s.revocations.current()
+	// stillAuthorized re-validates the bearer token (signature, expiry,
+	// blacklist, session_version, service-token revocation) before anything
+	// is written, so a revoked session never receives another byte.
+	stillAuthorized := func() bool {
+		claims, _, err := s.authenticateAdminToken(r.Context(), token)
+		return err == nil && claims != nil && adminRoleAllowed(claims.Role, r.URL.Path)
+	}
 	for {
 		select {
 		case <-r.Context().Done():
 			return
+		case <-revoked:
+			if !stillAuthorized() {
+				return
+			}
+			revoked = s.revocations.current()
 		case ev, ok := <-ch:
 			if !ok {
 				return
@@ -804,6 +823,9 @@ func (s *Server) handleAdminEvents(w http.ResponseWriter, r *http.Request) {
 			id, err := strconv.ParseInt(ev.ID, 10, 64)
 			if err == nil && id <= cursor {
 				continue
+			}
+			if !stillAuthorized() {
+				return
 			}
 			if err := writeSSE(w, ev); err != nil {
 				return
@@ -816,6 +838,9 @@ func (s *Server) handleAdminEvents(w http.ResponseWriter, r *http.Request) {
 				cursor = id
 			}
 		case <-tick.C:
+			if !stillAuthorized() {
+				return
+			}
 			if err := writeSSEComment(w, "keepalive"); err != nil {
 				return
 			}
@@ -1240,6 +1265,7 @@ func (s *Server) handleAdminLogout(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "logout failed")
 		return
 	}
+	s.revocations.notify()
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
@@ -1275,6 +1301,7 @@ func (s *Server) handleRevokeAllSessions(w http.ResponseWriter, r *http.Request)
 		}
 		revokedServices, _ = res.RowsAffected()
 	}
+	s.revocations.notify()
 	s.store.Audit(r.Context(), "sessions.revoke_all", claims.Username, "", fmt.Sprintf("service_tokens=%d", revokedServices))
 	writeJSON(w, 200, map[string]any{"ok": true, "revoked_service_tokens": revokedServices})
 }
@@ -1761,4 +1788,38 @@ func (s *Server) Run(ctx context.Context) error {
 		return nil
 	}
 	return err
+}
+
+// revocationNotifier broadcasts "some credential was revoked" to every open
+// event stream. Each stream then re-checks its own token; streams whose token
+// is still valid keep running. A closed channel is the broadcast; notify
+// swaps in a fresh one.
+type revocationNotifier struct {
+	mu sync.Mutex
+	ch chan struct{}
+}
+
+func newRevocationNotifier() *revocationNotifier {
+	return &revocationNotifier{ch: make(chan struct{})}
+}
+
+// current returns the channel that the next notify will close. A nil
+// notifier yields a nil channel, which never fires.
+func (n *revocationNotifier) current() <-chan struct{} {
+	if n == nil {
+		return nil
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.ch
+}
+
+func (n *revocationNotifier) notify() {
+	if n == nil {
+		return
+	}
+	n.mu.Lock()
+	close(n.ch)
+	n.ch = make(chan struct{})
+	n.mu.Unlock()
 }

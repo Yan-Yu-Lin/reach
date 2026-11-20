@@ -25,6 +25,10 @@ data: {"machine_id":"m_abc123","heartbeat_at":"2026-11-21T03:04:05Z","observed_s
   `data`.
 - A keepalive comment arrives every 25 s. Treat 60 s of silence as a dead
   stream and reconnect.
+- The server re-validates the bearer token before every event and keepalive,
+  and immediately after any logout, revoke-all or service-token revocation.
+  A revoked or expired session's stream is closed without further data; the
+  next reconnect gets 401, and the client should go to login.
 
 ## Two kinds of events
 
