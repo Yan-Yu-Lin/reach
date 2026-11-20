@@ -1,7 +1,7 @@
 import { mapSettledLimited } from '~/utils/concurrency'
 import { createAuthoritativeRefreshRetry } from '~/utils/authoritativeRefreshRetry'
 import { planFleetEvent, type MachinePatch } from '~/utils/fleetEvents'
-import { applyPatch, applySnapshot, createPatchLog, pendingOnly, upsertMachine } from '~/utils/fleetStore'
+import { applyPatch, applySnapshot, createPatchLog, pendingOnly, rebuildMachine, rebuildMachines } from '~/utils/fleetStore'
 import { createRefreshCoordinator, type RefreshBatch } from '~/utils/refreshCoordinator'
 import { groupFleet, uiStatus, type UiStatus } from '~/utils/status'
 
@@ -103,10 +103,6 @@ export function useFleet() {
   const pendingCount = computed(() => pending.value.length)
   const selectedMachine = computed(() => (selectedId.value && byId.get(selectedId.value)) || null)
 
-  function replaySince(mark: number, id?: string) {
-    for (const e of patchLog.patchesSince(mark, id)) applyPatch(byId, e.id, e.patch)
-  }
-
   async function loadPendingLane() {
     try {
       pending.value = pendingOnly(await api.pendingRequests())
@@ -138,8 +134,7 @@ export function useFleet() {
       }
       overflowCount.value = 0
       const touched = patchLog.touchedSince(mark)
-      applySnapshot(byId, snapshot || [], touched)
-      replaySince(mark)
+      rebuildMachines(byId, snapshot || [], patchLog.patchesSince(mark), touched)
       // Machines an event mentioned but the snapshot did not list: ask about each directly
       // instead of trusting a list that may predate them.
       const listed = new Set((snapshot || []).map(m => m.machine.id))
@@ -170,8 +165,7 @@ export function useFleet() {
       results.forEach((r, i) => {
         const id = ids[i]!
         if (r.status === 'fulfilled') {
-          upsertMachine(byId, r.value)
-          replaySince(mark, id)
+          rebuildMachine(byId, r.value, patchLog.patchesSince(mark, id))
         } else if ((r.reason as any)?.status === 404) {
           // Gone on the server (retired machines are no longer listed).
           byId.delete(id)

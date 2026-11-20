@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { MachineWithTunnels, RequestRow } from '../app/composables/useReachApi'
-import { applyPatch, applySnapshot, createPatchLog, knownHeartbeat, pendingOnly, upsertMachine } from '../app/utils/fleetStore'
+import { applyPatch, applySnapshot, createPatchLog, knownHeartbeat, pendingOnly, rebuildMachine, rebuildMachines, upsertMachine } from '../app/utils/fleetStore'
+import { planFleetEvent } from '../app/utils/fleetEvents'
 import { connectionChecks } from '../app/utils/status'
 
 function item(id: string, heartbeat = '2026-11-21T00:00:00Z'): MachineWithTunnels {
@@ -272,5 +273,86 @@ describe('replayed observed_changed (R2-03 timestamps)', () => {
     const store = new Map([['a', item('a', '2026-11-21T00:00:00Z')]])
     expect(applyPatch(store, 'a', { observed_state: 'offline', status: 'offline', heartbeat_at: '2026-11-19T00:00:00Z' })).toBe('noop')
     expect(store.get('a')!.machine.observed_state).toBe('online')
+  })
+})
+
+describe('ordered rebuild: HTTP base + in-flight events (astra R4-01)', () => {
+  // T0 HTTP read in flight -> T1 health accepted (Failed) -> T2 heartbeat -> T0 response lands.
+  const T0 = '2026-11-21T00:00:00Z', T1 = '2026-11-21T00:00:01Z', T2 = '2026-11-21T00:00:02Z'
+  const row = (): MachineWithTunnels => ({
+    machine: { id: 'm', slug: 'm', desired_state: 'active', observed_state: 'online', status: 'online', desired_generation: 1, update_policy: 'manual', local_port: 22, created_at: T0, updated_at: T0 },
+    tunnels: [],
+    agent_observation: { applied_generation: 1, heartbeat_at: T0 },
+    hub_observation: { probe_state: 'reachable', last_probe_at: T0 },
+  })
+  function scenario(apply: (store: Map<string, MachineWithTunnels>, base: MachineWithTunnels, patches: ReturnType<ReturnType<typeof createPatchLog>['patchesSince']>) => void) {
+    const store = new Map([['m', row()]])
+    const log = createPatchLog()
+    const { token, mark } = log.begin()
+    const health = planFleetEvent('machine.health_changed', { machine_id: 'm', observed_state: 'degraded', status: 'degraded', probe_state: 'unreachable', last_probe_at: T1, event_at: T1 }) as any
+    const hb = planFleetEvent('agent.heartbeat', { machine_id: 'm', observed_state: 'degraded', status: 'degraded', heartbeat_at: T2 }) as any
+    for (const p of [health.patch, hb.patch]) { log.record('m', p); applyPatch(store, 'm', p) }
+    expect(store.get('m')!.hub_observation).toMatchObject({ probe_state: 'unreachable', last_probe_at: T1 })
+    apply(store, row(), log.patchesSince(mark))
+    log.end(token)
+    return store.get('m')!
+  }
+
+  it('full snapshot path keeps the probe tuple unreachable/T1, the state degraded and liveness T2', () => {
+    const m = scenario((store, base, patches) => rebuildMachines(store, [base], patches))
+    expect(m.hub_observation).toEqual({ probe_state: 'unreachable', last_probe_at: T1 })
+    expect(m.machine.observed_state).toBe('degraded')
+    expect(knownHeartbeat(m)).toBe(T2)
+    const [probe] = connectionChecks(m, Date.parse(T2) + 1000)
+    expect(probe!.state).toBe('fail')
+  })
+
+  it('single machine path keeps the probe tuple unreachable/T1, the state degraded and liveness T2', () => {
+    const m = scenario((store, base, patches) => rebuildMachine(store, base, patches))
+    expect(m.hub_observation).toEqual({ probe_state: 'unreachable', last_probe_at: T1 })
+    expect(m.machine.observed_state).toBe('degraded')
+    expect(knownHeartbeat(m)).toBe(T2)
+  })
+
+  it('a newer heartbeat that is NOT in the replay window is kept, without guarding the replay', () => {
+    const store = new Map([['m', row()]])
+    applyPatch(store, 'm', { heartbeat_at: T2 }) // arrived before the request started
+    const log = createPatchLog()
+    const { token, mark } = log.begin()
+    const health = (planFleetEvent('machine.health_changed', { machine_id: 'm', observed_state: 'degraded', status: 'degraded', probe_state: 'unreachable', last_probe_at: T1, event_at: T1 }) as any).patch
+    log.record('m', health); applyPatch(store, 'm', health)
+    rebuildMachines(store, [row()], log.patchesSince(mark))
+    log.end(token)
+    const m = store.get('m')!
+    expect(m.hub_observation).toEqual({ probe_state: 'unreachable', last_probe_at: T1 })
+    expect(knownHeartbeat(m)).toBe(T2)
+  })
+
+  it('still drops a replayed event older than the HTTP base row (R3-04 kept)', () => {
+    const base = row()
+    base.machine.updated_at = T2
+    base.hub_observation = { probe_state: 'reachable', last_probe_at: T2 }
+    const store = new Map([['m', base]])
+    const log = createPatchLog()
+    const { token, mark } = log.begin()
+    const old = (planFleetEvent('machine.health_changed', { machine_id: 'm', observed_state: 'offline', status: 'offline', probe_state: 'unreachable', last_probe_at: T1, event_at: T1 }) as any).patch
+    log.record('m', old); applyPatch(store, 'm', old)
+    rebuildMachines(store, [structuredClone(base)], log.patchesSince(mark))
+    log.end(token)
+    expect(store.get('m')!.machine.observed_state).toBe('online')
+    expect(store.get('m')!.hub_observation).toEqual({ probe_state: 'reachable', last_probe_at: T2 })
+  })
+
+  it('keeps an undated replayed probe as Unknown over the HTTP base (R3-03 kept)', () => {
+    const store = new Map([['m', row()]])
+    const log = createPatchLog()
+    const { token, mark } = log.begin()
+    const undated = (planFleetEvent('machine.health_changed', { machine_id: 'm', observed_state: 'online', status: 'online', probe_state: 'unreachable' }) as any).patch
+    log.record('m', undated); applyPatch(store, 'm', undated)
+    rebuildMachines(store, [row()], log.patchesSince(mark))
+    log.end(token)
+    const m = store.get('m')!
+    expect(m.hub_observation).toEqual({ probe_state: 'reachable', last_probe_at: T0 })
+    expect(m.probe_unverified).toBe(true)
   })
 })

@@ -32,18 +32,14 @@ export function knownHeartbeat(item: MachineWithTunnels): string | undefined {
 }
 
 /**
- * Server data for one machine, keeping a live heartbeat that is newer than the payload's
- * observation (a heartbeat is published right after it is stored, so normally the payload
- * already contains it; this only matters when events and responses interleave).
+ * Server data for one machine, taken as it is. Client-only marks (live_heartbeat_at,
+ * state_at, probe_unverified) are NOT carried over from the held row: the server row is the
+ * base of an ordered rebuild, and the events that arrived while the request was in flight
+ * are replayed on top of it in their original order (see rebuildMachines). Carrying a later
+ * live heartbeat into the base first made the replayed, earlier health event look like
+ * history and dropped it (astra R4-01).
  */
-function fromServer(current: MachineWithTunnels | undefined, incoming: MachineWithTunnels): MachineWithTunnels {
-  // Client-only marks (probe_unverified, state_at) are not carried over: the server row is
-  // the authority. Events that arrived while this response was in flight are replayed on
-  // top of it by the caller.
-  const live = current?.live_heartbeat_at
-  if (live && time(live) > time(incoming.agent_observation?.heartbeat_at)) {
-    return { ...incoming, live_heartbeat_at: live }
-  }
+function fromServer(_current: MachineWithTunnels | undefined, incoming: MachineWithTunnels): MachineWithTunnels {
   return incoming
 }
 
@@ -176,6 +172,43 @@ export function applyPatch(store: Store, id: string, patch: MachinePatch): 'miss
 }
 
 type LoggedPatch = { seq: number; id: string; patch: MachinePatch }
+
+/**
+ * Keep a "seen alive at" time the rebuild could not reproduce (a heartbeat that reached us
+ * outside the replay window). Liveness only: it never changes state or probe, and it is
+ * merged AFTER the replay so it cannot act as a guard against the replayed events.
+ */
+function mergeLiveness(store: Store, id: string, liveAt: string | undefined) {
+  const item = store.get(id)
+  if (!item || !liveAt) return
+  if (time(liveAt) > time(knownHeartbeat(item))) store.set(id, { ...item, live_heartbeat_at: liveAt })
+}
+
+/**
+ * Ordered rebuild after a full snapshot (astra F03, R4-01):
+ *   1. the HTTP rows become the base, as the server had them when it read them;
+ *   2. the patches that arrived while the request was in flight are replayed in arrival
+ *      order through applyPatch, so each is judged against the state as it was then - a
+ *      health event newer than the base is accepted even if a later heartbeat followed it,
+ *      and one older than the base row (its updated_at) is still dropped (R3-04);
+ *   3. newer liveness that was not part of the replay is merged back last.
+ * `keep` lists machines missing from the snapshot that an event touched meanwhile.
+ */
+export function rebuildMachines(store: Store, snapshot: readonly MachineWithTunnels[], patches: readonly LoggedPatch[], keep: ReadonlySet<string> = new Set()) {
+  const liveBefore = new Map([...store].map(([id, item]) => [id, knownHeartbeat(item)]))
+  applySnapshot(store, snapshot, keep)
+  for (const e of patches) applyPatch(store, e.id, e.patch)
+  for (const [id, liveAt] of liveBefore) mergeLiveness(store, id, liveAt)
+}
+
+/** Same ordered rebuild for one machine's GET response. */
+export function rebuildMachine(store: Store, row: MachineWithTunnels, patches: readonly LoggedPatch[]) {
+  const id = row.machine.id
+  const liveBefore = store.get(id) ? knownHeartbeat(store.get(id)!) : undefined
+  upsertMachine(store, row)
+  for (const e of patches) if (e.id === id) applyPatch(store, e.id, e.patch)
+  mergeLiveness(store, id, liveBefore)
+}
 
 /**
  * Hard cap on what the log keeps while requests are in flight. Normally a few dozen entries

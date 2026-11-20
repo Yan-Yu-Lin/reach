@@ -421,6 +421,40 @@ await test('R3-05 every read overflows during a storm: backoff, a visible notice
   await ctx.close()
 })
 
+for (const path of ['full', 'single']) {
+  await test(`R4-01 HTTP in flight -> newer health (Failed) -> later heartbeat -> HTTP lands: probe stays Failed (${path})`, async () => {
+    await reset()
+    const id = (await ctl('/__mutate', { slug: 'omarchy', hub: { probe_state: 'reachable', last_probe_at: new Date().toISOString() } })).machine.id
+    const { ctx, page } = await open(undefined, { path: `/?m=${id}` })
+    await waitFor(async () => /\bOK\b/.test(await page.locator('.check').first().innerText()), 5000, 'OK before')
+    await page.locator('.live-live').waitFor()
+    await sleep(500)
+    // T0: a slow authoritative read starts (body captured now: reachable)
+    const key = path === 'full' ? 'GET /api/admin/machines' : 'GET /api/admin/machines/:id'
+    await ctl(`/__latency?key=${key}&ms=2200&times=1`)
+    await ctl('/__reset')
+    if (path === 'full') await ctl('/__emit', { type: 'machine.resync_required', data: { reason: 'test' } })
+    else await ctl('/__mutate', { slug: 'omarchy', emit: [{ type: 'ssh_config.changed', data: { reason: 'test' } }] })
+    await waitFor(async () => (await ctl('/__stats')).inflight > 0, 2000, 'slow read started')
+    // later reads fail, so only the slow T0 response and the events decide what is shown
+    await ctl('/__fail?key=GET /api/admin/machines&status=500&times=50')
+    await ctl('/__fail?key=GET /api/admin/machines/:id&status=500&times=50')
+    // T1: health (unreachable, dated); server now holds unreachable/T1
+    const t1 = new Date().toISOString()
+    await ctl('/__mutate', { slug: 'omarchy', machine: { observed_state: 'degraded', status: 'degraded' }, hub: { probe_state: 'unreachable', last_probe_at: t1 },
+      emit: [{ type: 'machine.health_changed', data: { observed_state: 'degraded', status: 'degraded', probe_state: 'unreachable', last_probe_at: t1, event_at: t1 } }] })
+    await waitFor(async () => /Failed/.test(await page.locator('.check').first().innerText()), 2000, 'Failed after T1')
+    await sleep(1100)
+    // T2: a later heartbeat
+    await ctl('/__hb?slug=omarchy&observed=degraded')
+    await sleep(2500) // the T0 response has landed and the in-flight events were replayed
+    const probe = await page.locator('.check').first().innerText()
+    expect(/Failed/.test(probe) && !/\bOK\b/.test(probe), `probe rolled back to the T0 response: ${probe}`)
+    expect(/Degraded/.test(await page.locator('.detail .badge').innerText()), 'badge')
+    await ctx.close()
+  })
+}
+
 // ---------------------------------------------------------------- F09
 await test('F09 a failed disable is reported as a failed disable, not a stuck removal', async () => {
   await reset()
