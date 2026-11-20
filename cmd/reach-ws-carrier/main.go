@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"reach/internal/wscarrier"
 )
@@ -28,10 +29,14 @@ func run(ctx context.Context, args []string) error {
 		fs := flag.NewFlagSet("server", flag.ContinueOnError)
 		listen := fs.String("listen", "127.0.0.1:9401", "listen address")
 		target := fs.String("target", "127.0.0.1:22", "target TCP address")
+		pathPrefix := fs.String("path-prefix", os.Getenv("REACH_WS_PATH_PREFIX"), "only accept this exact URL path prefix (default from REACH_WS_PATH_PREFIX; keep it out of argv)")
+		maxConns := fs.Int("max-conns", 64, "global concurrent connection limit")
+		maxPerIP := fs.Int("max-conns-per-ip", 8, "concurrent connections per client IP")
+		idle := fs.Duration("idle-timeout", 10*time.Minute, "close carried connections idle this long")
 		if err := fs.Parse(args); err != nil {
 			return err
 		}
-		return wscarrier.Serve(ctx, *listen, *target, log.Default())
+		return wscarrier.ServeWithOptions(ctx, *listen, *target, log.Default(), wscarrier.ServerOptions{PathPrefix: *pathPrefix, MaxConns: *maxConns, MaxConnsPerIP: *maxPerIP, IdleTimeout: *idle})
 	}
 	if args[0] == "client" {
 		fs := flag.NewFlagSet("client", flag.ContinueOnError)

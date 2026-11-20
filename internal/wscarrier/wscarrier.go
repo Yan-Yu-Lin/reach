@@ -102,13 +102,124 @@ func (c *wsConn) Close() error {
 	return c.Conn.Close()
 }
 
+// ServerOptions bounds the carrier (daybreak P2-4). Zero values select the
+// defaults below.
+type ServerOptions struct {
+	// PathPrefix, when set, is the only accepted URL path prefix (the shared
+	// /ws/tunnel/<secret>/ route). Requests for any other path get 404
+	// before the backend is dialled.
+	PathPrefix string
+	// MaxConns is the global concurrent connection limit.
+	MaxConns int
+	// MaxConnsPerIP limits concurrent connections per client IP (taken from
+	// X-Real-IP when the peer is loopback, i.e. nginx).
+	MaxConnsPerIP int
+	// IdleTimeout closes a carried connection with no traffic in either
+	// direction for this long.
+	IdleTimeout time.Duration
+	// HandshakeTimeout bounds the HTTP upgrade.
+	HandshakeTimeout time.Duration
+}
+
+const (
+	defaultMaxConns         = 64
+	defaultMaxConnsPerIP    = 8
+	defaultIdleTimeout      = 10 * time.Minute
+	defaultHandshakeTimeout = 10 * time.Second
+	// maxFramePayload bounds a single frame. Frames are streamed in chunks,
+	// so this is a protocol sanity limit, not a buffer size.
+	maxFramePayload = 16 * 1024 * 1024
+	streamChunk     = 32 * 1024
+)
+
+func (o ServerOptions) withDefaults() ServerOptions {
+	if o.MaxConns <= 0 {
+		o.MaxConns = defaultMaxConns
+	}
+	if o.MaxConnsPerIP <= 0 {
+		o.MaxConnsPerIP = defaultMaxConnsPerIP
+	}
+	if o.IdleTimeout <= 0 {
+		o.IdleTimeout = defaultIdleTimeout
+	}
+	if o.HandshakeTimeout <= 0 {
+		o.HandshakeTimeout = defaultHandshakeTimeout
+	}
+	if o.PathPrefix != "" {
+		o.PathPrefix = "/" + strings.Trim(o.PathPrefix, "/") + "/"
+	}
+	return o
+}
+
+type connLimiter struct {
+	mu    sync.Mutex
+	total int
+	perIP map[string]int
+	max   int
+	maxIP int
+}
+
+func (l *connLimiter) acquire(ip string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.total >= l.max || l.perIP[ip] >= l.maxIP {
+		return false
+	}
+	l.total++
+	l.perIP[ip]++
+	return true
+}
+
+func (l *connLimiter) release(ip string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.total--
+	if l.perIP[ip]--; l.perIP[ip] <= 0 {
+		delete(l.perIP, ip)
+	}
+}
+
+func remoteIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		if real := strings.TrimSpace(r.Header.Get("X-Real-IP")); real != "" {
+			return real
+		}
+	}
+	return host
+}
+
 // Serve accepts WebSocket connections and pipes each one to targetAddr.
 func Serve(ctx context.Context, listenAddr, targetAddr string, logger *log.Logger) error {
+	return ServeWithOptions(ctx, listenAddr, targetAddr, logger, ServerOptions{})
+}
+
+// NewHandler returns the carrier HTTP handler (exported for tests).
+func NewHandler(targetAddr string, logger *log.Logger, opts ServerOptions) http.Handler {
 	if logger == nil {
 		logger = log.Default()
 	}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	opts = opts.withDefaults()
+	limiter := &connLimiter{perIP: map[string]int{}, max: opts.MaxConns, maxIP: opts.MaxConnsPerIP}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if opts.PathPrefix != "" && !strings.HasPrefix(r.URL.Path, opts.PathPrefix) {
+			http.NotFound(w, r)
+			return
+		}
+		// Validate the upgrade before touching the backend.
+		if !headerHasToken(r.Header.Get("Connection"), "upgrade") || !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") || r.Header.Get("Sec-WebSocket-Key") == "" || r.Header.Get("Sec-WebSocket-Version") != "13" {
+			http.Error(w, "not a websocket upgrade", http.StatusBadRequest)
+			return
+		}
+		ip := remoteIP(r)
+		if !limiter.acquire(ip) {
+			http.Error(w, "too many connections", http.StatusTooManyRequests)
+			return
+		}
+		defer limiter.release(ip)
 		target, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
 		if err != nil {
 			http.Error(w, "target unavailable", http.StatusBadGateway)
@@ -121,24 +232,68 @@ func Serve(ctx context.Context, listenAddr, targetAddr string, logger *log.Logge
 			return
 		}
 		defer conn.Close()
-		logger.Printf("carrier connected remote=%s target=%s path=%s", r.RemoteAddr, targetAddr, redactPath(r.URL.Path))
-		if err := pump(r.Context(), br, conn, target, target, false); err != nil && !errors.Is(err, io.EOF) {
-			logger.Printf("carrier closed remote=%s err=%v", r.RemoteAddr, err)
+		logger.Printf("carrier connected remote=%s target=%s path=%s", ip, targetAddr, redactPath(r.URL.Path))
+		idle := &idleConn{Conn: conn, timeout: opts.IdleTimeout}
+		idleTarget := &idleConn{Conn: target, timeout: opts.IdleTimeout, peer: idle}
+		idle.peer = idleTarget
+		idle.touch()
+		if err := serverPump(r.Context(), br, idle, idleTarget); err != nil && !errors.Is(err, io.EOF) {
+			logger.Printf("carrier closed remote=%s err=%v", ip, err)
 		}
 	})
-	srv := &http.Server{Addr: listenAddr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+}
+
+// ServeWithOptions is Serve with explicit limits.
+func ServeWithOptions(ctx context.Context, listenAddr, targetAddr string, logger *log.Logger, opts ServerOptions) error {
+	if logger == nil {
+		logger = log.Default()
+	}
+	opts = opts.withDefaults()
+	srv := &http.Server{Addr: listenAddr, Handler: NewHandler(targetAddr, logger, opts), ReadHeaderTimeout: opts.HandshakeTimeout, MaxHeaderBytes: 16 << 10}
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
 	}()
-	logger.Printf("reach websocket carrier listening on %s -> %s", listenAddr, targetAddr)
+	logger.Printf("reach websocket carrier listening on %s -> %s (max %d conns, %d per IP, exact path %v)", listenAddr, targetAddr, opts.MaxConns, opts.MaxConnsPerIP, opts.PathPrefix != "")
 	err := srv.ListenAndServe()
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
 	return err
+}
+
+// idleConn closes both sides when neither has carried traffic for timeout.
+// Any read or write on either side extends both deadlines.
+type idleConn struct {
+	net.Conn
+	timeout time.Duration
+	peer    *idleConn
+}
+
+func (c *idleConn) touch() {
+	d := time.Now().Add(c.timeout)
+	_ = c.Conn.SetDeadline(d)
+	if c.peer != nil {
+		_ = c.peer.Conn.SetDeadline(d)
+	}
+}
+
+func (c *idleConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		c.touch()
+	}
+	return n, err
+}
+
+func (c *idleConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	if n > 0 {
+		c.touch()
+	}
+	return n, err
 }
 
 func carrierURL(rawURL, pathPrefix string) (*url.URL, error) {
@@ -331,6 +486,142 @@ func pump(ctx context.Context, br *bufio.Reader, conn net.Conn, plainIn io.Reade
 	case err := <-done:
 		return err
 	}
+}
+
+// serverPump is the carrier side of pump. Client frames are streamed into
+// the backend in fixed-size chunks, so a peer that declares a 16 MiB frame
+// and sends it slowly costs 32 KiB, not 16 MiB (daybreak P2-4). Each chunk
+// read refreshes the idle deadline.
+func serverPump(ctx context.Context, br *bufio.Reader, ws *idleConn, target *idleConn) error {
+	done := make(chan error, 2)
+	var writeMu sync.Mutex
+	go func() {
+		buf := make([]byte, streamChunk)
+		for {
+			n, err := target.Read(buf)
+			if n > 0 {
+				writeMu.Lock()
+				werr := writeFrame(ws, 2, buf[:n], false)
+				writeMu.Unlock()
+				if werr != nil {
+					done <- werr
+					return
+				}
+			}
+			if err != nil {
+				writeMu.Lock()
+				_ = writeFrame(ws, 8, []byte{}, false)
+				writeMu.Unlock()
+				done <- err
+				return
+			}
+		}
+	}()
+	go func() {
+		chunk := make([]byte, streamChunk)
+		for {
+			op, length, maskKey, err := readFrameHeader(br, true)
+			if err != nil {
+				done <- err
+				return
+			}
+			ws.touch()
+			switch op {
+			case 1, 2, 0:
+				var off uint64
+				for off < length {
+					n := uint64(len(chunk))
+					if length-off < n {
+						n = length - off
+					}
+					if _, err := io.ReadFull(br, chunk[:n]); err != nil {
+						done <- err
+						return
+					}
+					for i := uint64(0); i < n; i++ {
+						chunk[i] ^= maskKey[(off+i)%4]
+					}
+					ws.touch()
+					if _, err := target.Write(chunk[:n]); err != nil {
+						done <- err
+						return
+					}
+					off += n
+				}
+			case 8:
+				done <- io.EOF
+				return
+			case 9, 10:
+				if length > 125 {
+					done <- fmt.Errorf("control frame too large")
+					return
+				}
+				payload := make([]byte, length)
+				if _, err := io.ReadFull(br, payload); err != nil {
+					done <- err
+					return
+				}
+				for i := range payload {
+					payload[i] ^= maskKey[i%4]
+				}
+				if op == 9 {
+					writeMu.Lock()
+					_ = writeFrame(ws, 10, payload, false)
+					writeMu.Unlock()
+				}
+			default:
+				done <- fmt.Errorf("unsupported websocket opcode %d", op)
+				return
+			}
+		}
+	}()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-done:
+		return err
+	}
+}
+
+// readFrameHeader reads a frame header and returns opcode, payload length
+// and mask key without reading the payload.
+func readFrameHeader(r *bufio.Reader, expectMasked bool) (byte, uint64, [4]byte, error) {
+	var maskKey [4]byte
+	b1, err := r.ReadByte()
+	if err != nil {
+		return 0, 0, maskKey, err
+	}
+	b2, err := r.ReadByte()
+	if err != nil {
+		return 0, 0, maskKey, err
+	}
+	opcode := b1 & 0x0f
+	masked := b2&0x80 != 0
+	if expectMasked && !masked {
+		return 0, 0, maskKey, fmt.Errorf("expected masked websocket frame")
+	}
+	l := uint64(b2 & 0x7f)
+	switch l {
+	case 126:
+		var x uint16
+		if err := binary.Read(r, binary.BigEndian, &x); err != nil {
+			return 0, 0, maskKey, err
+		}
+		l = uint64(x)
+	case 127:
+		if err := binary.Read(r, binary.BigEndian, &l); err != nil {
+			return 0, 0, maskKey, err
+		}
+	}
+	if l > maxFramePayload {
+		return 0, 0, maskKey, fmt.Errorf("websocket frame too large: %d", l)
+	}
+	if masked {
+		if _, err := io.ReadFull(r, maskKey[:]); err != nil {
+			return 0, 0, maskKey, err
+		}
+	}
+	return opcode, l, maskKey, nil
 }
 
 func writeFrame(w io.Writer, opcode byte, payload []byte, mask bool) error {
