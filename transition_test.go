@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"net/http"
 	"testing"
 	"time"
@@ -71,7 +73,7 @@ func TestUsedSetupTokenIsUnauthorizedNotBusy(t *testing.T) {
 
 // Daybreak P2-7: a reachd crash mid-provision must not leave the request
 // (and its invite claim) stuck in "provisioning" forever, and a half-made
-// machine must be visible as failed.
+// machine must be cleaned up (retired) or kept as a cleanup_failed tombstone.
 func TestStuckProvisioningIsRecovered(t *testing.T) {
 	server, store, _ := newReliabilityTestServer(t)
 	hash, _ := HashSecret("inv-stuck")
@@ -101,7 +103,9 @@ func TestStuckProvisioningIsRecovered(t *testing.T) {
 	_ = store.db.QueryRow(`SELECT status FROM requests WHERE id=?`, id).Scan(&reqStatus)
 	_ = store.db.QueryRow(`SELECT status FROM machines WHERE id='m_stuck'`).Scan(&mStatus)
 	_ = store.db.QueryRow(`SELECT claimed_by_request_id FROM invites`).Scan(&claimed)
-	if reqStatus != "expired" || mStatus != "failed" || claimed != nil {
+	// The half-made machine is retired through the verified cleanup path
+	// (round 3 P2-A), not just labelled failed.
+	if reqStatus != "expired" || mStatus != "retired" || claimed != nil {
 		t.Fatalf("after recovery: request=%s machine=%s invite claim=%v", reqStatus, mStatus, claimed)
 	}
 	// A provision still inside its lease is left alone.
@@ -112,5 +116,96 @@ func TestStuckProvisioningIsRecovered(t *testing.T) {
 	_ = store.db.QueryRow(`SELECT status FROM requests WHERE id=?`, id).Scan(&reqStatus)
 	if reqStatus != "provisioning" {
 		t.Fatalf("in-lease provision was recovered: %s", reqStatus)
+	}
+}
+
+// Astra R2-10 / daybreak round 3 P2-A: the crash may happen after the
+// machine went offline but before the request was finalized, with OS auth
+// in place and a valid agent token. Recovery must revoke the token, remove
+// the hub account, and retire the machine and tunnel together.
+func TestRecoveryRevokesHalfFinishedProvision(t *testing.T) {
+	for _, mstatus := range []string{"provisioning", "offline", "failed"} {
+		t.Run(mstatus, func(t *testing.T) {
+			server, store, _ := newReliabilityTestServer(t)
+			fos := &fakeTunnelOS{residue: map[string][]string{"rt-orphan11": {"/etc/ssh/sshd_config.d/90-rt-orphan11.conf"}}}
+			server.prov.osOps = fos
+			insertRetireFixture(t, server, "m_orphan", "orphan-box", "rt-orphan11", 9281)
+			if _, err := store.db.Exec(`UPDATE machines SET status=? WHERE id='m_orphan'`, mstatus); err != nil {
+				t.Fatal(err)
+			}
+			old := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)
+			future := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+			if _, err := store.db.Exec(`INSERT INTO requests(id,name,client_secret_hash,status,created_at,expires_at,slug,provisioning_started_at,machine_id) VALUES ('r_orphan','orphan-box','sha256:x','provisioning',?,?,'orphan-box',?,'m_orphan')`, old, future, old); err != nil {
+				t.Fatal(err)
+			}
+			if err := server.prov.recoverStuckProvisioning(context.Background(), time.Now().UTC()); err != nil {
+				t.Fatal(err)
+			}
+			var reqStatus, mStat, desired, tStatus string
+			var token sql.NullString
+			_ = store.db.QueryRow(`SELECT status FROM requests WHERE id='r_orphan'`).Scan(&reqStatus)
+			_ = store.db.QueryRow(`SELECT status,desired_state,agent_token_hash FROM machines WHERE id='m_orphan'`).Scan(&mStat, &desired, &token)
+			_ = store.db.QueryRow(`SELECT status FROM tunnels WHERE machine_id='m_orphan'`).Scan(&tStatus)
+			if reqStatus != "expired" || token.Valid || desired != DesiredRetired || tStatus != "retired" {
+				t.Fatalf("request=%s machine=%s desired=%s tunnel=%s token=%v", reqStatus, mStat, desired, tStatus, token.Valid)
+			}
+			if len(fos.removed) == 0 {
+				t.Fatal("hub account was not removed")
+			}
+		})
+	}
+}
+
+// If the hub cleanup fails the machine stays a cleanup_failed tombstone
+// with its token revoked, and maintenance retries until it succeeds.
+func TestRecoveryCleanupFailureIsRetried(t *testing.T) {
+	server, store, _ := newReliabilityTestServer(t)
+	fos := &fakeTunnelOS{failRemove: true}
+	server.prov.osOps = fos
+	insertRetireFixture(t, server, "m_o2", "o2-box", "rt-orphan22", 9282)
+	old := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)
+	future := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+	if _, err := store.db.Exec(`INSERT INTO requests(id,name,client_secret_hash,status,created_at,expires_at,slug,provisioning_started_at,machine_id) VALUES ('r_o2','o2-box','sha256:x','provisioning',?,?,'o2-box',?,'m_o2')`, old, future, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.prov.ExpireOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var mStat, tStatus string
+	var token sql.NullString
+	_ = store.db.QueryRow(`SELECT status,agent_token_hash FROM machines WHERE id='m_o2'`).Scan(&mStat, &token)
+	_ = store.db.QueryRow(`SELECT status FROM tunnels WHERE machine_id='m_o2'`).Scan(&tStatus)
+	if mStat != CleanupFailed || token.Valid || tStatus != "cleanup_failed" {
+		t.Fatalf("after failed cleanup: machine=%s tunnel=%s token=%v", mStat, tStatus, token.Valid)
+	}
+	fos.mu.Lock()
+	fos.failRemove = false
+	fos.mu.Unlock()
+	if err := server.prov.ExpireOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	_ = store.db.QueryRow(`SELECT status FROM machines WHERE id='m_o2'`).Scan(&mStat)
+	if mStat != "retired" {
+		t.Fatalf("maintenance did not retry the cleanup: %s", mStat)
+	}
+}
+
+// The normal finalize must not succeed (or hand out the agent token) if
+// recovery reclaimed the request while CreateMachine ran.
+func TestProvisionFinalizeLosesToRecovery(t *testing.T) {
+	server, store, _ := newReliabilityTestServer(t)
+	server.prov.osOps = &fakeTunnelOS{}
+	future := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+	if _, err := store.db.Exec(`INSERT INTO requests(id,name,client_secret_hash,status,created_at,expires_at,slug,provisioning_started_at) VALUES ('r_l','l-box','sha256:x','expired',?,?,'l-box',?)`, nowUTC(), future, nowUTC()); err != nil {
+		t.Fatal(err)
+	}
+	_, err := server.prov.CreateMachine(context.Background(), CreateMachineInput{RequestID: "r_l", Slug: "l-box", Pubkey: testPubkey})
+	if !errors.Is(err, errProvisioningLeaseLost) {
+		t.Fatalf("CreateMachine on a reclaimed request: %v", err)
+	}
+	var n int
+	_ = store.db.QueryRow(`SELECT COUNT(*) FROM machines WHERE slug='l-box'`).Scan(&n)
+	if n != 0 {
+		t.Fatal("machine created for a reclaimed request")
 	}
 }

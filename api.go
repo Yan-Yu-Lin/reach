@@ -680,6 +680,10 @@ func (s *Server) handleClientProvision(w http.ResponseWriter, r *http.Request) {
 		_, _ = s.store.db.ExecContext(r.Context(), `UPDATE requests SET status='approved', provisioning_started_at=NULL, machine_id=NULL WHERE id=? AND status='provisioning'`, requestID)
 		// Details (sshd -t output, paths) stay in the server log (Opus P3-3).
 		log.Printf("provision %s failed: %v", requestID, err)
+		if errors.Is(err, errProvisioningLeaseLost) {
+			writeErr(w, http.StatusGone, "provisioning took too long and was cancelled; rerun setup")
+			return
+		}
 		if isUniqueSlugErr(err) {
 			writeErr(w, 409, "slug already in use")
 			return
@@ -687,10 +691,31 @@ func (s *Server) handleClientProvision(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "provisioning failed; ask the operator to check the reachd log")
 		return
 	}
-	_, _ = s.store.db.ExecContext(r.Context(), `UPDATE requests SET status='provisioned', machine_id=? WHERE id=?`, res.Machine.ID, requestID)
-	// Consume only the claim this request holds; never overwrite used_by.
-	if _, err := s.store.db.ExecContext(r.Context(), `UPDATE invites SET used_by=?, consumed_at=? WHERE claimed_by_request_id=? AND used_by IS NULL`, res.Machine.ID, nowUTC(), requestID); err != nil {
-		log.Printf("consume invite for %s: %v", requestID, err)
+	// Finalize only if the request is still ours: if maintenance reclaimed
+	// the lease meanwhile it is retiring this machine, and the agent token
+	// must not be handed out (astra R2-10). The invite is consumed in the
+	// same transaction (only the claim this request holds).
+	err = s.store.durableTx(r.Context(), "request.provisioned", res.Machine.ID, "system", func(tx *sql.Tx) error {
+		up, err := tx.ExecContext(r.Context(), `UPDATE requests SET status='provisioned', machine_id=? WHERE id=? AND status='provisioning'`, res.Machine.ID, requestID)
+		if err != nil {
+			return err
+		}
+		if n, _ := up.RowsAffected(); n != 1 {
+			return errProvisioningLeaseLost
+		}
+		_, err = tx.ExecContext(r.Context(), `UPDATE invites SET used_by=?, consumed_at=? WHERE claimed_by_request_id=? AND used_by IS NULL`, res.Machine.ID, nowUTC(), requestID)
+		return err
+	})
+	if err != nil {
+		log.Printf("finalize provision %s: %v", requestID, err)
+		if errors.Is(err, errProvisioningLeaseLost) {
+			writeErr(w, http.StatusGone, "provisioning took too long and was cancelled; rerun setup")
+			return
+		}
+		// Not recorded: the request stays provisioning and maintenance
+		// reclaims it (revoking this token) when the lease expires.
+		writeErr(w, 500, "provisioning failed; ask the operator to check the reachd log")
+		return
 	}
 	keys, err := s.activeAccessKeys(r.Context())
 	if err != nil {
