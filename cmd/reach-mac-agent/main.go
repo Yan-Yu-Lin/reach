@@ -30,6 +30,8 @@ type Config struct {
 	OutFile        string `yaml:"out_file"`
 	SSHConfigFile  string `yaml:"ssh_config_file"`
 	InstallInclude bool   `yaml:"install_include"`
+	// SSHBinary is the ssh used to validate generated config (ssh -G).
+	SSHBinary string `yaml:"ssh_binary,omitempty"`
 }
 
 type Event struct {
@@ -207,6 +209,9 @@ func (a Agent) stream(ctx context.Context, lastID *string) error {
 		case "ssh_config.changed", "machine.created", "machine.desired_changed", "machine.observed_changed", "machine.health_changed", "machine.online", "machine.degraded", "machine.offline", "machine.gone", "machine.disabled", "machine.enabled", "machine.retiring", "machine.retired":
 			a.log.Printf("event %s id=%s; syncing SSH config", ev.Type, ev.ID)
 			syncRequired = true
+		case "agent.heartbeat":
+			// Live-only liveness ping (docs/EVENTS.md); nothing to sync and
+			// not worth a log line every 30 s per machine.
 		default:
 			a.log.Printf("event %s id=%s", ev.Type, ev.ID)
 		}
@@ -360,33 +365,66 @@ func (a Agent) Sync(ctx context.Context) error {
 	}
 	syncCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(syncCtx, http.MethodGet, strings.TrimRight(a.cfg.APIURL, "/")+"/api/admin/ssh-config", nil)
+	hosts, err := a.fetchHosts(syncCtx)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+a.token())
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
+	valid, rejected := sanitizeHosts(hosts)
+	for _, e := range rejected {
+		a.log.Printf("skipping host from server: %v", e)
 	}
-	defer resp.Body.Close()
-	body, err := readBounded(resp.Body, maxSSHConfigBytes)
-	if err != nil {
-		return fmt.Errorf("read ssh-config response: %w", err)
-	}
-	if resp.StatusCode/100 != 2 {
-		return fmt.Errorf("ssh-config returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-	if err := writeAtomic(a.cfg.OutFile, body, 0o600); err != nil {
-		return err
+	if err := installSSHConfig(syncCtx, a.cfg.SSHBinary, a.cfg.OutFile, valid); err != nil {
+		return fmt.Errorf("keeping previous %s: %w", a.cfg.OutFile, err)
 	}
 	if a.cfg.InstallInclude {
 		if err := ensureInclude(a.cfg.SSHConfigFile, a.cfg.OutFile); err != nil {
 			return err
 		}
 	}
-	a.log.Printf("synced %s", a.cfg.OutFile)
+	a.log.Printf("synced %s (%d hosts)", a.cfg.OutFile, len(valid))
 	return nil
+}
+
+// fetchHosts prefers the structured endpoint and falls back to strictly
+// parsing the legacy text endpoint when talking to an older reachd.
+func (a Agent) fetchHosts(ctx context.Context) ([]sshHost, error) {
+	base := strings.TrimRight(a.cfg.APIURL, "/")
+	body, status, err := a.get(ctx, base+"/api/admin/ssh-config.json")
+	if err != nil {
+		return nil, err
+	}
+	if status/100 == 2 {
+		return parseSSHConfigJSON(body)
+	}
+	if status != http.StatusNotFound {
+		return nil, fmt.Errorf("ssh-config.json returned %d: %s", status, strings.TrimSpace(string(body)))
+	}
+	body, status, err = a.get(ctx, base+"/api/admin/ssh-config")
+	if err != nil {
+		return nil, err
+	}
+	if status/100 != 2 {
+		return nil, fmt.Errorf("ssh-config returned %d: %s", status, strings.TrimSpace(string(body)))
+	}
+	return parseLegacySSHConfig(body)
+}
+
+func (a Agent) get(ctx context.Context, url string) ([]byte, int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	req.Header.Set("Authorization", "Bearer "+a.token())
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	body, err := readBounded(resp.Body, maxSSHConfigBytes)
+	if err != nil {
+		return nil, resp.StatusCode, fmt.Errorf("read %s: %w", url, err)
+	}
+	return body, resp.StatusCode, nil
 }
 
 func readBounded(r io.Reader, limit int64) ([]byte, error) {
