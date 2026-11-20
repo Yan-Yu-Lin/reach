@@ -11,6 +11,8 @@ let timer: ReturnType<typeof setTimeout> | null = null
 let generation = 0
 let reconnectAttempt = 0
 let lastEventId = ''
+/** True when the live connection was opened with a Last-Event-ID (the server replayed what we missed). */
+let resumed = false
 const staleAfterMs = 60_000
 
 export function useSSE() {
@@ -32,7 +34,7 @@ export function useSSE() {
     return () => handlers.delete(handler)
   }
 
-  return { status: sseStatus, start, stop, onEvent }
+  return { status: sseStatus, start, stop, onEvent, wasResumed: () => resumed }
 }
 
 async function connect(token: string, apiBase: string, connectionGeneration: number) {
@@ -45,6 +47,7 @@ async function connect(token: string, apiBase: string, connectionGeneration: num
   try {
     const headers = new Headers({ Authorization: `Bearer ${token}` })
     if (lastEventId) headers.set('Last-Event-ID', lastEventId)
+    resumed = !!lastEventId
     const res = await fetch(`${apiBase}/admin/events`, {
       headers,
       signal: activeController.signal,

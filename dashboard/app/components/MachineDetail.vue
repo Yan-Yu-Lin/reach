@@ -1,294 +1,301 @@
 <template>
-  <div v-if="item">
-    <!-- Header -->
-    <div class="detail-header">
-      <div class="detail-title">
-        <button class="btn btn-ghost btn-sm" @click="$emit('back')">
-          &larr; Back
-        </button>
-        <span class="fleet-dot" :class="dotClass" style="width:10px;height:10px" />
-        <span class="detail-slug">{{ item.machine.slug }}</span>
-        <span class="pill" :class="item.machine.observed_state">{{ item.machine.observed_state }}</span>
+  <div v-if="item" class="detail" :class="`st-${status}`">
+    <!-- 1. Headline: name, big status, one plain sentence -->
+    <header class="detail-head">
+      <button type="button" class="btn btn-ghost btn-back" @click="$emit('back')">
+        <AppIcon name="back" :size="18" /> <span>Machines</span>
+      </button>
+      <h1 class="detail-name mono">{{ item.machine.slug }}</h1>
+      <div class="detail-status">
+        <StatusBadge :status="status" large />
+        <span class="detail-seen">{{ seenLabel }}</span>
       </div>
-      <div class="detail-actions">
-        <button class="btn btn-sm" @click="$emit('action', 'enable', item.machine.id)" v-if="item.machine.desired_state === 'disabled'">Enable</button>
-        <button class="btn btn-sm btn-danger" @click="confirmDisable" v-if="item.machine.desired_state === 'active'">Disable</button>
-        <button class="btn btn-sm btn-danger" @click="confirmRemove">Remove</button>
-      </div>
-    </div>
+      <p class="detail-sentence">{{ sentence }}</p>
+    </header>
 
-    <!-- SSH command block -->
-    <div class="ssh-block">
-      <code class="ssh-cmd">ssh {{ item.machine.slug }}</code>
-      <button class="btn btn-sm btn-primary" @click="$emit('copy', `ssh ${item.machine.slug}`)">Copy</button>
-    </div>
-
-    <!-- Connection chain -->
-    <div class="conn-chain">
-      <div class="chain-node">
-        <div class="chain-node-label">Your Mac</div>
-        <div class="chain-node-sub">ssh</div>
-      </div>
-      <div class="chain-segment">
-        <div class="chain-line ok" />
-      </div>
-      <div class="chain-node">
-        <div class="chain-node-label">{{ hubLabel }}:{{ hubPort }}</div>
-        <div class="chain-node-sub">ProxyJump</div>
-      </div>
-      <div class="chain-segment">
-        <div class="chain-line" :class="hubProbeOk ? 'ok' : 'fail'" />
-        <div class="chain-status" :class="hubProbeOk ? 'ok' : 'fail'">{{ hubProbeOk ? 'OK' : 'Fail' }}</div>
-      </div>
-      <div class="chain-node">
-        <div class="chain-node-label">{{ tunnelUser }}</div>
-        <div class="chain-node-sub">R:{{ tunnelPort }}</div>
-      </div>
-      <div class="chain-segment">
-        <div class="chain-line" :class="tunnelOk ? 'ok' : 'fail'" />
-        <div class="chain-status" :class="tunnelOk ? 'ok' : 'fail'">{{ tunnelOk ? 'OK' : tunnelState }}</div>
-      </div>
-      <div class="chain-node">
-        <div class="chain-node-label">target sshd</div>
-        <div class="chain-node-sub">:{{ item.machine.local_port || 22 }}</div>
-      </div>
-    </div>
-
-    <!-- Detail grid -->
-    <div class="detail-grid">
-      <!-- Agent diagnostics -->
-      <div class="detail-card">
-        <div class="detail-card-title">Agent diagnostics</div>
-        <dl>
-          <div class="detail-row">
-            <dt>Agent version</dt>
-            <dd>
-              {{ obs?.agent_version || '—' }}
-              <span v-if="item.update?.latest" class="muted" style="margin-left:4px">latest {{ item.update.latest }}</span>
-            </dd>
-          </div>
-          <div class="detail-row">
-            <dt>OS / distro</dt>
-            <dd>{{ item.machine.distro || '—' }} / {{ item.machine.arch || '—' }}</dd>
-          </div>
-          <div class="detail-row">
-            <dt>Transport</dt>
-            <dd>{{ obs?.transport || '—' }}</dd>
-          </div>
-          <div class="detail-row">
-            <dt>Persistence</dt>
-            <dd>{{ obs?.persistence_backend || '—' }} {{ obs?.persistence_reboot_safe ? '(reboot-safe)' : '' }}</dd>
-          </div>
-          <div class="detail-row">
-            <dt>Last heartbeat</dt>
-            <dd>{{ rt.relative(obs?.heartbeat_at) }}</dd>
-          </div>
-          <div class="detail-row">
-            <dt>Local SSH</dt>
-            <dd>
-              <span class="pill" :class="localSSHClass">{{ obs?.local_ssh_state || '—' }}</span>
-              <span v-if="obs?.local_ssh_error" class="muted" style="margin-left:4px">{{ obs.local_ssh_error }}</span>
-            </dd>
-          </div>
-          <div class="detail-row">
-            <dt>Tunnel state</dt>
-            <dd>
-              <span class="pill" :class="tunnelStateClass">{{ obs?.tunnel_state || '—' }}</span>
-              <span v-if="obs?.tunnel_error" class="muted" style="margin-left:4px">{{ obs.tunnel_error }}</span>
-            </dd>
-          </div>
-          <div class="detail-row" v-if="obs?.last_error">
-            <dt>Last error</dt>
-            <dd style="color:var(--danger)">{{ obs.last_error }}</dd>
-          </div>
-        </dl>
-      </div>
-
-      <!-- Machine info -->
-      <div class="detail-card">
-        <div class="detail-card-title">Machine info</div>
-        <dl>
-          <div class="detail-row">
-            <dt>ID</dt>
-            <dd class="mono">{{ item.machine.id }}</dd>
-          </div>
-          <div class="detail-row">
-            <dt>Desired state</dt>
-            <dd><span class="pill" :class="item.machine.desired_state">{{ item.machine.desired_state }}</span></dd>
-          </div>
-          <div class="detail-row">
-            <dt>Effective status</dt>
-            <dd><span class="pill" :class="item.machine.status">{{ item.machine.status }}</span></dd>
-          </div>
-          <div class="detail-row">
-            <dt>Generation</dt>
-            <dd>{{ item.machine.desired_generation }}</dd>
-          </div>
-          <div class="detail-row">
-            <dt>Update policy</dt>
-            <dd>
-              <select v-model="updatePolicy" class="process-title-input" style="max-width:150px" :disabled="updatePolicySaving" @change="saveUpdatePolicy">
-                <option value="manual">Manual</option>
-                <option value="auto">Auto-update</option>
-                <option value="disabled">Disabled</option>
-              </select>
-            </dd>
-          </div>
-          <div class="detail-row">
-            <dt>Target user</dt>
-            <dd>{{ item.machine.target_user || 'root' }}</dd>
-          </div>
-          <div class="detail-row">
-            <dt>Mode</dt>
-            <dd>{{ item.machine.mode || 'system' }}</dd>
-          </div>
-          <div class="detail-row">
-            <dt>Local port</dt>
-            <dd>{{ item.machine.local_port }}</dd>
-          </div>
-          <div class="detail-row">
-            <dt>Created</dt>
-            <dd>{{ rt.fullTime(item.machine.created_at) }}</dd>
-          </div>
-          <div class="detail-row" v-if="item.machine.expires_at">
-            <dt>Expires</dt>
-            <dd>{{ rt.fullTime(item.machine.expires_at) }}</dd>
-          </div>
-        </dl>
-      </div>
-
-      <!-- Process title -->
-      <div class="detail-card wide">
-        <div class="detail-card-title">Process title message</div>
-        <div class="muted" style="font-size:12px;margin-bottom:12px">
-          Controls what reach-agent displays in <span class="mono">ps aux</span>. Leave blank and clear to use the agent's local config/default.
-        </div>
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px">
-          <label style="display:flex;flex-direction:column;gap:6px;font-size:13px">
-            <span class="muted">Single message</span>
-            <input v-model="processTitleSingle" class="process-title-input" placeholder="Reach-Agent" />
-          </label>
-          <label style="display:flex;flex-direction:column;gap:6px;font-size:13px">
-            <span class="muted">Rotate interval</span>
-            <input v-model="processTitleInterval" class="process-title-input" placeholder="5s" />
-          </label>
-        </div>
-        <label style="display:flex;flex-direction:column;gap:6px;font-size:13px;margin-bottom:12px">
-          <span class="muted">Rotating messages (one per line, overrides single message)</span>
-          <textarea v-model="processTitleList" class="process-title-textarea" rows="4" placeholder="Reach-Agent\n今天也要開心 🚀\nTunnel vibes only" />
-        </label>
-        <div v-if="processTitleError" style="color:var(--danger);font-size:13px;margin-bottom:8px">{{ processTitleError }}</div>
-        <div style="display:flex;gap:8px;align-items:center">
-          <button class="btn btn-primary" :disabled="processTitleSaving" @click="saveProcessTitle">{{ processTitleSaving ? 'Saving...' : 'Save message' }}</button>
-          <button class="btn" :disabled="processTitleSaving" @click="clearProcessTitle">Clear dashboard override</button>
-          <span class="muted" style="font-size:12px">{{ processTitleSource }}</span>
-        </div>
-      </div>
-
-      <!-- Tunnel info -->
-      <div class="detail-card" v-if="item.tunnels.length > 0">
-        <div class="detail-card-title">Tunnel</div>
-        <dl v-for="t in item.tunnels" :key="t.id">
-          <div class="detail-row">
-            <dt>Hub</dt>
-            <dd>{{ t.hub_id }}</dd>
-          </div>
-          <div class="detail-row">
-            <dt>Unix user</dt>
-            <dd class="mono">{{ t.original_unix_user || t.unix_user }}</dd>
-          </div>
-          <div class="detail-row">
-            <dt>Remote port</dt>
-            <dd>{{ t.original_remote_port || t.remote_port }}</dd>
-          </div>
-          <div class="detail-row">
-            <dt>Status</dt>
-            <dd><span class="pill" :class="t.status">{{ t.status }}</span></dd>
-          </div>
-          <div class="detail-row">
-            <dt>Last seen</dt>
-            <dd>{{ rt.relative(t.last_seen_at) }}</dd>
-          </div>
-        </dl>
-      </div>
-
-      <!-- Hub probe -->
-      <div class="detail-card" v-if="item.hub_observation">
-        <div class="detail-card-title">Hub probe</div>
-        <dl>
-          <div class="detail-row">
-            <dt>Probe state</dt>
-            <dd><span class="pill" :class="item.hub_observation.probe_state">{{ item.hub_observation.probe_state }}</span></dd>
-          </div>
-          <div class="detail-row">
-            <dt>Last probe</dt>
-            <dd>{{ rt.relative(item.hub_observation.last_probe_at) }}</dd>
-          </div>
-          <div class="detail-row" v-if="item.hub_observation.last_success_at">
-            <dt>Last success</dt>
-            <dd>{{ rt.relative(item.hub_observation.last_success_at) }}</dd>
-          </div>
-          <div class="detail-row" v-if="item.hub_observation.probe_error">
-            <dt>Error</dt>
-            <dd style="color:var(--danger)">{{ item.hub_observation.probe_error }}</dd>
-          </div>
-        </dl>
-      </div>
-
-      <!-- Actions -->
-      <div class="detail-card">
-        <div class="detail-card-title">Actions</div>
-        <div style="display:flex;flex-direction:column;gap:8px">
-          <button class="btn" @click="$emit('copy', `ssh ${item.machine.slug}`)">Copy SSH command</button>
-          <button class="btn btn-primary" :disabled="!canQueueUpdate || updateSaving" @click="queueUpdateAgent">
-            {{ updateSaving ? 'Queueing...' : updateButtonLabel }}
+    <div class="detail-cols">
+      <div class="detail-col">
+        <!-- 2. Primary action -->
+        <section v-if="canSSH" class="card ssh-card" aria-label="SSH command">
+          <code class="ssh-cmd mono">ssh {{ item.machine.slug }}</code>
+          <button type="button" class="btn btn-primary btn-copy" @click="$emit('copy', `ssh ${item.machine.slug}`)">
+            <AppIcon name="copy" :size="18" /> Copy
           </button>
-          <button class="btn" @click="$emit('copy', repairCommand)">Copy repair command</button>
-          <button class="btn" @click="$emit('copy', uninstallCommand)">Copy uninstall command</button>
-          <div style="border-top:1px solid var(--border);padding-top:8px;margin-top:4px">
-            <button class="btn btn-danger" style="width:100%" @click="confirmRemove">Remove machine</button>
-          </div>
-        </div>
+        </section>
+
+        <!-- 3. Connection check -->
+        <section class="card" aria-labelledby="chk-title">
+          <h2 id="chk-title" class="card-title">Connection check</h2>
+          <ol class="checks">
+            <li v-for="c in checks" :key="c.key" class="check" :class="`check-${c.state}`">
+              <span class="check-mark" aria-hidden="true">
+                <AppIcon :name="c.state === 'ok' ? 'check' : c.state === 'fail' ? 'x' : 'help'" :size="16" />
+              </span>
+              <span class="check-body">
+                <span class="check-label">{{ c.label }}
+                  <span class="check-verdict">{{ c.state === 'ok' ? 'OK' : c.state === 'fail' ? 'Failed' : 'Unknown' }}</span>
+                </span>
+                <span class="check-detail">{{ c.detail }}</span>
+              </span>
+            </li>
+          </ol>
+        </section>
       </div>
 
-      <!-- Commands -->
-      <div class="detail-card" v-if="item.commands && item.commands.length > 0">
-        <div class="detail-card-title">Agent commands</div>
-        <dl v-for="cmd in item.commands" :key="cmd.id">
-          <div class="detail-row">
-            <dt>{{ cmd.type }}</dt>
-            <dd>
-              <span class="pill" :class="cmd.status">{{ cmd.status }}</span>
-              <span class="muted" style="margin-left:4px">{{ rt.relative(cmd.created_at) }}</span>
-            </dd>
-          </div>
-        </dl>
+      <div class="detail-col">
+        <!-- 4. Diagnostics -->
+        <section class="card" aria-labelledby="diag-title">
+          <h2 id="diag-title" class="card-title">Diagnostics</h2>
+          <dl class="kv">
+            <div><dt>Last heartbeat</dt><dd>{{ rt.relative(obs?.heartbeat_at) }}</dd></div>
+            <div><dt>Agent version</dt><dd class="mono wrap">{{ obs?.agent_version || '—' }}
+              <span v-if="item.update?.available && item.update.latest" class="tag tag-info">update available</span></dd></div>
+            <div><dt>Transport</dt><dd>{{ obs?.transport || '—' }}</dd></div>
+            <div><dt>System</dt><dd>{{ [item.machine.distro, item.machine.arch].filter(Boolean).join(' · ') || '—' }}</dd></div>
+            <div><dt>Persistence</dt><dd>{{ obs?.persistence_backend || '—' }}{{ obs?.persistence_reboot_safe ? ' (survives reboot)' : '' }}</dd></div>
+            <div><dt>Hub tunnel</dt><dd class="mono">{{ tunnelUser }} → :{{ tunnelPort }}</dd></div>
+            <div v-if="obs?.last_error" class="kv-error"><dt>Last error</dt><dd class="wrap">{{ obs.last_error }}</dd></div>
+            <div v-if="item.machine.provision_error" class="kv-error"><dt>Provision error</dt><dd class="wrap">{{ item.machine.provision_error }}</dd></div>
+          </dl>
+        </section>
       </div>
     </div>
+
+    <!-- 5. Advanced, collapsed -->
+    <details class="card advanced">
+      <summary class="card-title advanced-summary">
+        <span>Advanced</span>
+        <span class="muted small">updates, process title, IDs, repair</span>
+        <AppIcon name="chevron-down" :size="18" class="advanced-chevron" />
+      </summary>
+
+      <dl class="kv">
+        <div><dt>Machine ID</dt><dd class="mono">{{ item.machine.id }}</dd></div>
+        <div><dt>You set it to</dt><dd>{{ item.machine.desired_state }}<span class="muted"> (desired state)</span></dd></div>
+        <div><dt>Hub observes</dt><dd>{{ item.machine.observed_state }}<span class="muted"> (from heartbeat + probe)</span></dd></div>
+        <div v-if="item.machine.cleanup_state"><dt>Cleanup</dt><dd>{{ item.machine.cleanup_state }}</dd></div>
+        <div><dt>Generation</dt><dd>{{ item.machine.desired_generation }}<span class="muted"> (agent applied {{ obs?.applied_generation ?? '—' }})</span></dd></div>
+        <div><dt>Login user</dt><dd class="mono">{{ item.machine.target_user || 'root' }}</dd></div>
+        <div><dt>Install mode</dt><dd>{{ item.machine.mode || 'system' }}</dd></div>
+        <div><dt>Target ssh port</dt><dd>{{ item.machine.local_port || 22 }}</dd></div>
+        <div><dt>Created</dt><dd>{{ rt.fullTime(item.machine.created_at) }}</dd></div>
+        <div v-if="item.machine.expires_at"><dt>Expires</dt><dd>{{ rt.fullTime(item.machine.expires_at) }}</dd></div>
+      </dl>
+
+      <h3 class="sub-title">Agent updates</h3>
+      <div class="field-row">
+        <label class="field">
+          <span>Update policy</span>
+          <select v-model="updatePolicy" class="input" :disabled="updatePolicySaving" @change="saveUpdatePolicy">
+            <option value="manual">Manual</option>
+            <option value="auto">Auto-update</option>
+            <option value="disabled">Disabled</option>
+          </select>
+        </label>
+        <button type="button" class="btn" :disabled="!canQueueUpdate || updateSaving" @click="queueUpdateAgent">
+          {{ updateSaving ? 'Queueing...' : updateButtonLabel }}
+        </button>
+      </div>
+
+      <template v-if="item.commands && item.commands.length">
+        <h3 class="sub-title">Open agent commands</h3>
+        <ul class="cmd-list">
+          <li v-for="cmd in item.commands" :key="cmd.id">
+            <span class="mono">{{ cmd.type }}</span>
+            <span class="tag tag-muted">{{ cmd.status }}</span>
+            <span class="muted small">{{ rt.relative(cmd.created_at) }}</span>
+          </li>
+        </ul>
+      </template>
+
+      <h3 class="sub-title">Process title</h3>
+      <p class="muted small">What reach-agent shows in <span class="mono">ps aux</span>. Leave empty and clear to use the agent's own setting.</p>
+      <div class="field-row">
+        <label class="field">
+          <span>Single message</span>
+          <input v-model="processTitleSingle" class="input" placeholder="Reach-Agent" />
+        </label>
+        <label class="field field-narrow">
+          <span>Rotate every</span>
+          <input v-model="processTitleInterval" class="input" placeholder="5s" />
+        </label>
+      </div>
+      <label class="field">
+        <span>Rotating messages (one per line, overrides the single message)</span>
+        <textarea v-model="processTitleList" class="input" rows="3" placeholder="Reach-Agent" />
+      </label>
+      <p v-if="processTitleError" class="form-error">{{ processTitleError }}</p>
+      <div class="field-row">
+        <button type="button" class="btn btn-primary" :disabled="processTitleSaving" @click="saveProcessTitle">{{ processTitleSaving ? 'Saving...' : 'Save message' }}</button>
+        <button type="button" class="btn" :disabled="processTitleSaving" @click="clearProcessTitle">Clear override</button>
+        <span class="muted small">{{ processTitleSource }}</span>
+      </div>
+
+      <h3 class="sub-title">Run on the machine</h3>
+      <p class="muted small">Paste on {{ item.machine.slug }} itself.</p>
+      <div class="cmd-copy">
+        <span class="cmd-copy-label">Repair (restart the agent)</span>
+        <div class="cmd-copy-row">
+          <code class="mono">{{ repairCommand }}</code>
+          <button type="button" class="btn btn-icon" aria-label="Copy repair command" @click="$emit('copy', repairCommand)"><AppIcon name="copy" :size="18" /></button>
+        </div>
+      </div>
+      <div class="cmd-copy">
+        <span class="cmd-copy-label">Uninstall the agent</span>
+        <div class="cmd-copy-row">
+          <code class="mono">{{ uninstallCommand }}</code>
+          <button type="button" class="btn btn-icon" aria-label="Copy uninstall command" @click="$emit('copy', uninstallCommand)"><AppIcon name="copy" :size="18" /></button>
+        </div>
+      </div>
+    </details>
+
+    <!-- 6. Danger zone, at the very bottom -->
+    <section class="danger-zone" aria-labelledby="dz-title">
+      <h2 id="dz-title" class="card-title">Danger zone</h2>
+
+      <div v-if="item.machine.desired_state === 'active'" class="dz-row">
+        <div class="dz-text">
+          <strong>Disable</strong>
+          <p>Cuts the tunnel: the hub blocks this machine's key and its <span class="mono">ssh {{ item.machine.slug }}</span> alias stops working. Nothing is deleted. You can Enable it again any time.</p>
+        </div>
+        <button type="button" class="btn btn-warn" @click="dialog = 'disable'">Disable</button>
+      </div>
+      <div v-else-if="item.machine.desired_state === 'disabled'" class="dz-row">
+        <div class="dz-text">
+          <strong>Enable</strong>
+          <p>Unblocks the tunnel key. The agent reconnects on its next heartbeat.</p>
+        </div>
+        <button type="button" class="btn btn-primary" @click="dialog = 'enable'">Enable</button>
+      </div>
+
+      <div v-if="item.machine.desired_state === 'active' || item.machine.desired_state === 'disabled'" class="dz-row dz-severe">
+        <div class="dz-text">
+          <strong>Remove</strong>
+          <p>Permanent. Tells the agent to uninstall itself and deletes the tunnel account, key and port on the hub. To use this machine again you must run setup and approve it again.</p>
+        </div>
+        <button type="button" class="btn btn-danger" @click="dialog = 'remove'">Remove...</button>
+      </div>
+
+      <div v-if="status === 'stuck' || status === 'failed' || item.machine.desired_state === 'retiring'" class="dz-row dz-severe">
+        <div class="dz-text">
+          <strong>Force retire</strong>
+          <p>Finishes the removal on the hub without waiting for the agent. Use it when the machine is gone for good{{ status === 'failed' ? ', or to retry the failed cleanup' : '' }}.</p>
+        </div>
+        <button type="button" class="btn btn-danger" @click="dialog = 'retire-now'">Force retire...</button>
+      </div>
+    </section>
+
+    <ConfirmDialog
+      v-if="dialog === 'disable'"
+      title="Disable this machine?"
+      confirm-label="Disable"
+      danger
+      :busy="actionBusy"
+      @cancel="dialog = null"
+      @confirm="runAction('disable')"
+    >
+      <p><span class="mono">{{ item.machine.slug }}</span> will stop being reachable. The hub blocks its tunnel key and drops it from your Mac's ssh config.</p>
+      <p>Nothing is deleted. Enable brings it back.</p>
+    </ConfirmDialog>
+    <ConfirmDialog
+      v-if="dialog === 'enable'"
+      title="Enable this machine?"
+      confirm-label="Enable"
+      :busy="actionBusy"
+      @cancel="dialog = null"
+      @confirm="runAction('enable')"
+    >
+      <p>The hub accepts <span class="mono">{{ item.machine.slug }}</span>'s tunnel key again.</p>
+    </ConfirmDialog>
+    <ConfirmDialog
+      v-if="dialog === 'remove'"
+      title="Remove permanently?"
+      confirm-label="Remove machine"
+      danger
+      :type-to-confirm="item.machine.slug"
+      :busy="actionBusy"
+      @cancel="dialog = null"
+      @confirm="runAction('remove')"
+    >
+      <p>This cannot be undone. The agent on <span class="mono">{{ item.machine.slug }}</span> is told to uninstall, and the hub deletes its tunnel account, key and port.</p>
+      <p>If you only want to turn it off for now, use <strong>Disable</strong> instead.</p>
+    </ConfirmDialog>
+    <ConfirmDialog
+      v-if="dialog === 'retire-now'"
+      title="Force retire?"
+      confirm-label="Force retire"
+      danger
+      :type-to-confirm="item.machine.slug"
+      :busy="actionBusy"
+      @cancel="dialog = null"
+      @confirm="runAction('retire-now')"
+    >
+      <p>The hub deletes <span class="mono">{{ item.machine.slug }}</span>'s tunnel account, key and port now, without waiting for the agent to confirm.</p>
+      <p>If the machine is still running, its agent stays installed there. Run the uninstall command on it yourself.</p>
+    </ConfirmDialog>
   </div>
-  <div v-else class="empty-state">
-    <div>Machine not found or loading...</div>
+  <div v-else class="empty">
+    <p>Machine not found. It may have been retired.</p>
+    <button type="button" class="btn" @click="$emit('back')">Back to machines</button>
   </div>
 </template>
 
 <script setup lang="ts">
-const props = defineProps<{
-  item: MachineWithTunnels | null
-  events: any[]
-}>()
+import { connectionChecks, lastSeenAt, statusSentence, uiStatus } from '~/utils/status'
+import { repairCommandFor, uninstallCommandFor } from '~/utils/commands'
+
+type Action = 'disable' | 'enable' | 'remove' | 'retire-now'
+
+const props = defineProps<{ item: MachineWithTunnels | null; baseUrl: string }>()
 
 const emit = defineEmits<{
   back: []
-  action: [action: string, id: string]
+  action: [action: Action, id: string, done: () => void]
   copy: [text: string]
   refresh: [id: string]
 }>()
 
 const rt = useRelativeTime()
+const now = useNow()
 const api = useReachApi()
 const toast = useToast()
 
+const dialog = ref<Action | null>(null)
+const actionBusy = ref(false)
+
 const obs = computed(() => props.item?.agent_observation)
+const status = computed(() => props.item ? uiStatus(props.item, now.value) : 'unknown')
+const sentence = computed(() => props.item ? statusSentence(props.item, status.value, now.value) : '')
+const checks = computed(() => props.item ? connectionChecks(props.item, now.value) : [])
+const canSSH = computed(() => status.value === 'online' || status.value === 'degraded' || status.value === 'offline')
+const seenLabel = computed(() => {
+  if (!props.item) return ''
+  const seen = lastSeenAt(props.item)
+  return seen === null ? 'never seen' : `seen ${rt.relative(new Date(seen).toISOString())}`
+})
+
+const tunnelUser = computed(() => {
+  const t = props.item?.tunnels[0]
+  return t?.original_unix_user || t?.unix_user || '—'
+})
+const tunnelPort = computed(() => {
+  const t = props.item?.tunnels[0]
+  return t?.original_remote_port || t?.remote_port || '?'
+})
+
+const repairCommand = computed(() => props.item ? repairCommandFor(props.baseUrl, props.item.machine) : '')
+const uninstallCommand = computed(() => props.item ? uninstallCommandFor(props.baseUrl, props.item.machine) : '')
+
+function runAction(action: Action) {
+  if (!props.item) return
+  actionBusy.value = true
+  emit('action', action, props.item.machine.id, () => {
+    actionBusy.value = false
+    dialog.value = null
+  })
+}
+
+// Advanced: process title and update policy forms
 const processTitleSingle = ref('')
 const processTitleList = ref('')
 const processTitleInterval = ref('5s')
@@ -298,9 +305,9 @@ const updateSaving = ref(false)
 const updatePolicy = ref<'manual' | 'auto' | 'disabled'>('manual')
 const updatePolicySaving = ref(false)
 
-const processTitleSource = computed(() => props.item?.machine.process_title_config ? 'Dashboard override active' : 'Using agent local config/default')
+const processTitleSource = computed(() => props.item?.machine.process_title_config ? 'Dashboard override active' : 'Using the agent\'s own setting')
 
-watch(() => props.item?.machine.id, () => { resetProcessTitleForm(); resetUpdatePolicyForm() }, { immediate: true })
+watch(() => props.item?.machine.id, () => { resetProcessTitleForm(); resetUpdatePolicyForm(); dialog.value = null }, { immediate: true })
 watch(() => props.item?.machine.process_title_config, () => resetProcessTitleForm())
 watch(() => props.item?.machine.update_policy, () => resetUpdatePolicyForm())
 
@@ -317,10 +324,7 @@ function resetUpdatePolicyForm() {
 }
 
 function buildProcessTitleConfig(): ProcessTitleConfig | null {
-  const titles = processTitleList.value
-    .split('\n')
-    .map(s => s.trim())
-    .filter(Boolean)
+  const titles = processTitleList.value.split('\n').map(s => s.trim()).filter(Boolean)
   const single = processTitleSingle.value.trim()
   const interval = processTitleInterval.value.trim()
   if (!titles.length && !single) return null
@@ -384,8 +388,8 @@ const updateButtonLabel = computed(() => {
   if (updateCommandOpen.value) return 'Agent update queued'
   if (!props.item?.update?.latest) return 'No update version configured'
   if (props.item.machine.update_policy === 'disabled') return 'Updates disabled'
-  if (props.item.update.available === false) return 'Agent is latest'
-  return `Update Agent to ${props.item.update.latest}`
+  if (props.item.update.available === false) return 'Agent is up to date'
+  return `Update agent to ${props.item.update.latest}`
 })
 
 async function queueUpdateAgent() {
@@ -399,88 +403,6 @@ async function queueUpdateAgent() {
     toast.error(e.message || 'Failed to queue agent update')
   } finally {
     updateSaving.value = false
-  }
-}
-
-const dotClass = computed(() => {
-  if (!props.item) return 'unknown'
-  const m = props.item.machine
-  if (m.desired_state === 'disabled' || m.desired_state === 'retired') return m.desired_state
-  return m.observed_state || 'unknown'
-})
-
-const hubLabel = computed(() => {
-  const tunnel = props.item?.tunnels[0]
-  return tunnel?.hub_id || 'hub'
-})
-
-const hubPort = computed(() => '443')
-
-const tunnelUser = computed(() => {
-  const tunnel = props.item?.tunnels[0]
-  return tunnel?.original_unix_user || tunnel?.unix_user || 'rt-???'
-})
-
-const tunnelPort = computed(() => {
-  const tunnel = props.item?.tunnels[0]
-  return tunnel?.original_remote_port || tunnel?.remote_port || '?'
-})
-
-const hubProbeOk = computed(() => {
-  if (!props.item?.hub_observation) return true
-  return props.item.hub_observation.probe_state === 'reachable'
-})
-
-const tunnelOk = computed(() => {
-  const state = obs.value?.tunnel_state
-  return state === 'connected' || state === 'running'
-})
-
-const tunnelState = computed(() => obs.value?.tunnel_state || 'unknown')
-
-const localSSHClass = computed(() => {
-  const state = obs.value?.local_ssh_state
-  if (state === 'running' || state === 'ok' || state === 'healthy') return 'online'
-  if (state === 'stopped' || state === 'error' || state === 'down') return 'offline'
-  return 'unknown'
-})
-
-const tunnelStateClass = computed(() => {
-  const state = obs.value?.tunnel_state
-  if (state === 'connected' || state === 'running') return 'online'
-  if (state === 'disconnected' || state === 'error' || state === 'failed') return 'offline'
-  return 'unknown'
-})
-
-const runtimeConfig = useRuntimeConfig()
-const reachBaseUrl = computed(() => {
-  const configured = String(runtimeConfig.public.reachBaseUrl || '').replace(/\/$/, '')
-  if (configured) return configured
-  if (import.meta.client) return window.location.origin
-  return 'https://tunnels.your-domain.example'
-})
-
-const repairCommand = computed(() => {
-  if (!props.item) return ''
-  return `curl -fsSL ${reachBaseUrl.value}/setup.sh | sudo sh -s -- --repair`
-})
-
-const uninstallCommand = computed(() => {
-  if (!props.item) return ''
-  return `curl -fsSL ${reachBaseUrl.value}/setup.sh | sudo sh -s -- --uninstall`
-})
-
-function confirmDisable() {
-  if (!props.item) return
-  if (confirm(`Disable ${props.item.machine.slug}?`)) {
-    emit('action', 'disable', props.item.machine.id)
-  }
-}
-
-function confirmRemove() {
-  if (!props.item) return
-  if (confirm(`Remove ${props.item.machine.slug}? This retires the DB row and removes hub-side files.`)) {
-    emit('action', 'remove', props.item.machine.id)
   }
 }
 </script>

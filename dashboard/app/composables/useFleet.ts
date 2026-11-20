@@ -1,102 +1,68 @@
 import { mapSettledLimited, summarizeSettled } from '~/utils/concurrency'
 import { createAuthoritativeRefreshRetry } from '~/utils/authoritativeRefreshRetry'
 import { planFleetEvent } from '~/utils/fleetEvents'
+import { applyPatch, applySnapshot, pendingOnly, upsertMachine } from '~/utils/fleetStore'
 import { createRefreshCoordinator, type RefreshBatch } from '~/utils/refreshCoordinator'
+import { groupFleet, uiStatus, type UiStatus } from '~/utils/status'
 
 const machineRefreshConcurrency = 4
 const fullRefreshThreshold = 12
+/** A non-resumed hello this soon after a full snapshot started does not need another one. */
+const helloDedupMs = 3_000
 
 export function useFleet() {
   const api = useReachApi()
   const sse = useSSE()
-  const machines = ref<MachineWithTunnels[]>([])
-  const requests = ref<RequestRow[]>([])
+  const now = useNow()
+
+  // id -> machine. shallowReactive: Vue tracks set/delete per key, not deep mutations.
+  // fleetStore replaces a machine object whenever it changes, so only that row re-renders.
+  const byId = shallowReactive(new Map<string, MachineWithTunnels>())
+  const pending = shallowRef<RequestRow[]>([])
   const loading = ref(true)
+  const loaded = ref(false)
   const error = ref('')
   const selectedId = ref<string | null>(null)
+  let lastFullStartedAt = 0
   let disposeSSE: (() => void) | null = null
+
   const authoritativeRetry = createAuthoritativeRefreshRetry(() => {
     void refreshCoordinator.requestFull(true).catch(() => {})
   })
 
-  const pendingRequests = computed(() =>
-    requests.value.filter(r => r.status === 'pending')
-  )
-
-  const pendingCount = computed(() => pendingRequests.value.length)
-
-  const onlineCount = computed(() =>
-    machines.value.filter(m =>
-      m.machine.desired_state === 'active' && m.machine.observed_state === 'online'
-    ).length
-  )
-
-  const degradedCount = computed(() =>
-    machines.value.filter(m =>
-      m.machine.desired_state === 'active' && m.machine.observed_state === 'degraded'
-    ).length
-  )
-
-  const offlineCount = computed(() =>
-    machines.value.filter(m =>
-      m.machine.desired_state === 'active' &&
-      (m.machine.observed_state === 'offline' || m.machine.observed_state === 'gone')
-    ).length
-  )
-
-  type FleetGroup = {
-    label: string
-    machines: MachineWithTunnels[]
-    collapsed?: boolean
-  }
-
-  const grouped = computed((): FleetGroup[] => {
-    const needsAttention: MachineWithTunnels[] = []
-    const activeFleet: MachineWithTunnels[] = []
-    const inactive: MachineWithTunnels[] = []
-
-    for (const item of machines.value) {
-      const m = item.machine
-      if (m.desired_state === 'disabled' || m.desired_state === 'retired' || m.desired_state === 'retiring') {
-        inactive.push(item)
-      } else if (
-        m.observed_state === 'offline' ||
-        m.observed_state === 'gone' ||
-        m.observed_state === 'degraded' ||
-        m.status === 'pending'
-      ) {
-        needsAttention.push(item)
-      } else {
-        activeFleet.push(item)
-      }
-    }
-
-    const groups: FleetGroup[] = []
-    if (needsAttention.length) groups.push({ label: 'Needs attention', machines: needsAttention })
-    if (activeFleet.length) groups.push({ label: 'Active fleet', machines: activeFleet })
-    if (inactive.length) groups.push({ label: 'Inactive', machines: inactive, collapsed: true })
-    return groups
+  const machines = computed(() => [...byId.values()])
+  const statusOf = computed(() => {
+    const out = new Map<string, UiStatus>()
+    for (const item of byId.values()) out.set(item.machine.id, uiStatus(item, now.value))
+    return out
   })
+  const groups = computed(() => groupFleet(byId.values(), now.value))
+  const counts = computed(() => {
+    const c: Record<UiStatus, number> = {
+      online: 0, degraded: 0, offline: 0, dormant: 0, pending: 0, disabled: 0,
+      retiring: 0, stuck: 0, failed: 0, retired: 0, unknown: 0,
+    }
+    for (const s of statusOf.value.values()) c[s]++
+    return c
+  })
+  const attentionCount = computed(() => groups.value.find(g => g.key === 'attention')?.items.length || 0)
+  const pendingCount = computed(() => pending.value.length)
+  const selectedMachine = computed(() => (selectedId.value && byId.get(selectedId.value)) || null)
 
-  const selectedMachine = computed(() =>
-    machines.value.find(m => m.machine.id === selectedId.value) || null
-  )
-
-  const recentlyChanged = computed(() =>
-    [...machines.value]
-      .sort((a, b) => (b.machine.updated_at || b.machine.created_at).localeCompare(a.machine.updated_at || a.machine.created_at))
-      .slice(0, 5)
-  )
+  async function loadPending() {
+    pending.value = pendingOnly(await api.pendingRequests())
+  }
 
   async function executeRefresh(batch: RefreshBatch) {
     if (batch.full) {
+      lastFullStartedAt = Date.now()
       loading.value = true
       try {
-        const [machineResult, requestResult] = await Promise.allSettled([api.machines(), api.requests()])
+        const [machineResult, requestResult] = await Promise.allSettled([api.machines(), api.pendingRequests()])
         const failures: unknown[] = []
-        if (machineResult.status === 'fulfilled') machines.value = machineResult.value || []
+        if (machineResult.status === 'fulfilled') applySnapshot(byId, machineResult.value || [])
         else failures.push(machineResult.reason)
-        if (requestResult.status === 'fulfilled') requests.value = requestResult.value || []
+        if (requestResult.status === 'fulfilled') pending.value = pendingOnly(requestResult.value)
         else failures.push(requestResult.reason)
         if (failures.length > 0) {
           const failure = failures[0] as any
@@ -104,6 +70,7 @@ export function useFleet() {
           authoritativeRetry.failed()
         } else {
           error.value = ''
+          loaded.value = true
           authoritativeRetry.succeeded()
         }
       } finally {
@@ -113,31 +80,32 @@ export function useFleet() {
     }
 
     if (batch.machineIds.length >= fullRefreshThreshold) {
-      await executeRefresh({ full: true, machineIds: [] })
+      await executeRefresh({ full: true, machineIds: [], requests: false })
       return
     }
 
-    const updateResults = await mapSettledLimited(
-      batch.machineIds,
-      machineRefreshConcurrency,
-      id => api.machine(id),
-    )
-    const { values: updates, failureCount, needsFullRefresh } = summarizeSettled(updateResults)
-    for (const updated of updates) {
-      const index = machines.value.findIndex(item => item.machine.id === updated.machine.id)
-      if (index >= 0) machines.value[index] = updated
-      else machines.value.push(updated)
+    const jobs: Promise<unknown>[] = []
+    if (batch.requests) {
+      jobs.push(loadPending().catch((e: any) => { error.value = e?.message || 'Failed to load requests' }))
     }
-
-    if (needsFullRefresh) {
-      error.value = `${failureCount} machine refresh${failureCount === 1 ? '' : 'es'} failed. Refreshing fleet...`
-      void refreshCoordinator.requestFull().catch(() => {})
+    if (batch.machineIds.length > 0) {
+      jobs.push((async () => {
+        const updateResults = await mapSettledLimited(batch.machineIds, machineRefreshConcurrency, id => api.machine(id))
+        const { values: updates, failureCount, needsFullRefresh } = summarizeSettled(updateResults)
+        for (const updated of updates) upsertMachine(byId, updated)
+        if (needsFullRefresh) {
+          error.value = `${failureCount} machine refresh${failureCount === 1 ? '' : 'es'} failed. Refreshing fleet...`
+          void refreshCoordinator.requestFull().catch(() => {})
+        }
+      })())
     }
+    await Promise.all(jobs)
   }
 
   const refreshCoordinator = createRefreshCoordinator(executeRefresh)
 
   function refresh() {
+    lastFullStartedAt = Date.now()
     return refreshCoordinator.requestFull(true)
   }
 
@@ -145,26 +113,80 @@ export function useFleet() {
     return refreshCoordinator.requestMachine(id)
   }
 
+  function refreshRequests() {
+    return refreshCoordinator.requestRequests()
+  }
+
+  function handleEvent(event: string, rawData: unknown) {
+    const plan = planFleetEvent(event, rawData)
+    switch (plan.kind) {
+      case 'hello': {
+        // Resumed with Last-Event-ID: the server already replayed what we missed.
+        if (sse.wasResumed()) return
+        // Fresh stream right after (or during) a snapshot: that snapshot is current enough.
+        // Something could still have changed between the snapshot read and the subscribe;
+        // machines heal on their next heartbeat (it carries observed_state), so only the
+        // tiny pending-request list is re-checked.
+        if (Date.now() - lastFullStartedAt < helloDedupMs) {
+          void refreshCoordinator.requestRequests().catch(() => {})
+          return
+        }
+        void refreshCoordinator.requestFull().catch(() => {})
+        return
+      }
+      case 'full':
+        void refreshCoordinator.requestFull().catch(() => {})
+        return
+      case 'requests':
+        void refreshCoordinator.requestRequests().catch(() => {})
+        if (plan.notifyPending) notifyPending(rawData as Record<string, any>)
+        return
+      case 'machine':
+        void refreshCoordinator.requestMachine(plan.machineId).catch(() => {})
+        return
+      case 'detail':
+        if (selectedId.value === plan.machineId) void refreshCoordinator.requestMachine(plan.machineId).catch(() => {})
+        return
+      case 'patch': {
+        const result = applyPatch(byId, plan.machineId, plan.patch)
+        if (result === 'missing' || (plan.refetchIfSelected && selectedId.value === plan.machineId)) {
+          void refreshCoordinator.requestMachine(plan.machineId).catch(() => {})
+        }
+        return
+      }
+      default:
+        return
+    }
+  }
+
   function setupSSE() {
     disposeSSE?.()
     if (!api.token.value) return () => {}
 
     const config = useRuntimeConfig()
-    const removeHandler = sse.onEvent((event, rawData) => {
-      const plan = planFleetEvent(event, rawData)
-      if (plan.fullRefresh) {
-        void refreshCoordinator.requestFull().catch(() => {})
-      } else if (plan.machineId) {
-        void refreshCoordinator.requestMachine(plan.machineId).catch(() => {})
-      }
+    const removeHandler = sse.onEvent(handleEvent)
+    const startStream = () => sse.start(api.token.value || '', config.public.apiBase as string || '/api')
 
-      if (plan.notifyPending) {
-        notifyPending(rawData as Record<string, any>)
+    // Phones suspend background tabs. When the page comes back and the stream is not live,
+    // reconnect now instead of waiting for the backoff timer. Heartbeats are live-only and
+    // never replayed, so after a long absence take one fresh snapshot for the "x ago" labels.
+    let hiddenAt = 0
+    const onVisible = () => {
+      if (document.visibilityState === 'hidden') {
+        hiddenAt = Date.now()
+        return
       }
-    })
+      if (!api.token.value) return
+      const awayMs = hiddenAt ? Date.now() - hiddenAt : 0
+      hiddenAt = 0
+      if (sse.status.value !== 'live') startStream()
+      else if (awayMs > 60_000) void refreshCoordinator.requestFull().catch(() => {})
+    }
+    document.addEventListener('visibilitychange', onVisible)
 
-    sse.start(api.token.value, config.public.apiBase as string || '/api')
+    startStream()
     disposeSSE = () => {
+      document.removeEventListener('visibilitychange', onVisible)
       removeHandler()
       sse.stop()
       disposeSSE = null
@@ -178,15 +200,17 @@ export function useFleet() {
     refreshCoordinator.dispose()
   }
 
+  /** Only ever shows a notification; asking for permission happens in Settings, on a tap. */
   function notifyPending(data: Record<string, any>) {
     if (!import.meta.client || !('Notification' in window)) return
-    if (Notification.permission === 'granted') {
-      new Notification('Reach: New request', {
+    if (Notification.permission !== 'granted') return
+    try {
+      new Notification('Reach: new machine request', {
         body: `${data.name || 'Unknown'} wants to connect`,
         tag: 'reach-pending',
       })
-    } else if (Notification.permission !== 'denied') {
-      void Notification.requestPermission()
+    } catch {
+      // Some mobile browsers only allow notifications from a service worker.
     }
   }
 
@@ -195,22 +219,25 @@ export function useFleet() {
   })
 
   return {
+    byId,
     machines,
-    requests,
+    pending,
     loading,
+    loaded,
     error,
     selectedId,
-    pendingRequests,
-    pendingCount,
-    onlineCount,
-    degradedCount,
-    offlineCount,
-    grouped,
     selectedMachine,
-    recentlyChanged,
+    statusOf,
+    groups,
+    counts,
+    attentionCount,
+    pendingCount,
     refresh,
     refreshMachine,
+    refreshRequests,
     setupSSE,
     dispose,
+    /** Exposed for tests and the harness. */
+    handleEvent,
   }
 }

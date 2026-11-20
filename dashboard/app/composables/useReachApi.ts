@@ -93,7 +93,22 @@ export type RequestRow = {
   approved_at?: string
   denied_at?: string
   setup_token_expires_at?: string
+  /** IP the server itself saw (newer servers). Trustworthy, unlike metadata.source_ip. */
+  observed_ip?: string
+  /** Fields the server binds at approval time (newer servers). Provision must match them. */
+  slug?: string
+  target_user?: string
+  mode?: string
+  local_port?: number
+  /** Everything in here was sent by the requester and is NOT verified. */
   metadata?: Record<string, any>
+}
+
+const TOKEN_KEY = 'reach-token'
+
+function readStoredToken(): string | null {
+  // Session storage first: a "don't remember" login must win over an old remembered one.
+  return sessionStorage.getItem(TOKEN_KEY) || localStorage.getItem(TOKEN_KEY)
 }
 
 export function useReachApi() {
@@ -102,15 +117,20 @@ export function useReachApi() {
   const token = useState<string | null>('reach-token', () => null)
 
   if (import.meta.client && token.value === null) {
-    token.value = localStorage.getItem('reach-token')
+    token.value = readStoredToken()
   }
 
-  function setToken(next: string | null) {
+  /**
+   * remember=true keeps the token in localStorage (survives closing the browser, what a
+   * phone needs). remember=false keeps it in sessionStorage only, so it is gone when the
+   * tab closes. Either way an XSS could read it; see docs/review/2026-11-21-dashboard.md.
+   */
+  function setToken(next: string | null, remember = true) {
     token.value = next
-    if (import.meta.client) {
-      if (next) localStorage.setItem('reach-token', next)
-      else localStorage.removeItem('reach-token')
-    }
+    if (!import.meta.client) return
+    localStorage.removeItem(TOKEN_KEY)
+    sessionStorage.removeItem(TOKEN_KEY)
+    if (next) (remember ? localStorage : sessionStorage).setItem(TOKEN_KEY, next)
   }
 
   async function request<T>(path: string, opts: RequestInit = {}): Promise<T> {
@@ -156,12 +176,12 @@ export function useReachApi() {
     return body as T
   }
 
-  async function login(username: string, password: string) {
+  async function login(username: string, password: string, remember = true) {
     const res = await request<LoginResponse>('/admin/login', {
       method: 'POST',
       body: JSON.stringify({ username, password })
     })
-    setToken(res.token)
+    setToken(res.token, remember)
     return res
   }
 
@@ -170,14 +190,23 @@ export function useReachApi() {
     setToken,
     login,
     logout: () => request<{ ok: boolean }>('/admin/logout', { method: 'POST' }),
+    /** Invalidates every dashboard login (and optionally Mac service tokens). Newer servers only. */
+    revokeAllSessions: (includeServiceTokens = false) => request<{ ok: boolean }>('/admin/sessions/revoke-all', {
+      method: 'POST',
+      body: JSON.stringify({ include_service_tokens: includeServiceTokens })
+    }),
     machines: () => request<MachineWithTunnels[]>('/admin/machines'),
     machine: (id: string) => request<MachineWithTunnels>(`/admin/machines/${encodeURIComponent(id)}`),
+    /** Pending only. Older servers ignore the filter, so callers still filter by status. */
+    pendingRequests: () => request<RequestRow[] | null>('/admin/requests?status=pending'),
     requests: () => request<RequestRow[]>('/admin/requests'),
     approve: (id: string) => request(`/admin/requests/${encodeURIComponent(id)}/approve`, { method: 'POST' }),
     deny: (id: string) => request(`/admin/requests/${encodeURIComponent(id)}/deny`, { method: 'POST' }),
     disable: (id: string) => request(`/admin/machines/${encodeURIComponent(id)}/disable`, { method: 'POST' }),
     enable: (id: string) => request(`/admin/machines/${encodeURIComponent(id)}/enable`, { method: 'POST' }),
     remove: (id: string) => request(`/admin/machines/${encodeURIComponent(id)}/remove`, { method: 'POST' }),
+    /** Finish a stuck or failed removal on the hub without waiting for the agent. */
+    retireNow: (id: string) => request(`/admin/machines/${encodeURIComponent(id)}/retire-now`, { method: 'POST' }),
     setProcessTitle: (id: string, config: ProcessTitleConfig | null) => request<{ machine: Machine }>(`/admin/machines/${encodeURIComponent(id)}/process-title`, {
       method: 'POST',
       body: JSON.stringify({ process_title_config: config })
