@@ -91,10 +91,10 @@ func (s *Server) applyCORS(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// allowedCORSOrigin allows only the configured public origin and explicit
+// allowed_origins. Local dev servers (http://localhost:3000) must be listed in
+// allowed_origins; they are no longer allowed implicitly (Opus P3-2).
 func (s *Server) allowedCORSOrigin(origin string) bool {
-	if strings.HasPrefix(origin, "http://localhost:") || strings.HasPrefix(origin, "http://127.0.0.1:") {
-		return true
-	}
 	if origin == originFromURL(s.cfg.DefaultHub.APIURL) {
 		return true
 	}
@@ -124,6 +124,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/admin/login", s.method("POST", s.handleAdminLogin))
 	s.mux.HandleFunc("/api/admin/logout", s.admin(s.method("POST", s.handleAdminLogout)))
 	s.mux.HandleFunc("/api/admin/service-tokens", s.admin(s.method("POST", s.handleCreateServiceToken)))
+	s.mux.HandleFunc("/api/admin/sessions/revoke-all", s.admin(s.method("POST", s.handleRevokeAllSessions)))
 	s.mux.HandleFunc("/api/admin/requests", s.admin(s.method("GET", s.handleAdminRequests)))
 	s.mux.HandleFunc("/api/admin/requests/", s.admin(s.handleAdminRequestAction))
 	s.mux.HandleFunc("/api/admin/machines", s.admin(s.method("GET", s.handleAdminMachines)))
@@ -1172,7 +1173,8 @@ func (s *Server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var id, username, hash, role string
-	err := s.store.db.QueryRowContext(r.Context(), `SELECT id,username,password_hash,role FROM users WHERE username=?`, req.Username).Scan(&id, &username, &hash, &role)
+	var sessionVersion int64
+	err := s.store.db.QueryRowContext(r.Context(), `SELECT id,username,password_hash,role,session_version FROM users WHERE username=?`, req.Username).Scan(&id, &username, &hash, &role, &sessionVersion)
 	known := err == nil
 	if !known {
 		// Unknown account: still pay for one Argon2 run so response timing
@@ -1187,7 +1189,7 @@ func (s *Server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 401, "invalid username or password")
 		return
 	}
-	tok, err := SignJWT(s.cfg.JWTSecret, id, username, role, s.cfg.AdminJWTTTL)
+	tok, err := SignJWTVersion(s.cfg.JWTSecret, id, username, role, sessionVersion, s.cfg.AdminJWTTTL)
 	if err != nil {
 		writeErr(w, 500, "could not sign token")
 		return
@@ -1216,6 +1218,42 @@ func (s *Server) handleAdminLogout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true})
+}
+
+// handleRevokeAllSessions invalidates every dashboard JWT of the caller's
+// account (including the current one). With include_service_tokens it also
+// revokes all service tokens, which disconnects reach-mac-agent until it is
+// given a new token.
+func (s *Server) handleRevokeAllSessions(w http.ResponseWriter, r *http.Request) {
+	if authKindFrom(r.Context()) != "jwt" {
+		writeErr(w, 403, "sessions can only be revoked from an interactive admin session")
+		return
+	}
+	claims := claimsFrom(r.Context())
+	var req struct {
+		IncludeServiceTokens bool `json:"include_service_tokens"`
+	}
+	if r.ContentLength != 0 {
+		if err := decodeJSON(r, &req); err != nil {
+			writeErr(w, 400, "invalid json")
+			return
+		}
+	}
+	if _, err := s.store.db.ExecContext(r.Context(), `UPDATE users SET session_version=session_version+1 WHERE id=?`, claims.UserID); err != nil {
+		writeErr(w, 500, "revoke failed")
+		return
+	}
+	revokedServices := int64(0)
+	if req.IncludeServiceTokens {
+		res, err := s.store.db.ExecContext(r.Context(), `UPDATE service_tokens SET revoked_at=? WHERE revoked_at IS NULL`, nowUTC())
+		if err != nil {
+			writeErr(w, 500, "revoke failed")
+			return
+		}
+		revokedServices, _ = res.RowsAffected()
+	}
+	s.store.Audit(r.Context(), "sessions.revoke_all", claims.Username, "", fmt.Sprintf("service_tokens=%d", revokedServices))
+	writeJSON(w, 200, map[string]any{"ok": true, "revoked_service_tokens": revokedServices})
 }
 
 func (s *Server) handleCreateServiceToken(w http.ResponseWriter, r *http.Request) {
@@ -1618,6 +1656,13 @@ func (s *Server) authenticateAdminToken(ctx context.Context, token string) (*Cla
 		}
 		if blacklisted {
 			return nil, "", errors.New("blacklisted token")
+		}
+		var current int64
+		if err := s.store.db.QueryRowContext(ctx, `SELECT session_version FROM users WHERE id=?`, claims.UserID).Scan(&current); err != nil {
+			return nil, "", errors.New("unknown user")
+		}
+		if claims.SessionVersion != current {
+			return nil, "", errors.New("session revoked")
 		}
 		return claims, "jwt", nil
 	}

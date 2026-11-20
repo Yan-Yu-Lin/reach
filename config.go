@@ -97,6 +97,11 @@ type PendingRequestNotificationConfig struct {
 	WebhookHeaders map[string]string `yaml:"webhook_headers"`
 }
 
+const (
+	defaultAdminJWTTTL = 7 * 24 * time.Hour
+	maxAdminJWTTTL     = 30 * 24 * time.Hour
+)
+
 func envDefault(name, def string) string {
 	if v := os.Getenv(name); v != "" {
 		return v
@@ -111,7 +116,7 @@ func DefaultConfig() Config {
 		ListenAddr:          "127.0.0.1:9300",
 		DBPath:              "/var/lib/reach/reach.db",
 		LogLevel:            "info",
-		AdminJWTTTL:         365 * 24 * time.Hour,
+		AdminJWTTTL:         defaultAdminJWTTTL,
 		RequestTTL:          30 * time.Minute,
 		SetupTokenTTL:       15 * time.Minute,
 		HealthInterval:      45 * time.Second,
@@ -171,7 +176,12 @@ func LoadConfig(path string) (Config, error) {
 		cfg.SSHServiceName = "ssh"
 	}
 	if cfg.AdminJWTTTL == 0 {
-		cfg.AdminJWTTTL = 365 * 24 * time.Hour
+		cfg.AdminJWTTTL = defaultAdminJWTTTL
+	}
+	if cfg.AdminJWTTTL > maxAdminJWTTTL {
+		// A stolen dashboard token used to stay valid for a year
+		// (daybreak P3-1, Opus P2-7).
+		cfg.AdminJWTTTL = maxAdminJWTTTL
 	}
 	if cfg.AdminJWTTTL < 0 {
 		return cfg, fmt.Errorf("admin_jwt_ttl must not be negative")

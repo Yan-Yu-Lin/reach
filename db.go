@@ -316,6 +316,7 @@ func (s *Store) Migrate(ctx context.Context, cfg Config) error {
 		{"tunnels", "original_unix_user", "TEXT"},
 		{"tunnels", "original_remote_port", "INTEGER"},
 		{"tunnels", "cleanup_verified_at", "TEXT"},
+		{"users", "session_version", "INTEGER NOT NULL DEFAULT 0"},
 		{"invites", "claimed_by_request_id", "TEXT"},
 		{"invites", "claimed_at", "TEXT"},
 		{"invites", "consumed_at", "TEXT"},

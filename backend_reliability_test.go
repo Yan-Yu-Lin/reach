@@ -38,6 +38,17 @@ func newReliabilityTestServer(t *testing.T) (*Server, *Store, Config) {
 	return NewServer(cfg, store, prov), store, cfg
 }
 
+// adminTestToken signs a JWT for the seeded owner account.
+func adminTestToken(t *testing.T, store *Store, cfg Config) (string, error) {
+	t.Helper()
+	var id, username string
+	var sv int64
+	if err := store.db.QueryRow(`SELECT id,username,session_version FROM users ORDER BY created_at LIMIT 1`).Scan(&id, &username, &sv); err != nil {
+		t.Fatal(err)
+	}
+	return SignJWTVersion(cfg.JWTSecret, id, username, "owner", sv, time.Hour)
+}
+
 func insertTestMachine(t *testing.T, store *Store, id, slug string) {
 	t.Helper()
 	_, err := store.db.Exec(`INSERT INTO machines (id,slug,original_slug,status,desired_state,observed_state,created_at) VALUES (?,?,?,'offline','active','offline',?)`, id, slug, slug, nowUTC())
@@ -240,7 +251,7 @@ func TestReplayWindowIsTimeBased(t *testing.T) {
 		}
 	}
 	_ = tx.Commit()
-	token, _ := SignJWT(cfg.JWTSecret, "u", "tester", "owner", time.Hour)
+	token, _ := adminTestToken(t, server.store, cfg)
 	ts := httptest.NewServer(server)
 	defer ts.Close()
 	read := func(cursor string) string {
@@ -276,7 +287,7 @@ func TestReplayWindowIsTimeBased(t *testing.T) {
 
 func TestInvalidEventCursorRequiresResnapshot(t *testing.T) {
 	server, _, cfg := newReliabilityTestServer(t)
-	token, err := SignJWT(cfg.JWTSecret, "u_test", "tester", "owner", time.Hour)
+	token, err := adminTestToken(t, server.store, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -441,7 +452,7 @@ func TestPendingCommandsWorksWithOneDatabaseConnection(t *testing.T) {
 func TestAdminEventsNoCursorIsLiveOnlyAndCursorReplays(t *testing.T) {
 	server, _, cfg := newReliabilityTestServer(t)
 	server.events.Publish(context.Background(), "machine.old", "m_old", map[string]any{"old": true})
-	token, err := SignJWT(cfg.JWTSecret, "u_test", "tester", "owner", time.Hour)
+	token, err := adminTestToken(t, server.store, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -514,7 +525,7 @@ func TestEventReplayOverflowRequiresResnapshot(t *testing.T) {
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	token, err := SignJWT(cfg.JWTSecret, "u_test", "tester", "owner", time.Hour)
+	token, err := adminTestToken(t, server.store, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}

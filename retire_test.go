@@ -121,7 +121,7 @@ func TestDisableFailsClosed(t *testing.T) {
 	server, store, cfg := newReliabilityTestServer(t)
 	server.prov.osOps = &fakeTunnelOS{failDisable: true}
 	insertRetireFixture(t, server, "m_dis", "dis-box", "rt-disbox11", 9208)
-	admin, _ := SignJWT(cfg.JWTSecret, "u", "tester", "owner", time.Hour)
+	admin, _ := adminTestToken(t, server.store, cfg)
 	rec := doJSON(t, server, http.MethodPost, "/api/admin/machines/m_dis/disable", "", admin)
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("disable with failing OS = %d %s", rec.Code, rec.Body.String())
@@ -199,7 +199,7 @@ func TestListMachinesHidesRetiredByDefault(t *testing.T) {
 	if _, err := store.db.Exec(`INSERT INTO machines (id,slug,original_slug,status,desired_state,observed_state,created_at) VALUES ('m_dead','dead--retired-x','dead','retired','retired','gone',?)`, nowUTC()); err != nil {
 		t.Fatal(err)
 	}
-	admin, _ := SignJWT(cfg.JWTSecret, "u", "tester", "owner", time.Hour)
+	admin, _ := adminTestToken(t, server.store, cfg)
 	if body := doJSON(t, server, http.MethodGet, "/api/admin/machines", "", admin).Body.String(); strings.Contains(body, "m_dead") || !strings.Contains(body, "m_live") {
 		t.Fatalf("default list: %s", body)
 	}

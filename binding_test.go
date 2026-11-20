@@ -21,7 +21,7 @@ func registerAndApprove(t *testing.T, server *Server, cfg Config, body string) (
 		ClientSecret string `json:"client_secret"`
 	}
 	_ = json.Unmarshal(rec.Body.Bytes(), &out)
-	admin, err := SignJWT(cfg.JWTSecret, "u", "tester", "owner", time.Hour)
+	admin, err := adminTestToken(t, server.store, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +138,7 @@ func TestRequestsListExposesObservedIPAndFilter(t *testing.T) {
 	registerAndApprove(t, server, cfg, `{"name":"listed-box"}`)
 	server.registerL = newRateLimiter(1000, time.Minute)
 	_ = doJSON(t, server, http.MethodPost, "/api/client/register", `{"name":"pending-box"}`, "")
-	admin, _ := SignJWT(cfg.JWTSecret, "u", "tester", "owner", time.Hour)
+	admin, _ := adminTestToken(t, server.store, cfg)
 	rec := doJSON(t, server, http.MethodGet, "/api/admin/requests?status=pending", "", admin)
 	var rows []map[string]any
 	_ = json.Unmarshal(rec.Body.Bytes(), &rows)

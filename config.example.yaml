@@ -3,8 +3,19 @@ listen_addr: 127.0.0.1:9300
 db_path: /var/lib/reach/reach.db
 log_level: info
 
-# Extra CORS origins for admin/API calls. The default_hub.api_url origin is allowed automatically.
+# Extra CORS origins for admin/API calls. The default_hub.api_url origin is
+# allowed automatically. Local dev servers are NOT allowed implicitly; add e.g.
+# "http://localhost:3000" here on a development hub only.
 allowed_origins: []
+
+# Aliases targets may never claim, in addition to the built-in list
+# (jason*, *-public, pi, pi-*, localhost, reach, reach-hub, hub, github*, ...).
+# Add every hand-written Host from the operator's ~/.ssh/config.
+reserved_slugs: []
+
+# How long a removed machine may wait for its agent to confirm uninstall
+# before it is flagged timed_out for an operator decision (retire-now).
+retiring_timeout: 24h
 
 # Generate with: printf '<secret>' | reachd hash-secret
 god_code_hash: "$argon2id$..."
@@ -21,9 +32,10 @@ initial_admin:
 
 # Generate a long random string before deployment.
 jwt_secret: "replace-with-32+-bytes-random"
-# Long-lived because this is commonly used as a single-admin personal dashboard.
-# Logout blacklists the current token; rotate jwt_secret to revoke all sessions.
-admin_jwt_ttl: 8760h
+# Dashboard session lifetime. Capped at 720h (30 days); default 168h.
+# Logout blacklists the current token; POST /api/admin/sessions/revoke-all
+# invalidates every session of the account (and optionally service tokens).
+admin_jwt_ttl: 168h
 
 # Optional: returned to clients for StrictHostKeyChecking pinning.
 # Include an ssh-rsa host key when supporting OpenSSH 5.x target clients.

@@ -212,10 +212,17 @@ type Claims struct {
 	UserID   string `json:"uid"`
 	Username string `json:"username"`
 	Role     string `json:"role"`
+	// SessionVersion must equal users.session_version; bumping it revokes
+	// every outstanding JWT of that user.
+	SessionVersion int64 `json:"sv,omitempty"`
 	jwt.RegisteredClaims
 }
 
 func SignJWT(secret, userID, username, role string, ttl time.Duration) (string, error) {
+	return SignJWTVersion(secret, userID, username, role, 0, ttl)
+}
+
+func SignJWTVersion(secret, userID, username, role string, sessionVersion int64, ttl time.Duration) (string, error) {
 	if secret == "" {
 		return "", errors.New("jwt secret is empty")
 	}
@@ -224,7 +231,7 @@ func SignJWT(secret, userID, username, role string, ttl time.Duration) (string, 
 	}
 	now := time.Now()
 	claims := Claims{
-		UserID: userID, Username: username, Role: role,
+		UserID: userID, Username: username, Role: role, SessionVersion: sessionVersion,
 		RegisteredClaims: jwt.RegisteredClaims{IssuedAt: jwt.NewNumericDate(now), ExpiresAt: jwt.NewNumericDate(now.Add(ttl))},
 	}
 	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(secret))
