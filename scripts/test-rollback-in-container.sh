@@ -19,6 +19,7 @@ git -C "$repo" archive "$base" | (mkdir -p "$work/old" && tar -x -C "$work/old")
 (cd "$work/old" && GOOS=linux GOARCH="$(go env GOARCH)" CGO_ENABLED=0 go build -o "$work/reachd-old" .)
 (cd "$repo" && GOOS=linux GOARCH="$(go env GOARCH)" CGO_ENABLED=0 go build -o "$work/reachd-new" .)
 cp -R "$repo/scripts" "$work/scripts"
+[ -n "${REACH_RBTEST_TRACE:-}" ] && sed -i "" "s/^set -Eeuo pipefail$/set -Eeuxo pipefail/" "$work/scripts/rehearse-rollback.sh"
 
 cat > "$work/run.sh" <<'EOS'
 #!/usr/bin/env bash
