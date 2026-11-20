@@ -877,7 +877,10 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-const tunnelSeenWriteInterval = 5 * time.Minute
+const (
+	tunnelSeenWriteInterval   = 5 * time.Minute
+	serviceTokenTouchInterval = time.Minute
+)
 
 func normalizeHeartbeat(hb AgentHeartbeat) AgentHeartbeat {
 	if hb.Observed.LocalSSH.State == "" && hb.LocalSSH.State != "" {
@@ -1644,7 +1647,10 @@ func (s *Server) parseServiceToken(ctx context.Context, token string) (*Claims, 
 	if err != nil {
 		return nil, err
 	}
-	_, _ = s.store.db.ExecContext(ctx, `UPDATE service_tokens SET last_used_at=? WHERE id=?`, nowUTC(), id)
+	// Throttled: at most one write per token per minute (perf #6). The
+	// conditional WHERE makes concurrent requests a no-op.
+	now := time.Now().UTC()
+	_, _ = s.store.db.ExecContext(ctx, `UPDATE service_tokens SET last_used_at=? WHERE id=? AND (last_used_at IS NULL OR last_used_at<?)`, now.Format(time.RFC3339), id, now.Add(-serviceTokenTouchInterval).Format(time.RFC3339))
 	return &Claims{UserID: id, Username: "service:" + label, Role: role}, nil
 }
 

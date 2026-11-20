@@ -30,12 +30,15 @@ type Provisioner struct {
 
 	publishEvent func(string, string, map[string]any)
 	pruneEvents  func(context.Context, string) error
+	// probeTunnel overrides the batched ss/keyscan probe (tests only).
 	probeTunnel  func(context.Context, int) (bool, string)
 	observedMu   sync.Mutex
 	healthMu     sync.RWMutex
 	healthReport []map[string]any
 	argon        *argonGate
 	osOps        tunnelOS
+	// listListeners overrides `ss -Htln` in tests.
+	listListeners func(context.Context) (map[int]bool, error)
 }
 
 type CreateMachineInput struct {
@@ -61,7 +64,7 @@ type CreateMachineResult struct {
 }
 
 func NewProvisioner(store *Store, cfg Config) *Provisioner {
-	p := &Provisioner{store: store, cfg: cfg, probeTunnel: checkTunnelPort}
+	p := &Provisioner{store: store, cfg: cfg}
 	if cfg.ProvisioningEnabled {
 		p.osOps = systemTunnelOS{cfg: cfg}
 	} else {
@@ -973,8 +976,27 @@ func (p *Provisioner) publish(typ, machineID string, data map[string]any) {
 	}
 }
 
+const (
+	// keyscanInterval: a listening tunnel is only re-verified with
+	// ssh-keyscan this often. Listener changes are still seen every round.
+	keyscanInterval = 5 * time.Minute
+	// dormantAfter: a tunnel that is down and whose machine has not sent a
+	// heartbeat for this long only gets its unchanged observation row
+	// refreshed every dormantRefresh (it is still probed each round via the
+	// shared ss output, which costs nothing per tunnel).
+	dormantAfter   = 24 * time.Hour
+	dormantRefresh = time.Hour
+	// hubObservationRefresh bounds how stale last_probe_at may get when
+	// nothing changes, so the dashboard still sees the probe is alive.
+	hubObservationRefresh = 10 * time.Minute
+)
+
+// RunHealthCheck probes every live tunnel. One `ss -Htln` per round replaces
+// one fork per tunnel; ssh-keyscan only runs when a listener appears or its
+// last success is older than keyscanInterval; DB rows are written only when
+// something changed (perf #5, #6).
 func (p *Provisioner) RunHealthCheck(ctx context.Context) ([]map[string]any, error) {
-	rows, err := p.store.db.QueryContext(ctx, `SELECT `+tunnelCols+` FROM tunnels WHERE status NOT IN ('disabled','retired','failed','cleanup_failed')`)
+	rows, err := p.store.db.QueryContext(ctx, `SELECT `+tunnelCols+` FROM tunnels WHERE status NOT IN ('disabled','retired','failed','cleanup_failed') AND remote_port>0`)
 	if err != nil {
 		return nil, err
 	}
@@ -990,43 +1012,107 @@ func (p *Provisioner) RunHealthCheck(ctx context.Context) ([]map[string]any, err
 	if err := rows.Close(); err != nil {
 		return nil, err
 	}
+	type prevObs struct {
+		state, probeErr, lastProbe, lastSuccess string
+		ok                                      bool
+	}
+	prev := map[string]prevObs{}
+	obsRows, err := p.store.db.QueryContext(ctx, `SELECT tunnel_id,probe_state,COALESCE(probe_error,''),last_probe_at,COALESCE(last_success_at,'') FROM hub_observations`)
+	if err != nil {
+		return nil, err
+	}
+	for obsRows.Next() {
+		var id string
+		var o prevObs
+		if err := obsRows.Scan(&id, &o.state, &o.probeErr, &o.lastProbe, &o.lastSuccess); err != nil {
+			_ = obsRows.Close()
+			return nil, err
+		}
+		o.ok = true
+		prev[id] = o
+	}
+	if err := obsRows.Close(); err != nil {
+		return nil, err
+	}
+	lastHeartbeat := map[string]time.Time{}
+	hbRows, err := p.store.db.QueryContext(ctx, `SELECT machine_id,heartbeat_at FROM agent_observations`)
+	if err != nil {
+		return nil, err
+	}
+	for hbRows.Next() {
+		var mid, at string
+		if hbRows.Scan(&mid, &at) == nil {
+			if t, err := time.Parse(time.RFC3339, at); err == nil {
+				lastHeartbeat[mid] = t
+			}
+		}
+	}
+	_ = hbRows.Close()
+
+	listening, ssErr := p.listeningPorts(ctx)
+	nowT := time.Now().UTC()
 	var report []map[string]any
 	for _, t := range tunnels {
-		probe := p.probeTunnel
-		if probe == nil {
-			probe = checkTunnelPort
+		po := prev[t.ID]
+		var ok bool
+		var detail string
+		switch {
+		case p.probeTunnel != nil:
+			// Injected probe (tests).
+			ok, detail = p.probeTunnel(ctx, t.RemotePort)
+		case ssErr != nil:
+			ok, detail = checkTunnelPort(ctx, t.RemotePort)
+		case !listening[t.RemotePort]:
+			ok, detail = false, "ss: port not listening"
+		default:
+			lastSuccess, _ := time.Parse(time.RFC3339, po.lastSuccess)
+			if po.ok && po.state == "reachable" && nowT.Sub(lastSuccess) < keyscanInterval {
+				ok, detail = true, "listening (keyscan cached)"
+			} else {
+				ok, detail = keyscanTunnel(ctx, t.RemotePort)
+			}
 		}
-		ok, detail := probe(ctx, t.RemotePort)
-		now := nowUTC()
+		// Dormant tunnels that stay down are written rarely.
+		hb, hasHB := lastHeartbeat[t.MachineID]
+		dormant := !ok && (!hasHB || nowT.Sub(hb) > dormantAfter)
 		state := "unreachable"
-		lastSuccess := sql.NullString{}
 		probeErr := detail
 		if ok {
 			state = "reachable"
-			lastSuccess = sql.NullString{String: now, Valid: true}
 			probeErr = ""
 		}
-		var previousProbe, previousProbeError sql.NullString
-		err := p.store.db.QueryRowContext(ctx, `SELECT probe_state,probe_error FROM hub_observations WHERE tunnel_id=?`, t.ID).Scan(&previousProbe, &previousProbeError)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return nil, err
-		}
+		now := nowT.Format(time.RFC3339)
 		nextTunnelStatus := "offline"
 		if ok {
 			nextTunnelStatus = "online"
 		}
-		if _, err := p.store.db.ExecContext(ctx, `UPDATE tunnels SET status=?,last_seen_at=CASE WHEN ?='online' THEN ? ELSE last_seen_at END WHERE id=? AND status NOT IN ('disabled','retired','failed','cleanup_failed')`, nextTunnelStatus, nextTunnelStatus, now, t.ID); err != nil {
-			return nil, err
+		lastProbe, _ := time.Parse(time.RFC3339, po.lastProbe)
+		refreshAge := hubObservationRefresh
+		if dormant {
+			refreshAge = dormantRefresh
 		}
-		if _, err := p.store.db.ExecContext(ctx, `INSERT INTO hub_observations (tunnel_id,machine_id,probe_state,last_probe_at,last_success_at,probe_error) VALUES (?,?,?,?,?,?) ON CONFLICT(tunnel_id) DO UPDATE SET probe_state=excluded.probe_state,last_probe_at=excluded.last_probe_at,last_success_at=COALESCE(excluded.last_success_at,hub_observations.last_success_at),probe_error=excluded.probe_error`, t.ID, t.MachineID, state, now, lastSuccess, nullable(probeErr)); err != nil {
-			return nil, err
+		changed := !po.ok || po.state != state || po.probeErr != probeErr
+		if changed || (ok && po.state == "reachable" && detail != "listening (keyscan cached)") || nowT.Sub(lastProbe) >= refreshAge {
+			var lastSuccess any
+			if ok {
+				lastSuccess = now
+			}
+			if _, err := p.store.db.ExecContext(ctx, `INSERT INTO hub_observations (tunnel_id,machine_id,probe_state,last_probe_at,last_success_at,probe_error) VALUES (?,?,?,?,?,?) ON CONFLICT(tunnel_id) DO UPDATE SET probe_state=excluded.probe_state,last_probe_at=excluded.last_probe_at,last_success_at=COALESCE(excluded.last_success_at,hub_observations.last_success_at),probe_error=excluded.probe_error`, t.ID, t.MachineID, state, now, lastSuccess, nullable(probeErr)); err != nil {
+				return nil, err
+			}
 		}
+		if t.Status != nextTunnelStatus {
+			if _, err := p.store.db.ExecContext(ctx, `UPDATE tunnels SET status=?,last_seen_at=CASE WHEN ?='online' THEN ? ELSE last_seen_at END WHERE id=? AND status NOT IN ('disabled','retired','failed','cleanup_failed')`, nextTunnelStatus, nextTunnelStatus, now, t.ID); err != nil {
+				return nil, err
+			}
+		}
+		// recomputeObserved only writes when the derived state changes, and
+		// must run every round because heartbeat staleness is time-based.
 		machineChanged, observed, status, err := p.recomputeObserved(ctx, t.MachineID)
 		if err != nil {
 			return nil, err
 		}
-		healthChanged := t.Status != nextTunnelStatus || !previousProbe.Valid || previousProbe.String != state || previousProbeError.String != probeErr
-		if machineChanged || healthChanged {
+		if machineChanged || changed || t.Status != nextTunnelStatus {
 			p.publish("machine.health_changed", t.MachineID, map[string]any{"machine_id": t.MachineID, "observed_state": observed, "status": status, "probe_state": state})
 		}
 		report = append(report, map[string]any{"tunnel_id": t.ID, "machine_id": t.MachineID, "port": t.RemotePort, "ok": ok, "probe_state": state, "detail": detail, "checked_at": now})
@@ -1035,6 +1121,53 @@ func (p *Provisioner) RunHealthCheck(ctx context.Context) ([]map[string]any, err
 	p.healthReport = report
 	p.healthMu.Unlock()
 	return report, nil
+}
+
+// listeningPorts runs `ss -Htln` once and returns loopback TCP listeners.
+func (p *Provisioner) listeningPorts(ctx context.Context) (map[int]bool, error) {
+	if p.listListeners != nil {
+		return p.listListeners(ctx)
+	}
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(cctx, "ss", "-Htln").Output()
+	if err != nil {
+		return nil, err
+	}
+	return parseSSListeners(string(out)), nil
+}
+
+// parseSSListeners extracts local ports from `ss -Htln` output, e.g.
+// "LISTEN 0 128 127.0.0.1:9208 0.0.0.0:*".
+func parseSSListeners(out string) map[int]bool {
+	ports := map[int]bool{}
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 4 {
+			continue
+		}
+		local := f[3]
+		i := strings.LastIndex(local, ":")
+		if i < 0 {
+			continue
+		}
+		if n, err := strconv.Atoi(local[i+1:]); err == nil {
+			ports[n] = true
+		}
+	}
+	return ports
+}
+
+func keyscanTunnel(ctx context.Context, port int) (bool, string) {
+	out, err := exec.CommandContext(ctx, "ssh-keyscan", "-T", "3", "-p", strconv.Itoa(port), "127.0.0.1").CombinedOutput()
+	if err != nil {
+		return false, "listener ok, ssh-keyscan failed: " + strings.TrimSpace(string(out))
+	}
+	s := strings.TrimSpace(string(out))
+	if !strings.Contains(s, "ssh-") && !strings.Contains(s, "ecdsa-") {
+		return false, "no ssh host key in banner"
+	}
+	return true, firstLine(s)
 }
 
 func (p *Provisioner) recomputeObserved(ctx context.Context, machineID string) (bool, string, string, error) {

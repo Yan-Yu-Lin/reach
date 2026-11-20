@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -46,10 +47,8 @@ func latestAgentUpdate(cfg Config) (agentUpdateRelease, bool) {
 	}
 	rel := agentUpdateRelease{Version: strings.TrimSpace(cfg.AgentUpdates.LatestVersion), APIURL: strings.TrimSpace(cfg.AgentUpdates.APIURL)}
 	if rel.Version == "" && cfg.AgentUpdates.ManifestPath != "" {
-		if b, err := os.ReadFile(cfg.AgentUpdates.ManifestPath); err == nil {
-			_ = json.Unmarshal(b, &rel)
-			rel.Version = strings.TrimSpace(rel.Version)
-			rel.APIURL = strings.TrimSpace(rel.APIURL)
+		if cached, ok := readManifestCached(cfg.AgentUpdates.ManifestPath); ok {
+			rel = cached
 		}
 	}
 	if rel.Version == "" {
@@ -59,6 +58,50 @@ func latestAgentUpdate(cfg Config) (agentUpdateRelease, bool) {
 		rel.APIURL = strings.TrimSpace(cfg.DefaultHub.APIURL)
 	}
 	return rel, true
+}
+
+// manifestCache avoids re-reading latest.json on every heartbeat and for
+// every machine in /machines (perf #7). The file is re-read when its mtime or
+// size changes, and at most every manifestCacheTTL otherwise.
+var manifestCache struct {
+	sync.Mutex
+	path    string
+	mod     time.Time
+	size    int64
+	checked time.Time
+	rel     agentUpdateRelease
+	ok      bool
+}
+
+const manifestCacheTTL = 10 * time.Second
+
+func readManifestCached(path string) (agentUpdateRelease, bool) {
+	manifestCache.Lock()
+	defer manifestCache.Unlock()
+	now := time.Now()
+	if manifestCache.path == path && now.Sub(manifestCache.checked) < manifestCacheTTL {
+		return manifestCache.rel, manifestCache.ok
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		manifestCache.path, manifestCache.checked, manifestCache.ok = path, now, false
+		manifestCache.rel = agentUpdateRelease{}
+		return agentUpdateRelease{}, false
+	}
+	if manifestCache.path == path && st.ModTime().Equal(manifestCache.mod) && st.Size() == manifestCache.size {
+		manifestCache.checked = now
+		return manifestCache.rel, manifestCache.ok
+	}
+	var rel agentUpdateRelease
+	ok := false
+	if b, err := os.ReadFile(path); err == nil && json.Unmarshal(b, &rel) == nil {
+		rel.Version = strings.TrimSpace(rel.Version)
+		rel.APIURL = strings.TrimSpace(rel.APIURL)
+		ok = true
+	}
+	manifestCache.path, manifestCache.mod, manifestCache.size, manifestCache.checked = path, st.ModTime(), st.Size(), now
+	manifestCache.rel, manifestCache.ok = rel, ok
+	return rel, ok
 }
 
 func agentUpdateHintFor(cfg Config, current string) *AgentUpdateHint {

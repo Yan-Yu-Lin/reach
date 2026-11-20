@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -94,6 +95,7 @@ func serveCommand(ctx context.Context, args []string) error {
 		return fmt.Errorf("jwt_secret is required for API server")
 	}
 	server := NewServer(cfg, store, prov)
+	warnDuplicateTunnelPorts(ctx, store)
 	prov.StartHealthLoop(ctx)
 	prov.StartMaintenanceLoop(ctx)
 	return server.Run(ctx)
@@ -330,4 +332,22 @@ Usage:
   reachctl health
   reachd db-check [--config /etc/reach/config.yaml]
   printf 'secret' | reachd hash-secret`)
+}
+
+// warnDuplicateTunnelPorts logs live tunnel rows that share a port across hub
+// rows (created before allocation became hub-independent). Their probe
+// results are ambiguous; retire or re-provision the stale machine.
+func warnDuplicateTunnelPorts(ctx context.Context, store *Store) {
+	rows, err := store.db.QueryContext(ctx, `SELECT remote_port,group_concat(machine_id||'/'||hub_id||'/'||status,' ') FROM tunnels WHERE status<>'retired' AND remote_port>0 GROUP BY remote_port HAVING COUNT(*)>1`)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var port int
+		var who string
+		if rows.Scan(&port, &who) == nil {
+			log.Printf("WARNING: tunnel port %d is assigned to more than one live tunnel row: %s", port, who)
+		}
+	}
 }
