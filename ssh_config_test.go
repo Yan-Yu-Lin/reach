@@ -130,3 +130,24 @@ func TestLegacyTextOmitsTargetOptionsByDefault(t *testing.T) {
 		t.Fatal("opt-in did not restore options")
 	}
 }
+
+// Daybreak round 3 P3-B: ssh-config.json carries the hub's extra reserved
+// aliases so reach-mac-agent can enforce them too.
+func TestSSHConfigJSONIncludesReservedHosts(t *testing.T) {
+	server, store, cfg := newReliabilityTestServer(t)
+	server.cfg.ReservedSlugs = []string{"office-*"}
+	server.cfg.DefaultHub.ProxyJumpAlias = "my-hub"
+	admin, _ := adminTestToken(t, store, cfg)
+	rec := doJSON(t, server, http.MethodGet, "/api/admin/ssh-config.json", "", admin)
+	if rec.Code != 200 {
+		t.Fatalf("%d", rec.Code)
+	}
+	var doc SSHConfigDocument
+	if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(doc.ReservedHosts, ",")
+	if !strings.Contains(got, "office-*") || !strings.Contains(got, "my-hub") {
+		t.Fatalf("reserved_hosts = %v", doc.ReservedHosts)
+	}
+}

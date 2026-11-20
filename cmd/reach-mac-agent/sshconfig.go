@@ -40,8 +40,9 @@ type sshHost struct {
 }
 
 type sshConfigDocument struct {
-	Schema int       `json:"schema"`
-	Hosts  []sshHost `json:"hosts"`
+	Schema        int       `json:"schema"`
+	Hosts         []sshHost `json:"hosts"`
+	ReservedHosts []string  `json:"reserved_hosts,omitempty"`
 }
 
 var (
@@ -151,17 +152,17 @@ func renderSSHConfig(hosts []sshHost) string {
 	return b.String()
 }
 
-func parseSSHConfigJSON(body []byte) ([]sshHost, error) {
+func parseSSHConfigJSON(body []byte) ([]sshHost, []string, error) {
 	var doc sshConfigDocument
 	dec := json.NewDecoder(strings.NewReader(string(body)))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&doc); err != nil {
-		return nil, fmt.Errorf("parse ssh-config.json: %w", err)
+		return nil, nil, fmt.Errorf("parse ssh-config.json: %w", err)
 	}
 	if doc.Schema != 1 {
-		return nil, fmt.Errorf("unsupported ssh-config schema %d", doc.Schema)
+		return nil, nil, fmt.Errorf("unsupported ssh-config schema %d", doc.Schema)
 	}
-	return doc.Hosts, nil
+	return doc.Hosts, doc.ReservedHosts, nil
 }
 
 var errLegacyDirective = errors.New("legacy ssh-config contains a directive outside the allowlist")
@@ -237,17 +238,34 @@ func parseLegacySSHConfig(body []byte) ([]sshHost, error) {
 
 // validateWithSSH runs `ssh -G -F <candidate> <host>` so OpenSSH itself
 // confirms the file parses. The candidate contains only allowlisted
-// directives, so -G cannot execute anything.
+// directives, so -G cannot execute anything. ssh -G parses the whole file
+// but only applies the named host's block, so each host with options is
+// checked by name.
 func validateWithSSH(ctx context.Context, sshBinary, path string, hosts []sshHost) error {
 	if len(hosts) == 0 {
 		return nil
 	}
+	names := []string{hosts[0].Host}
+	for _, h := range hosts[1:] {
+		if len(h.Options) > 0 {
+			names = append(names, h.Host)
+		}
+	}
+	for _, name := range names {
+		if err := sshG(ctx, sshBinary, path, name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func sshG(ctx context.Context, sshBinary, path, host string) error {
 	if sshBinary == "" {
 		sshBinary = "ssh"
 	}
 	vctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(vctx, sshBinary, "-G", "-F", path, hosts[0].Host)
+	cmd := exec.CommandContext(vctx, sshBinary, "-G", "-F", path, host)
 	cmd.Env = append(os.Environ(), "SSH_AUTH_SOCK=")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -255,19 +273,21 @@ func validateWithSSH(ctx context.Context, sshBinary, path string, hosts []sshHos
 		if len(msg) > 400 {
 			msg = msg[:400]
 		}
-		return fmt.Errorf("ssh -G rejected generated config: %v: %s", err, msg)
+		return fmt.Errorf("ssh -G rejected generated config for %s: %v: %s", host, err, msg)
 	}
 	return nil
 }
 
 // installSSHConfig renders hosts, validates the candidate with ssh -G in the
 // destination directory, then atomically replaces the previous file.
-// optionsDropped is set when the last install had to remove per-host
-// options to pass ssh -G (logged by the caller).
-var optionsDropped bool
+// If validation fails, each host's options are checked on their own and
+// only the hosts whose options OpenSSH rejects lose them (daybreak P1-4,
+// round 3 P3-C); everyone else keeps their legacy algorithm overrides.
+// droppedOptions lists those hosts (logged by the caller).
+var droppedOptions []string
 
 func installSSHConfig(ctx context.Context, sshBinary, outFile string, hosts []sshHost) error {
-	optionsDropped = false
+	droppedOptions = nil
 	outFile = expandHome(outFile)
 	content := []byte(renderSSHConfig(hosts))
 	if prev, err := os.ReadFile(outFile); err == nil && string(prev) == string(content) {
@@ -291,26 +311,32 @@ func installSSHConfig(ctx context.Context, sshBinary, outFile string, hosts []ss
 		return err
 	}
 	if err := validateWithSSH(ctx, sshBinary, tmpName, hosts); err != nil {
-		// One host's options must not freeze the whole fleet (daybreak
-		// P1-4): retry with every host's target-supplied options removed.
-		// If that validates, install it; hosts lose only their legacy
-		// algorithm overrides until the server sends valid ones.
-		stripped := make([]sshHost, len(hosts))
-		for i, h := range hosts {
-			h.Options = nil
-			stripped[i] = h
-		}
 		if !hostsHaveOptions(hosts) {
 			return err
 		}
-		content = []byte(renderSSHConfig(stripped))
+		fixed := make([]sshHost, len(hosts))
+		copy(fixed, hosts)
+		for i, h := range fixed {
+			if len(h.Options) == 0 {
+				continue
+			}
+			// This host alone, with its options.
+			single := []byte(renderSSHConfig([]sshHost{h}))
+			if werr := os.WriteFile(tmpName, single, 0o600); werr != nil {
+				return werr
+			}
+			if sshG(ctx, sshBinary, tmpName, h.Host) != nil {
+				fixed[i].Options = nil
+				droppedOptions = append(droppedOptions, h.Host)
+			}
+		}
+		content = []byte(renderSSHConfig(fixed))
 		if werr := os.WriteFile(tmpName, content, 0o600); werr != nil {
 			return werr
 		}
-		if err2 := validateWithSSH(ctx, sshBinary, tmpName, stripped); err2 != nil {
-			return fmt.Errorf("%v; and without per-host options: %w", err, err2)
+		if err2 := validateWithSSH(ctx, sshBinary, tmpName, fixed); err2 != nil {
+			return fmt.Errorf("%v; and after removing rejected per-host options: %w", err, err2)
 		}
-		optionsDropped = true
 	}
 	return writeAtomic(outFile, content, 0o600)
 }

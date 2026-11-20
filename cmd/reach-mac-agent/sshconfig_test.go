@@ -108,8 +108,8 @@ func TestBadHostOptionsDoNotFreezeFleet(t *testing.T) {
 	if !strings.Contains(string(b), "Host new-box") || strings.Contains(string(b), "bogus-cipher") {
 		t.Fatalf("unexpected config:\n%s", b)
 	}
-	if !optionsDropped {
-		t.Fatal("dropping options was not reported")
+	if len(droppedOptions) != 1 || droppedOptions[0] != "evil-box" {
+		t.Fatalf("dropped options reported for %v", droppedOptions)
 	}
 	if matches, _ := filepath.Glob(filepath.Join(dir, ".reach-validate-*")); len(matches) != 0 {
 		t.Fatalf("validation temp file left behind: %v", matches)
@@ -218,5 +218,58 @@ func TestMacRejectsEveryServerReservedAlias(t *testing.T) {
 	}
 	if err := validateHost(goodHost()); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Daybreak round 3 P3-C: a bad option on one host must not strip the valid
+// legacy options of another host.
+func TestBadOptionsOnlyAffectTheirHost(t *testing.T) {
+	sshBin := requireSSH(t)
+	out := filepath.Join(t.TempDir(), "reach-tunnels.conf")
+	legacy := goodHost()
+	legacy.Host = "old-box"
+	legacy.HostKeyAlias = "reach-m_old001"
+	legacy.Options = [][2]string{{"KexAlgorithms", "+diffie-hellman-group14-sha1"}}
+	bad := goodHost()
+	bad.Host = "evil-box"
+	bad.HostKeyAlias = "reach-m_evil01"
+	bad.Options = [][2]string{{"Ciphers", "bogus-cipher-xyz"}}
+	if err := installSSHConfig(context.Background(), sshBin, out, []sshHost{goodHost(), legacy, bad}); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(out)
+	if !strings.Contains(string(b), "diffie-hellman-group14-sha1") {
+		t.Fatalf("valid legacy option of another host was dropped:\n%s", b)
+	}
+	if strings.Contains(string(b), "bogus-cipher") {
+		t.Fatalf("bad option installed:\n%s", b)
+	}
+	if len(droppedOptions) != 1 || droppedOptions[0] != "evil-box" {
+		t.Fatalf("droppedOptions = %v", droppedOptions)
+	}
+}
+
+// Daybreak round 3 P3-B: aliases the hub reserves (reserved_slugs, its
+// ProxyJump alias) are honoured by the Mac without local configuration.
+func TestSyncHonoursServerReservedHosts(t *testing.T) {
+	sshBin := requireSSH(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/admin/ssh-config.json" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = io.WriteString(w, `{"schema":1,"reserved_hosts":["office-*"],"hosts":[
+			{"host":"jack","hostname":"localhost","port":9210,"user":"arthur","proxy_jump":"jason-public","host_key_alias":"reach-m_abc123","machine_id":"m_abc123","observed_state":"offline"},
+			{"host":"office-nas","hostname":"localhost","port":9211,"user":"root","proxy_jump":"jason-public","host_key_alias":"reach-m_off001","machine_id":"m_off001","observed_state":"online"}]}`)
+	}))
+	defer server.Close()
+	out := filepath.Join(t.TempDir(), "reach.conf")
+	agent := Agent{cfg: Config{APIURL: server.URL, Token: "t", OutFile: out, SSHBinary: sshBin}, log: log.New(io.Discard, "", 0)}
+	if err := agent.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(out)
+	if !strings.Contains(string(b), "Host jack\n") || strings.Contains(string(b), "office-nas") {
+		t.Fatalf("server-reserved alias written:\n%s", b)
 	}
 }

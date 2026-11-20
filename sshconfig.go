@@ -44,6 +44,12 @@ type SSHHost struct {
 type SSHConfigDocument struct {
 	Schema int       `json:"schema"`
 	Hosts  []SSHHost `json:"hosts"`
+	// ReservedHosts are this hub's extra reserved alias patterns
+	// (reserved_slugs plus the ProxyJump alias). reach-mac-agent unions them
+	// with the built-in list and its own reserved_hosts, so the two sides
+	// cannot drift (daybreak round 3 P3-B). Older agents reject unknown
+	// fields, so this is only sent when non-empty.
+	ReservedHosts []string `json:"reserved_hosts,omitempty"`
 }
 
 // sshClientOptionAllowlist names the only directives an agent may contribute
@@ -242,5 +248,10 @@ func (s *Server) handleSSHConfigJSON(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "could not generate ssh config")
 		return
 	}
-	writeJSON(w, 200, SSHConfigDocument{Schema: sshConfigSchema, Hosts: hosts})
+	doc := SSHConfigDocument{Schema: sshConfigSchema, Hosts: hosts}
+	doc.ReservedHosts = append(doc.ReservedHosts, s.cfg.ReservedSlugs...)
+	if a := strings.TrimSpace(s.cfg.DefaultHub.ProxyJumpAlias); a != "" {
+		doc.ReservedHosts = append(doc.ReservedHosts, a)
+	}
+	writeJSON(w, 200, doc)
 }

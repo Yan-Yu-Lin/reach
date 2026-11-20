@@ -369,11 +369,14 @@ func (a Agent) Sync(ctx context.Context) error {
 	}
 	syncCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	hosts, err := a.fetchHosts(syncCtx)
+	hosts, serverReserved, err := a.fetchHosts(syncCtx)
 	if err != nil {
 		return err
 	}
-	valid, rejected := sanitizeHosts(hosts, a.cfg.ReservedHosts...)
+	// Union of the built-in list, the hub's reserved aliases and the
+	// local reserved_hosts (daybreak round 3 P3-B).
+	extra := append(append([]string{}, a.cfg.ReservedHosts...), serverReserved...)
+	valid, rejected := sanitizeHosts(hosts, extra...)
 	for _, e := range rejected {
 		a.log.Printf("skipping host from server: %v", e)
 	}
@@ -385,8 +388,8 @@ func (a Agent) Sync(ctx context.Context) error {
 			return err
 		}
 	}
-	if optionsDropped {
-		a.log.Printf("warning: ssh rejected per-host algorithm options from the server; installed config without them")
+	if len(droppedOptions) > 0 {
+		a.log.Printf("warning: ssh rejected the server's algorithm options for %s; installed those hosts without them", strings.Join(droppedOptions, ", "))
 	}
 	a.log.Printf("synced %s (%d hosts)", a.cfg.OutFile, len(valid))
 	return nil
@@ -394,26 +397,27 @@ func (a Agent) Sync(ctx context.Context) error {
 
 // fetchHosts prefers the structured endpoint and falls back to strictly
 // parsing the legacy text endpoint when talking to an older reachd.
-func (a Agent) fetchHosts(ctx context.Context) ([]sshHost, error) {
+func (a Agent) fetchHosts(ctx context.Context) ([]sshHost, []string, error) {
 	base := strings.TrimRight(a.cfg.APIURL, "/")
 	body, status, err := a.get(ctx, base+"/api/admin/ssh-config.json")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if status/100 == 2 {
 		return parseSSHConfigJSON(body)
 	}
 	if status != http.StatusNotFound {
-		return nil, fmt.Errorf("ssh-config.json returned %d: %s", status, strings.TrimSpace(string(body)))
+		return nil, nil, fmt.Errorf("ssh-config.json returned %d: %s", status, strings.TrimSpace(string(body)))
 	}
 	body, status, err = a.get(ctx, base+"/api/admin/ssh-config")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if status/100 != 2 {
-		return nil, fmt.Errorf("ssh-config returned %d: %s", status, strings.TrimSpace(string(body)))
+		return nil, nil, fmt.Errorf("ssh-config returned %d: %s", status, strings.TrimSpace(string(body)))
 	}
-	return parseLegacySSHConfig(body)
+	hosts, err := parseLegacySSHConfig(body)
+	return hosts, nil, err
 }
 
 func (a Agent) get(ctx context.Context, url string) ([]byte, int, error) {
