@@ -68,7 +68,7 @@ func TestTransportDialerDirectAndWebSocket(t *testing.T) {
 	wsHost, wsPortText, _ := net.SplitHostPort(wsListen)
 	wsPort, _ := strconv.Atoi(wsPortText)
 	go func() {
-		_ = wscarrier.Serve(ctx, wsListen, sshTarget, log.New(io.Discard, "", 0))
+		_ = wscarrier.ServeAnyPathForTests(ctx, wsListen, sshTarget, log.New(io.Discard, "", 0))
 	}()
 	waitTCP(t, wsListen)
 	d.cfg.Tunnel.HubHost = wsHost

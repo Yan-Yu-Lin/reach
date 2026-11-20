@@ -10,12 +10,14 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -193,8 +195,37 @@ func remoteIP(r *http.Request) string {
 }
 
 // Serve accepts WebSocket connections and pipes each one to targetAddr.
-func Serve(ctx context.Context, listenAddr, targetAddr string, logger *log.Logger) error {
+// ServeAnyPathForTests serves without a path gate. Tests only: production
+// entry points go through RunServerCLI, which requires a path.
+func ServeAnyPathForTests(ctx context.Context, listenAddr, targetAddr string, logger *log.Logger) error {
 	return ServeWithOptions(ctx, listenAddr, targetAddr, logger, ServerOptions{})
+}
+
+// ErrNoPathPrefix: a production carrier must be given its exact path.
+var ErrNoPathPrefix = errors.New("refusing to start without --path-prefix or REACH_WS_PATH_PREFIX (use --allow-any-path for development)")
+
+// RunServerCLI parses the carrier server flags and starts it. It is the
+// single startup path for every production entry point (reach-ws-carrier
+// server, reachd ws-server), so the mandatory path gate cannot be skipped
+// by picking another binary (astra R2-13).
+func RunServerCLI(ctx context.Context, name string, args []string, logger *log.Logger) error {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	listen := fs.String("listen", "127.0.0.1:9401", "listen address")
+	target := fs.String("target", "127.0.0.1:22", "target TCP address")
+	pathPrefix := fs.String("path-prefix", os.Getenv("REACH_WS_PATH_PREFIX"), "only accept this exact URL path (default from REACH_WS_PATH_PREFIX; keep it out of argv)")
+	maxConns := fs.Int("max-conns", 64, "global concurrent connection limit")
+	maxPerIP := fs.Int("max-conns-per-ip", 8, "concurrent connections per client IP")
+	idle := fs.Duration("idle-timeout", 10*time.Minute, "close carried connections idle this long")
+	allowAnyPath := fs.Bool("allow-any-path", false, "start without --path-prefix (development only)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	// Fail closed: without the path the carrier hands raw sshd to any
+	// WebSocket client that reaches it (daybreak P2-11).
+	if strings.TrimSpace(*pathPrefix) == "" && !*allowAnyPath {
+		return ErrNoPathPrefix
+	}
+	return ServeWithOptions(ctx, *listen, *target, logger, ServerOptions{PathPrefix: *pathPrefix, MaxConns: *maxConns, MaxConnsPerIP: *maxPerIP, IdleTimeout: *idle})
 }
 
 // NewHandler returns the carrier HTTP handler (exported for tests).

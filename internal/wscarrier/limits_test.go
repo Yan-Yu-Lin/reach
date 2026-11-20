@@ -2,6 +2,8 @@ package wscarrier
 
 import (
 	"bufio"
+	"context"
+	"errors"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -171,5 +173,16 @@ func TestAgentPathMatchesExactCarrierPath(t *testing.T) {
 		if code != http.StatusSwitchingProtocols {
 			t.Fatalf("prefix %q: agent path %q got %d", prefix, u.Path, code)
 		}
+	}
+}
+
+// Astra R2-13: every production entry point refuses to start without a
+// path. RunServerCLI is shared by reach-ws-carrier server and reachd
+// ws-server.
+func TestRunServerCLIRequiresPath(t *testing.T) {
+	t.Setenv("REACH_WS_PATH_PREFIX", "")
+	err := RunServerCLI(context.Background(), "ws-server", []string{"--listen", "127.0.0.1:0"}, log.New(io.Discard, "", 0))
+	if !errors.Is(err, ErrNoPathPrefix) {
+		t.Fatalf("err = %v", err)
 	}
 }

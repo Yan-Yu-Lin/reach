@@ -490,16 +490,30 @@ server {
 Optional WebSocket carrier reverse proxy:
 
 ```nginx
-location /ws/tunnel/<long-random-secret>/ {
-    proxy_pass http://127.0.0.1:9401/;
+location = /ws/tunnel/<long-random-secret>/ {
+    # No URI after the port: nginx must pass the original path through.
+    # "proxy_pass http://127.0.0.1:9401/;" rewrites it to "/", and the
+    # carrier, which accepts only its exact configured path, answers 404.
+    proxy_pass http://127.0.0.1:9401;
     proxy_http_version 1.1;
     proxy_set_header Upgrade $http_upgrade;
     proxy_set_header Connection "upgrade";
     proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
 }
 ```
 
-The carrier path is effectively a shared secret in the current implementation. Use a high-entropy path and TLS.
+The carrier path is a fleet-wide shared secret in the current implementation (see `docs/design/2026-11-21-carrier-credentials.md`). Use a high-entropy path and TLS. `deploy/nginx/reach-tunnels.conf` has the full route with connection limits.
+
+After changing nginx or the carrier, check through the real proxy that the upgrade succeeds (expect `101`), without putting the secret in shell history:
+
+```bash
+read -r -s -p "carrier path: " WS_PATH; echo
+curl -s -o /dev/null -w '%{http_code}\n' --http1.1 \
+  -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+  -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+  --max-time 5 "https://<your-host>$WS_PATH"   # prints 101, then curl times out
+```
 
 ### 7. Optional WebSocket carrier service
 
@@ -512,12 +526,24 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+User=reach-wstunnel
+Group=reach-wstunnel
+# REACH_WS_PATH_PREFIX=/ws/tunnel/<long-random-secret>/  (kept out of argv)
+EnvironmentFile=/etc/reach/ws-carrier.env
 ExecStart=/opt/reach/reach-ws-carrier server --listen 127.0.0.1:9401 --target 127.0.0.1:22
 Restart=always
 RestartSec=5
+NoNewPrivileges=yes
 
 [Install]
 WantedBy=multi-user.target
+```
+
+The carrier refuses to start without its path (`REACH_WS_PATH_PREFIX` or `--path-prefix`) and then accepts only that exact path; `reachd ws-server` behaves the same. Create the env file from `websocket_tunnel.path_prefix` in `/etc/reach/config.yaml`, normalised to start and end with `/` (`scripts/deploy-jason.sh` does this on deploy):
+
+```bash
+printf 'REACH_WS_PATH_PREFIX=%s\n' '/ws/tunnel/<long-random-secret>/' \
+  | sudo install -m 0640 -o root -g reach-wstunnel /dev/stdin /etc/reach/ws-carrier.env
 ```
 
 Enable it only if you configure `websocket_tunnel` in `/etc/reach/config.yaml`.

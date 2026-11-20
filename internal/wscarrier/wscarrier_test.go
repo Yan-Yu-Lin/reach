@@ -62,7 +62,7 @@ func TestCarrierEcho(t *testing.T) {
 	wsAddr := wsLn.Addr().String()
 	_ = wsLn.Close()
 	go func() {
-		_ = Serve(ctx, wsAddr, echoLn.Addr().String(), log.New(io.Discard, "", 0))
+		_ = ServeAnyPathForTests(ctx, wsAddr, echoLn.Addr().String(), log.New(io.Discard, "", 0))
 	}()
 	time.Sleep(100 * time.Millisecond)
 	inR, inW := io.Pipe()

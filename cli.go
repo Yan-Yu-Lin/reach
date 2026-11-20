@@ -53,14 +53,9 @@ func runCLI(ctx context.Context, args []string) error {
 	}
 }
 
+// cliWSServer: same flags, path gate and limits as reach-ws-carrier server.
 func cliWSServer(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("ws-server", flag.ContinueOnError)
-	listen := fs.String("listen", "127.0.0.1:9401", "listen address")
-	target := fs.String("target", "127.0.0.1:22", "target TCP address")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	return wscarrier.Serve(ctx, *listen, *target, nil)
+	return wscarrier.RunServerCLI(ctx, "ws-server", args, log.Default())
 }
 
 func baseFS(name string, args []string) (*flag.FlagSet, *string) {
