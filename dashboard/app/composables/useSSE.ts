@@ -1,4 +1,4 @@
-import { currentAppPath, loginLocation } from '~/utils/auth'
+import { goToLoginOnce } from '~/composables/useReachApi'
 import { createSSEParser, reconnectDelay } from '~/utils/sse'
 
 export type SSEStatus = 'connecting' | 'live' | 'reconnecting' | 'stale'
@@ -55,7 +55,7 @@ async function connect(token: string, apiBase: string, connectionGeneration: num
     })
 
     if (res.status === 401) {
-      await handleSSEUnauthorized()
+      await handleSSEUnauthorized(token, connectionGeneration)
       return
     }
     if (!res.ok || !res.body) throw new Error(`Event stream failed (${res.status})`)
@@ -115,13 +115,13 @@ function stopSSEConnection() {
   clearTimer()
 }
 
-async function handleSSEUnauthorized() {
+async function handleSSEUnauthorized(sentWith: string, connectionGeneration: number) {
+  // A stream that was already replaced (stop/start since) has nothing to say any more.
+  if (connectionGeneration !== generation) return
   stopSSEConnection()
   const api = useReachApi()
-  api.signOutLocally()
-  if (import.meta.client) {
-    await navigateTo(loginLocation(currentAppPath(), 'session-expired'))
-  }
+  // Only end the session this stream was opened with (astra R2-01).
+  if (api.signOutLocally(sentWith, 'expired') && import.meta.client) await goToLoginOnce()
 }
 
 function scheduleReconnect(token: string, apiBase: string, connectionGeneration: number) {

@@ -17,6 +17,12 @@ function sessionExpiredLocation() {
   return loginLocation(currentAppPath(), 'session-expired')
 }
 
+/** Go to the login page unless we are already there (keeps the first saved `next`). */
+export async function goToLoginOnce() {
+  if (typeof window !== 'undefined' && window.location.pathname === '/login') return
+  await navigateTo(sessionExpiredLocation())
+}
+
 export type ProcessTitleConfig = {
   process_title?: string
   process_titles?: string[]
@@ -122,6 +128,35 @@ const TOKEN_KEY = 'reach-token'
 /** localStorage key whose change tells other tabs "signed out here, sign out too". */
 export const SIGNOUT_KEY = 'reach-signout'
 
+/**
+ * Short non-secret fingerprint of a token (FNV-1a), so a sign-out broadcast can say WHICH
+ * session ended without putting the token itself into the message.
+ */
+export function tokenFingerprint(t: string | null | undefined): string {
+  if (!t) return ''
+  let h = 0x811c9dc5
+  for (let i = 0; i < t.length; i++) {
+    h ^= t.charCodeAt(i)
+    h = Math.imul(h, 0x01000193)
+  }
+  return (h >>> 0).toString(36)
+}
+
+/**
+ * all:     the user signed out on purpose (Sign out, Sign out everywhere): every tab leaves.
+ * expired: the server rejected token `fp`: only tabs still holding that same token leave.
+ */
+export type SignOutBroadcast = { at: number; reason: 'all' | 'expired'; fp: string }
+
+export function parseSignOutBroadcast(raw: string | null): SignOutBroadcast | null {
+  if (!raw) return null
+  try {
+    const v = JSON.parse(raw)
+    if (v && (v.reason === 'all' || v.reason === 'expired') && typeof v.fp === 'string') return v
+  } catch { /* older format: a bare timestamp */ }
+  return { at: Number(raw) || 0, reason: 'all', fp: '' }
+}
+
 function readStoredToken(): string | null {
   // Session storage first: a "don't remember" login must win over an old remembered one.
   return sessionStorage.getItem(TOKEN_KEY) || localStorage.getItem(TOKEN_KEY)
@@ -149,18 +184,36 @@ export function useReachApi() {
     if (next) (remember ? localStorage : sessionStorage).setItem(TOKEN_KEY, next)
   }
 
-  /** Forget the token here and tell other open tabs of this browser to do the same. */
-  function signOutLocally() {
+  /**
+   * Forget the session here and tell the other tabs of this browser.
+   *
+   * `sentWith` is the token the failed/finished operation used. If the user has signed in
+   * again since then (token changed), the result is about an old session: nothing is
+   * cleared and false is returned (astra R2-01). Pass `undefined` only for an explicit
+   * sign-out of whatever session is current.
+   */
+  function signOutLocally(sentWith?: string | null, reason: SignOutBroadcast['reason'] = 'all'): boolean {
+    if (sentWith !== undefined && token.value !== sentWith) return false
+    const fp = tokenFingerprint(token.value)
     setToken(null)
     if (import.meta.client) {
-      try { localStorage.setItem(SIGNOUT_KEY, String(Date.now())) } catch { /* private mode */ }
+      const msg: SignOutBroadcast = { at: Date.now(), reason, fp }
+      try { localStorage.setItem(SIGNOUT_KEY, JSON.stringify(msg)) } catch { /* private mode */ }
     }
+    return true
+  }
+
+  /** The token currently in use (to remember what an operation was sent with). */
+  function currentToken() {
+    return token.value
   }
 
   async function request<T>(path: string, opts: RequestInit & { skipAuthRedirect?: boolean } = {}): Promise<T> {
     const headers = new Headers(opts.headers || {})
     if (!headers.has('Content-Type') && opts.body) headers.set('Content-Type', 'application/json')
-    if (token.value) headers.set('Authorization', `Bearer ${token.value}`)
+    // Remember which session this request belongs to; a 401 only ends THAT session.
+    const sentWith = token.value
+    if (sentWith) headers.set('Authorization', `Bearer ${sentWith}`)
 
     const timeoutController = new AbortController()
     const timeout = setTimeout(() => timeoutController.abort(), 15_000)
@@ -193,8 +246,9 @@ export function useReachApi() {
       const msg = body && typeof body === 'object' && body.error ? body.error : text || res.statusText
       const err = new ReachApiError(msg, res.status, body)
       if (res.status === 401 && path !== '/admin/login' && !opts.skipAuthRedirect) {
-        signOutLocally()
-        if (import.meta.client) await navigateTo(sessionExpiredLocation())
+        // A late 401 for a session that has already been replaced (signed in again) or
+        // already ended must not sign out the new one or rewrite the saved return path.
+        if (signOutLocally(sentWith, 'expired') && import.meta.client) await goToLoginOnce()
       }
       throw err
     }
@@ -214,6 +268,7 @@ export function useReachApi() {
     token,
     setToken,
     signOutLocally,
+    currentToken,
     login,
     logout: () => request<{ ok: boolean }>('/admin/logout', { method: 'POST' }),
     /** Invalidates every dashboard login (and optionally Mac service tokens). Newer servers only. */

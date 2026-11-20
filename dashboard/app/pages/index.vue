@@ -277,8 +277,7 @@ import { setupCommand, websocketSetupCommand, windowsSetupCommand } from '~/util
 import { requestSlug, requestWarnings } from '~/utils/requests'
 import { STATUS_LABEL, type UiStatus } from '~/utils/status'
 import { mapSettledLimited } from '~/utils/concurrency'
-import { currentAppPath, loginLocation } from '~/utils/auth'
-import { SIGNOUT_KEY } from '~/composables/useReachApi'
+import { goToLoginOnce, parseSignOutBroadcast, SIGNOUT_KEY, tokenFingerprint } from '~/composables/useReachApi'
 
 type Tab = 'machines' | 'requests' | 'settings'
 type Dialog =
@@ -508,27 +507,38 @@ function bulkDisable(shownIds: string[]) {
 
 // Only a 2xx means the server revoked anything (daybreak P3-5). A 401 means this login was
 // already invalid and the handler never ran: sign in again and confirm again.
+//
+// The answer can arrive late: the server may already have closed our stream, the stream's
+// 401 sent us to the login page, and the user may have signed in again. Every branch below
+// only acts if the session the request was sent with is still the current one (astra R2-01).
 async function revokeAll() {
+  const sentWith = api.currentToken()
   await withDialog(async () => {
     try {
       await api.revokeAllSessions(false)
     } catch (e: any) {
+      if (api.currentToken() !== sentWith) return
       if (e?.status === 404) {
         toast.error('This hub version cannot do that yet. Update reachd first.')
         return
       }
       if (e?.status === 401) {
         fleet.dispose()
-        api.signOutLocally()
+        api.signOutLocally(sentWith, 'expired')
         await navigateTo({ path: '/login', query: { then: 'revoke-all' } })
         return
       }
       toast.error(`Sign out everywhere failed: ${e?.message || 'unknown error'}. Nothing was revoked.`)
       return
     }
-    fleet.dispose()
-    api.signOutLocally()
-    await navigateTo({ path: '/login', query: { reason: 'signed-out-everywhere' } })
+    if (api.signOutLocally(sentWith, 'all')) {
+      fleet.dispose()
+      await navigateTo({ path: '/login', query: { reason: 'signed-out-everywhere' } })
+    } else if (!api.currentToken()) {
+      // Already sent to the login page by the closed stream; say what actually happened.
+      await navigateTo({ path: '/login', query: { reason: 'signed-out-everywhere' } }, { replace: true })
+    }
+    // Otherwise the user has signed in again since: leave that new session alone.
   })
 }
 
@@ -567,18 +577,23 @@ async function enableNotifications() {
 }
 
 async function logout() {
+  const sentWith = api.currentToken()
   fleet.dispose()
   try { await api.logout() } catch { /* clear locally anyway */ }
-  api.signOutLocally()
-  navigateTo('/login')
+  if (api.signOutLocally(sentWith, 'all')) navigateTo('/login')
 }
 
-// Another tab of this browser signed out (or revoked everything): leave too.
+// Another tab of this browser signed out. An explicit sign-out ends every tab; a rejected
+// (expired/revoked) token only ends tabs that still hold that same token, so a tab that
+// signed in on its own keeps working (astra R2-01).
 function onStorage(e: StorageEvent) {
-  if (e.key !== SIGNOUT_KEY || !e.newValue) return
+  if (e.key !== SIGNOUT_KEY) return
+  const msg = parseSignOutBroadcast(e.newValue)
+  if (!msg || !api.currentToken()) return
+  if (msg.reason === 'expired' && msg.fp !== tokenFingerprint(api.currentToken())) return
   fleet.dispose()
   api.setToken(null)
-  navigateTo(loginLocation(currentAppPath(), 'session-expired'))
+  void goToLoginOnce()
 }
 
 // ---- keyboard (desktop)

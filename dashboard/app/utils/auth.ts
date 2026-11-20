@@ -34,6 +34,10 @@ export function safeReturnPath(raw: unknown): string {
     return '/'
   }
   if (url.origin !== 'https://reach.invalid') return '/'
+  // Normalisation can turn encoded dot-segments into a protocol-relative path
+  // ('/%2e%2e//evil.example' -> '//evil.example'); check the result, not just the input
+  // (astra R2-04).
+  if (url.pathname.startsWith('//') || url.pathname.startsWith('/\\')) return '/'
   if (url.pathname === '/login' || url.pathname.startsWith('/login/')) return '/'
   return `${url.pathname}${url.search}${url.hash}`
 }
