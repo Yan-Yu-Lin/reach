@@ -6,9 +6,34 @@ import (
 	"io"
 	"log"
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
+
+// lockedBuffer is written by the client goroutine and polled by the test.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) Len() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Len()
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
 
 func TestCarrierEcho(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -41,7 +66,7 @@ func TestCarrierEcho(t *testing.T) {
 	}()
 	time.Sleep(100 * time.Millisecond)
 	inR, inW := io.Pipe()
-	var out bytes.Buffer
+	var out lockedBuffer
 	errCh := make(chan error, 1)
 	go func() { errCh <- Client(ctx, "ws://"+wsAddr, "/secret", inR, &out) }()
 	msg := []byte("hello over websocket")
