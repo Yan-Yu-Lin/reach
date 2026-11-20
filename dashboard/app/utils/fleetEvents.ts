@@ -18,6 +18,8 @@ export type MachinePatch = {
   observed_state?: string
   status?: string
   probe_state?: string
+  /** Server's stored probe time (health_changed on 2026-11-21+ servers). */
+  last_probe_at?: string
 }
 
 /** When the machine open in the detail view should be re-fetched after a patch. */
@@ -30,7 +32,14 @@ export type FleetEventPlan =
   | { kind: 'requests'; notifyPending: boolean }
   | { kind: 'machine'; machineId: string }
   /** Apply locally, then re-fetch the machine if its detail is open. */
-  | { kind: 'patch'; machineId: string; patch: MachinePatch; refetchIfSelected: SelectedRefetch }
+  | {
+    kind: 'patch'
+    machineId: string
+    patch: MachinePatch
+    refetchIfSelected: SelectedRefetch
+    /** The event lacks the server time needed to judge it; ask the server for this machine. */
+    needsAuthoritative?: boolean
+  }
   /** Only matters for the detail view (e.g. agent command results). */
   | { kind: 'detail'; machineId: string }
 
@@ -92,9 +101,21 @@ export function planFleetEvent(event: string, rawData: unknown): FleetEventPlan 
       const probe = str(data.probe_state)
       if (observed) patch.observed_state = observed
       if (status) patch.status = status
-      if (probe) patch.probe_state = probe
+      // observed_changed on 2026-11-21+ servers names the heartbeat behind it, so a replayed
+      // old state change cannot roll back a newer one (applyPatch ignores older heartbeats).
+      const hbAt = event === 'machine.observed_changed' ? str(data.heartbeat_at) : undefined
+      if (hbAt) patch.heartbeat_at = hbAt
+      if (probe) {
+        patch.probe_state = probe
+        const probeAt = str(data.last_probe_at)
+        if (probeAt) patch.last_probe_at = probeAt
+      }
       if (!observed && !status) return { kind: 'machine', machineId }
-      return { kind: 'patch', machineId, patch, refetchIfSelected: 'now' }
+      // A probe result without its server time (older reachd, or a never-probed machine)
+      // cannot be dated: keep the stored time and fetch the authoritative row (R2-03).
+      // NOT inferred from the SSE id: live durable events have ids too.
+      const needsAuthoritative = !!probe && !patch.last_probe_at
+      return { kind: 'patch', machineId, patch, refetchIfSelected: 'now', ...(needsAuthoritative ? { needsAuthoritative } : {}) }
     }
     return { kind: 'machine', machineId }
   }

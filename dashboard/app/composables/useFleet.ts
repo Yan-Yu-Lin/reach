@@ -99,7 +99,7 @@ export function useFleet() {
   const selectedMachine = computed(() => (selectedId.value && byId.get(selectedId.value)) || null)
 
   function replaySince(mark: number, id?: string) {
-    for (const e of patchLog.patchesSince(mark, id)) applyPatch(byId, e.id, e.patch, e.receivedAt)
+    for (const e of patchLog.patchesSince(mark, id)) applyPatch(byId, e.id, e.patch)
   }
 
   async function loadPendingLane() {
@@ -117,6 +117,12 @@ export function useFleet() {
     const { token, mark } = patchLog.begin()
     try {
       const snapshot = await api.machines()
+      if (!patchLog.valid(token)) {
+        // Too many events arrived while this read was in flight to replay them safely:
+        // the response is stale, read again.
+        void refreshCoordinator.requestFull().catch(() => {})
+        return true
+      }
       const touched = patchLog.touchedSince(mark)
       applySnapshot(byId, snapshot || [], touched)
       replaySince(mark)
@@ -139,6 +145,10 @@ export function useFleet() {
     const { token, mark } = patchLog.begin()
     try {
       const results = await mapSettledLimited(ids, machineRefreshConcurrency, id => api.machine(id))
+      if (!patchLog.valid(token)) {
+        void refreshCoordinator.requestFull().catch(() => {})
+        return
+      }
       let failures = 0
       results.forEach((r, i) => {
         const id = ids[i]!
@@ -242,6 +252,9 @@ export function useFleet() {
       case 'patch': {
         recordMachineEvent(plan.machineId, plan.patch)
         const result = applyPatch(byId, plan.machineId, plan.patch)
+        if (plan.needsAuthoritative && result !== 'missing' && loaded.value) {
+          void refreshCoordinator.requestMachine(plan.machineId).catch(() => {})
+        }
         if (result === 'missing') {
           // Before the first snapshot every machine is "missing"; that snapshot is coming
           // (hello requested it) and this patch is replayed on top of it, so no GET.

@@ -42,12 +42,30 @@ describe('planFleetEvent', () => {
   })
 
   it('patches state changes and only re-fetches the open machine', () => {
-    expect(planFleetEvent('machine.health_changed', { machine_id: 'm-1', observed_state: 'degraded', status: 'degraded', probe_state: 'unreachable' })).toEqual({
+    expect(planFleetEvent('machine.health_changed', { machine_id: 'm-1', observed_state: 'degraded', status: 'degraded', probe_state: 'unreachable', last_probe_at: '2026-11-21T00:00:00Z', event_at: '2026-11-21T00:00:00Z' })).toEqual({
       kind: 'patch',
       machineId: 'm-1',
-      patch: { observed_state: 'degraded', status: 'degraded', probe_state: 'unreachable' },
+      patch: { observed_state: 'degraded', status: 'degraded', probe_state: 'unreachable', last_probe_at: '2026-11-21T00:00:00Z' },
       refetchIfSelected: 'now',
     })
+  })
+
+  it('dates observed_changed by its heartbeat on newer servers', () => {
+    expect(planFleetEvent('machine.observed_changed', { machine_id: 'm-1', observed_state: 'offline', status: 'offline', heartbeat_at: '2026-11-19T00:00:00Z', event_at: '2026-11-19T00:05:00Z' })).toMatchObject({
+      kind: 'patch',
+      patch: { observed_state: 'offline', status: 'offline', heartbeat_at: '2026-11-19T00:00:00Z' },
+    })
+  })
+
+  it('asks the server when a probe result has no server time (R2-03, older reachd)', () => {
+    for (const lastProbeAt of [undefined, '']) {
+      expect(planFleetEvent('machine.health_changed', { machine_id: 'm-1', observed_state: 'online', status: 'online', probe_state: 'reachable', last_probe_at: lastProbeAt })).toMatchObject({
+        kind: 'patch',
+        needsAuthoritative: true,
+      })
+    }
+    // observed_changed carries no probe result: nothing to date, no extra fetch
+    expect(planFleetEvent('machine.observed_changed', { machine_id: 'm-1', observed_state: 'online', status: 'online' })).not.toHaveProperty('needsAuthoritative')
   })
 
   it('ignores machine.<state> aliases that duplicate observed_changed', () => {

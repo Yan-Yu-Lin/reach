@@ -93,7 +93,7 @@ export function upsertMachine(store: Store, raw: MachineWithTunnels): boolean {
  * Returns 'missing' when the machine is not in the store (the caller should fetch it),
  * 'applied' or 'noop'.
  */
-export function applyPatch(store: Store, id: string, patch: MachinePatch, receivedAt = new Date().toISOString()): 'missing' | 'applied' | 'noop' {
+export function applyPatch(store: Store, id: string, patch: MachinePatch): 'missing' | 'applied' | 'noop' {
   const item = store.get(id)
   if (!item) return 'missing'
   let next: MachineWithTunnels = item
@@ -117,10 +117,17 @@ export function applyPatch(store: Store, id: string, patch: MachinePatch, receiv
     next = { ...next, machine: { ...item.machine, ...machineChanges } }
   }
   if (patch.probe_state) {
-    // health_changed is sent when a probe just produced a new result: that is a fresh probe.
-    next = {
-      ...next,
-      hub_observation: { ...(item.hub_observation || {}), probe_state: patch.probe_state, last_probe_at: receivedAt },
+    // A durable health_changed can be a replay from up to 72 h ago, so the time it ARRIVED
+    // says nothing about when the probe ran (astra R2-03). Newer servers send the stored
+    // probe time; without it the existing time is kept, so an old result never looks fresh
+    // (the caller then asks the server). A probe time older than what we hold is history:
+    // it must not overwrite a newer result either.
+    const current = item.hub_observation
+    const probeAt = patch.last_probe_at
+    if (probeAt && time(probeAt) >= time(current?.last_probe_at)) {
+      next = { ...next, hub_observation: { ...(current || {}), probe_state: patch.probe_state, last_probe_at: probeAt } }
+    } else if (!probeAt && current?.probe_state !== patch.probe_state) {
+      next = { ...next, hub_observation: { ...(current || { last_probe_at: '' }), probe_state: patch.probe_state } }
     }
   }
   if (next === item) return 'noop'
@@ -128,7 +135,16 @@ export function applyPatch(store: Store, id: string, patch: MachinePatch, receiv
   return 'applied'
 }
 
-type LoggedPatch = { seq: number; id: string; patch: MachinePatch; receivedAt: string }
+type LoggedPatch = { seq: number; id: string; patch: MachinePatch }
+
+/**
+ * Hard cap on what the log keeps while requests are in flight. Normally a few dozen entries
+ * at most (requests time out after 15 s). When it is exceeded the log does NOT drop old
+ * patches (that would bring back astra F03); it marks itself overflowed, every read that
+ * was open at that moment must discard its response, and the caller schedules a fresh
+ * authoritative read instead.
+ */
+export const PATCH_LOG_LIMIT = 5_000
 
 /**
  * Sequence of SSE events and the machine patches among them, kept while any HTTP request
@@ -137,11 +153,12 @@ type LoggedPatch = { seq: number; id: string; patch: MachinePatch; receivedAt: s
  * touchedSince() lists machines any event mentioned (including ones that only triggered a
  * GET), so a snapshot does not delete them on stale evidence.
  */
-export function createPatchLog() {
+export function createPatchLog(limit = PATCH_LOG_LIMIT) {
   let seq = 0
   let entries: LoggedPatch[] = []
   let touched: Array<{ seq: number; id: string }> = []
   const open = new Map<number, number>() // token -> start seq
+  const voided = new Set<number>() // tokens whose response must be thrown away
   let nextToken = 0
 
   function prune() {
@@ -155,13 +172,22 @@ export function createPatchLog() {
     touched = touched.filter(e => e.seq > oldest)
   }
 
+  function overflow() {
+    // Every open read loses the history it would need; void them all and start empty.
+    for (const token of open.keys()) voided.add(token)
+    open.clear()
+    entries = []
+    touched = []
+  }
+
   return {
     /** Record that an event about machine `id` arrived (with its patch, if it carried one). */
-    record(id: string, patch?: MachinePatch, receivedAt = new Date().toISOString()) {
+    record(id: string, patch?: MachinePatch) {
       seq++
       if (open.size === 0) return
       touched.push({ seq, id })
-      if (patch) entries.push({ seq, id, patch, receivedAt })
+      if (patch) entries.push({ seq, id, patch })
+      if (entries.length + touched.length > limit) overflow()
     },
     /** Start of an HTTP read. Call end(token) when its response has been applied. */
     begin(): { token: number; mark: number } {
@@ -169,8 +195,13 @@ export function createPatchLog() {
       open.set(token, seq)
       return { token, mark: seq }
     },
+    /** False if the log overflowed while this read was open: discard its response. */
+    valid(token: number) {
+      return !voided.has(token)
+    },
     end(token: number) {
       open.delete(token)
+      voided.delete(token)
       prune()
     },
     patchesSince(mark: number, id?: string): LoggedPatch[] {

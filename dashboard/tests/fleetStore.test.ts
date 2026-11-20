@@ -94,7 +94,7 @@ describe('HTTP response vs newer SSE patch (astra F03)', () => {
     applyPatch(store, 'a', patch)
     const stale = item('a', '2026-11-21T00:00:00Z') // read before the patch, arrives after it
     apply(store, stale)
-    for (const e of log.patchesSince(mark, 'a')) applyPatch(store, e.id, e.patch, e.receivedAt)
+    for (const e of log.patchesSince(mark, 'a')) applyPatch(store, e.id, e.patch)
     log.end(token)
     return store.get('a')!
   }
@@ -139,5 +139,68 @@ describe('HTTP response vs newer SSE patch (astra F03)', () => {
     expect(log.size()).toBe(2)
     log.end(token)
     expect(log.size()).toBe(0)
+  })
+})
+
+describe('probe time (astra R2-03)', () => {
+  const dayAgo = '2026-11-20T00:00:00Z'
+  function withProbe(at: string, state = 'reachable') {
+    const store = new Map([['a', item('a')]])
+    store.get('a')!.hub_observation = { probe_state: state, last_probe_at: at }
+    return store
+  }
+
+  it('a replayed health event without a server time does not make an old probe look fresh', () => {
+    const store = withProbe(dayAgo, 'unreachable')
+    applyPatch(store, 'a', { observed_state: 'online', status: 'online', probe_state: 'reachable' })
+    expect(store.get('a')!.hub_observation).toEqual({ probe_state: 'reachable', last_probe_at: dayAgo })
+  })
+
+  it('uses the server probe time when the event carries one', () => {
+    const store = withProbe(dayAgo, 'unreachable')
+    applyPatch(store, 'a', { probe_state: 'reachable', last_probe_at: '2026-11-21T00:00:00Z' })
+    expect(store.get('a')!.hub_observation).toEqual({ probe_state: 'reachable', last_probe_at: '2026-11-21T00:00:00Z' })
+  })
+
+  it('an older probe result (replayed history) does not overwrite a newer one', () => {
+    const store = withProbe('2026-11-21T00:00:00Z', 'reachable')
+    applyPatch(store, 'a', { probe_state: 'unreachable', last_probe_at: dayAgo })
+    expect(store.get('a')!.hub_observation).toEqual({ probe_state: 'reachable', last_probe_at: '2026-11-21T00:00:00Z' })
+  })
+})
+
+describe('patch log capacity', () => {
+  it('voids the open reads on overflow instead of dropping old patches', () => {
+    const log = createPatchLog(10)
+    const a = log.begin()
+    const b = log.begin()
+    for (let i = 0; i < 6; i++) log.record('m', { heartbeat_at: `2026-11-21T00:00:0${i}Z` })
+    expect(log.valid(a.token)).toBe(false)
+    expect(log.valid(b.token)).toBe(false)
+    expect(log.size()).toBe(0)
+    // a read started after the overflow is fine and keeps its own history
+    const c = log.begin()
+    log.record('m', { heartbeat_at: '2026-11-21T00:01:00Z' })
+    expect(log.valid(c.token)).toBe(true)
+    expect(log.patchesSince(c.mark)).toHaveLength(1)
+    log.end(a.token); log.end(b.token); log.end(c.token)
+    expect(log.size()).toBe(0)
+  })
+
+  it('is bounded even when 200 000 events arrive during one read', () => {
+    const log = createPatchLog()
+    const r = log.begin()
+    for (let i = 0; i < 200_000; i++) log.record('m', { observed_state: 'online' })
+    expect(log.size()).toBeLessThanOrEqual(10_000)
+    expect(log.valid(r.token)).toBe(false)
+    log.end(r.token)
+  })
+})
+
+describe('replayed observed_changed (R2-03 timestamps)', () => {
+  it('an old state change replayed after a newer heartbeat does not roll state back', () => {
+    const store = new Map([['a', item('a', '2026-11-21T00:00:00Z')]])
+    expect(applyPatch(store, 'a', { observed_state: 'offline', status: 'offline', heartbeat_at: '2026-11-19T00:00:00Z' })).toBe('noop')
+    expect(store.get('a')!.machine.observed_state).toBe('online')
   })
 })
