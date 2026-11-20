@@ -71,3 +71,18 @@ func TestSyncKeysInstallsValidSubset(t *testing.T) {
 		t.Fatalf("%q", b)
 	}
 }
+
+// Astra R3-08: a desired list whose only entries are blank is not a
+// revocation; the installed key stays and the sync reports an error.
+func TestSyncKeysBlankDesiredKeysKeepFile(t *testing.T) {
+	for _, blank := range []string{"", "   "} {
+		d, auth := syncKeysFixture(t)
+		before, _ := os.ReadFile(auth)
+		if err := d.syncKeys([]DesiredPubkey{{PublicKey: blank}}, true); !errors.Is(err, errNoValidDesiredKeys) {
+			t.Fatalf("blank %q: err = %v", blank, err)
+		}
+		if after, _ := os.ReadFile(auth); string(after) != string(before) {
+			t.Fatalf("blank %q changed authorized_keys", blank)
+		}
+	}
+}

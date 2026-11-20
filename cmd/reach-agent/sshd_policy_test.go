@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 )
@@ -136,5 +137,33 @@ func TestDarwinRemoteLoginEnabled(t *testing.T) {
 		if got := darwinRemoteLoginEnabled(in); got != want {
 			t.Errorf("%q: got %v want %v", in, got, want)
 		}
+	}
+}
+
+// Astra R3-10: a Red Hat style rc4.d S-link counts as boot-enabled, like
+// every other multi-user runlevel.
+func TestSysVRunlevelDirectories(t *testing.T) {
+	for _, d := range sysvRunlevelDirs {
+		root := t.TempDir()
+		sysvRoot = root
+		if err := os.MkdirAll(root+d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("../init.d/sshd", root+d+"/S20sshd"); err != nil {
+			t.Fatal(err)
+		}
+		if !sysvBootEnabled("sshd") {
+			t.Errorf("S-link in %s not seen", d)
+		}
+	}
+	sysvRoot = ""
+	found := false
+	for _, d := range sysvRunlevelDirs {
+		if d == "/etc/rc.d/rc4.d" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("/etc/rc.d/rc4.d not checked")
 	}
 }

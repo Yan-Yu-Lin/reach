@@ -517,6 +517,14 @@ curl -s -o /dev/null -w '%{http_code}\n' --http1.1 \
 
 ### 7. Optional WebSocket carrier service
 
+The carrier runs as an unprivileged system user. Create it first (safe to
+rerun; `scripts/deploy-jason.sh` does the same):
+
+```bash
+id reach-wstunnel >/dev/null 2>&1 || \
+  sudo useradd --system --no-create-home --shell /usr/sbin/nologin reach-wstunnel
+```
+
 ```ini
 # /etc/systemd/system/reach-ws-carrier.service
 [Unit]

@@ -1257,11 +1257,15 @@ func (d *Daemon) syncKeys(keys []DesiredPubkey, enabled bool) error {
 		if d.cfg.LocalSSH.InternalSSHD {
 			supportedKeyTypes = internalSSHDSupportedKeyTypes
 		}
+		// Any non-empty desired list is a replacement request; blank or
+		// malformed entries are invalid candidates, not a revocation
+		// (astra R3-08).
+		desired = len(keys)
 		for _, k := range keys {
 			if strings.TrimSpace(k.PublicKey) == "" {
+				d.logger.Printf("skipping blank admin key from hub")
 				continue
 			}
-			desired++
 			pub, err := canonicalAdminKey(k.PublicKey)
 			if err != nil {
 				d.logger.Printf("skipping invalid admin key from hub: %v", err)

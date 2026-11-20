@@ -78,9 +78,14 @@ func defaultUnixSSHDProbe() unixSSHDProbe {
 
 // sysvBootEnabled reports whether a SysV init script starts at boot in a
 // multi-user runlevel (an S??svc link in rc2.d..rc5.d).
+// sysvRoot prefixes the rc directories (tests only).
+var sysvRoot = ""
+
+var sysvRunlevelDirs = []string{"/etc/rc2.d", "/etc/rc3.d", "/etc/rc4.d", "/etc/rc5.d", "/etc/rc.d/rc2.d", "/etc/rc.d/rc3.d", "/etc/rc.d/rc4.d", "/etc/rc.d/rc5.d"}
+
 func sysvBootEnabled(svc string) bool {
-	for _, dir := range []string{"/etc/rc2.d", "/etc/rc3.d", "/etc/rc4.d", "/etc/rc5.d", "/etc/rc.d/rc2.d", "/etc/rc.d/rc3.d", "/etc/rc.d/rc5.d"} {
-		entries, err := os.ReadDir(dir)
+	for _, dir := range sysvRunlevelDirs {
+		entries, err := os.ReadDir(sysvRoot + dir)
 		if err != nil {
 			continue
 		}

@@ -75,6 +75,25 @@ function Add-ReachOpenSSHPath {
   }
 }
 
+# Test-ReachOpenSSHPolicy: read-only check of the host sshd policy. Returns
+# an error message when a system install would be refused, or '' when it
+# may proceed. Changes nothing, so it can run before any uninstall
+# (astra R3-09).
+function Test-ReachOpenSSHPolicy {
+  $svc = Get-Service -Name sshd -ErrorAction SilentlyContinue
+  if (-not $svc) {
+    if (-not $InstallOpenSSH) {
+      return "Windows OpenSSH Server is not installed. Installing it opens port 22 on all interfaces. Rerun with -InstallOpenSSH if you accept that (and firewall port 22), or run setup.ps1 without Administrator to use Reach's loopback-only built-in SSH server."
+    }
+    return ''
+  }
+  $mode = (Get-CimInstance Win32_Service -Filter "Name='sshd'").StartMode
+  if ($mode -ne 'Auto' -and -not $InstallOpenSSH) {
+    return "Windows OpenSSH Server is installed but its StartupType is $mode. Reach will not enable it (it listens on all interfaces). Rerun with -InstallOpenSSH to enable it, or run setup.ps1 without Administrator to use Reach's loopback-only built-in SSH server."
+  }
+  return ''
+}
+
 function Ensure-ReachOpenSSHServer {
   Log "Checking Windows OpenSSH Client/Server"
   Add-ReachOpenSSHPath
@@ -242,6 +261,13 @@ if ($UserMode) {
   $DataDir = $ProgramDataDir
 }
 $AgentPath = Join-Path $InstallDir 'reach-agent.exe'
+
+# A reinstall must not remove the working agent and then refuse to install
+# the new one: check the sshd policy first (astra R3-09).
+if ($Reinstall -and -not $UserMode) {
+  $policyError = Test-ReachOpenSSHPolicy
+  if ($policyError) { Die "Reinstall refused before removing anything: $policyError" }
+}
 
 if ($Uninstall -or $Reinstall) {
   Log "Uninstalling existing Reach Windows agent"
