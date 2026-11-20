@@ -1177,8 +1177,16 @@ func (s *Server) handleAgentUninstall(w http.ResponseWriter, r *http.Request, co
 			s.publishEvent(r.Context(), "machine.retired", req.MachineID, map[string]any{"machine_id": req.MachineID})
 		}
 	} else {
+		// Idempotent only once revoke actually succeeded: a machine already
+		// retiring with cleanup pending/timed_out needs nothing; a previous
+		// disable_failed/cleanup_failed must be retried (astra P2-02).
 		m, err := s.prov.GetMachine(r.Context(), req.MachineID)
-		if err == nil && m.DesiredState != DesiredRetiring {
+		if err != nil {
+			opErr = err
+		} else if m.CleanupState != nil && *m.CleanupState == CleanupFailed {
+			// Hub cleanup already started and failed: retry the full retire.
+			opErr = s.prov.RetireMachineNow(r.Context(), req.MachineID, "agent-uninstall")
+		} else if m.DesiredState != DesiredRetiring || (m.CleanupState != nil && *m.CleanupState == DisableFailed) {
 			opErr = s.prov.RemoveMachine(r.Context(), req.MachineID, "agent-uninstall")
 		}
 		if opErr == nil {

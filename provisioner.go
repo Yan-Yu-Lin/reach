@@ -1175,8 +1175,9 @@ func (p *Provisioner) recomputeObserved(ctx context.Context, machineID string) (
 	defer p.observedMu.Unlock()
 
 	var desired, old, oldStatus string
+	var cleanup sql.NullString
 	var hbAt, agentTunnel, localSSH, probe sql.NullString
-	if err := p.store.db.QueryRowContext(ctx, `SELECT desired_state,observed_state,status FROM machines WHERE id=?`, machineID).Scan(&desired, &old, &oldStatus); err != nil {
+	if err := p.store.db.QueryRowContext(ctx, `SELECT desired_state,observed_state,status,cleanup_state FROM machines WHERE id=?`, machineID).Scan(&desired, &old, &oldStatus, &cleanup); err != nil {
 		return false, "", "", err
 	}
 	if err := p.store.db.QueryRowContext(ctx, `SELECT heartbeat_at,tunnel_state,local_ssh_state FROM agent_observations WHERE machine_id=?`, machineID).Scan(&hbAt, &agentTunnel, &localSSH); err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -1207,17 +1208,36 @@ func (p *Provisioner) recomputeObserved(ctx context.Context, machineID string) (
 	} else if probeReachable {
 		observed = ObservedDegraded
 	}
-	effective := observed
-	if desired == DesiredDisabled || desired == DesiredRetiring || desired == DesiredRetired {
-		effective = desired
-	}
+	effective := effectiveStatus(desired, cleanup.String, observed)
 	changed := observed != old || effective != oldStatus
 	if changed {
-		if _, err := p.store.db.ExecContext(ctx, `UPDATE machines SET observed_state=?,status=?,updated_at=? WHERE id=?`, observed, effective, nowUTC(), machineID); err != nil {
+		// Conditional on the lifecycle columns we read: if a disable/retire
+		// landed in between, this stale recompute must not overwrite it.
+		res, err := p.store.db.ExecContext(ctx, `UPDATE machines SET observed_state=?,status=?,updated_at=? WHERE id=? AND desired_state=? AND COALESCE(cleanup_state,'')=?`, observed, effective, nowUTC(), machineID, desired, cleanup.String)
+		if err != nil {
 			return false, "", "", err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return false, old, oldStatus, nil
 		}
 	}
 	return changed, observed, effective, nil
+}
+
+// effectiveStatus is the single derivation of machines.status. A recorded
+// revoke/cleanup failure wins over the desired state, so a heartbeat cannot
+// make a machine whose hub access may still work look disabled or plainly
+// retiring (astra P2-01). Only a successful retry clears cleanup_state.
+func effectiveStatus(desired, cleanup, observed string) string {
+	switch cleanup {
+	case DisableFailed, CleanupFailed:
+		return cleanup
+	}
+	switch desired {
+	case DesiredDisabled, DesiredRetiring, DesiredRetired:
+		return desired
+	}
+	return observed
 }
 
 func (p *Provisioner) CachedHealth(ctx context.Context) ([]map[string]any, error) {
