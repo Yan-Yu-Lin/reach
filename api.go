@@ -297,6 +297,15 @@ func (s *Server) handleClientRegister(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
+	// Agents before the approval binding (8c74086 and older) send neither
+	// mode nor local_port at registration and only reveal their SSH plan at
+	// provision, which the binding then rejects with 403 after the operator
+	// already approved. Refuse them here instead, with a clear message
+	// (astra R2-08). The binding rules themselves are unchanged.
+	if strings.TrimSpace(req.Mode) == "" || req.LocalPort == 0 {
+		writeErr(w, http.StatusUpgradeRequired, "this Reach installer is too old for this hub (registration without mode/local_port); install the current reach-agent release, or ask the operator to publish it")
+		return
+	}
 	clientSecret, err := RandomToken("cs", 24)
 	if err != nil {
 		writeErr(w, 500, "could not generate client secret")

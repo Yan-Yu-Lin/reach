@@ -30,7 +30,7 @@ func TestInviteIsClaimedAtomically(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			body, _ := json.Marshal(map[string]any{"name": "friend-" + string(rune('a'+i)) + "-box", "auth_code": "invite-code-1"})
+			body, _ := json.Marshal(map[string]any{"mode": "system", "local_port": 22, "name": "friend-" + string(rune('a'+i)) + "-box", "auth_code": "invite-code-1"})
 			rec := doJSON(t, server, http.MethodPost, "/api/client/register", string(body), "")
 			codes[i] = rec.Code
 			var out struct {
@@ -63,7 +63,7 @@ func TestInviteIsClaimedAtomically(t *testing.T) {
 		t.Fatalf("invite used_by=%q claimed=%q", used, claimed)
 	}
 	// A used invite cannot be claimed again.
-	if rec := doJSON(t, server, http.MethodPost, "/api/client/register", `{"name":"late-box","auth_code":"invite-code-1"}`, ""); rec.Code != http.StatusUnauthorized {
+	if rec := doJSON(t, server, http.MethodPost, "/api/client/register", `{"mode":"system","local_port":22,"name":"late-box","auth_code":"invite-code-1"}`, ""); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("reuse of consumed invite = %d", rec.Code)
 	}
 }
@@ -74,7 +74,7 @@ func TestExpiredInviteClaimIsReleased(t *testing.T) {
 	if _, err := store.db.Exec(`INSERT INTO invites (code_hash,type,expires_at,created_at) VALUES (?,'friend',?,?)`, hash, time.Now().UTC().Add(time.Hour).Format(time.RFC3339), nowUTC()); err != nil {
 		t.Fatal(err)
 	}
-	if rec := doJSON(t, server, http.MethodPost, "/api/client/register", `{"name":"slow-box","auth_code":"invite-code-2"}`, ""); rec.Code != 200 {
+	if rec := doJSON(t, server, http.MethodPost, "/api/client/register", `{"mode":"system","local_port":22,"name":"slow-box","auth_code":"invite-code-2"}`, ""); rec.Code != 200 {
 		t.Fatalf("register = %d", rec.Code)
 	}
 	if _, err := store.db.Exec(`UPDATE requests SET expires_at=?`, time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)); err != nil {

@@ -56,7 +56,7 @@ func provisionBody(id, token string, fields map[string]any) string {
 // PoC from Opus P1-2: approve without a slug, then provision as jason-public.
 func TestProvisionSlugMustMatchApproval(t *testing.T) {
 	server, _, cfg := newReliabilityTestServer(t)
-	id, secret := registerAndApprove(t, server, cfg, `{"name":"Friend laptop"}`)
+	id, secret := registerAndApprove(t, server, cfg, `{"mode":"system","local_port":22,"name":"Friend laptop"}`)
 	tok := setupTokenFor(t, server, id, secret)
 	rec := doJSON(t, server, http.MethodPost, "/api/client/provision", provisionBody(id, tok, map[string]any{"slug": "jason-public"}), "")
 	if rec.Code == 200 {
@@ -97,7 +97,7 @@ func TestProvisionCannotClearApprovedFields(t *testing.T) {
 
 func TestProvisionFailsClosedOnCorruptMetadata(t *testing.T) {
 	server, store, cfg := newReliabilityTestServer(t)
-	id, secret := registerAndApprove(t, server, cfg, `{"name":"corrupt-box"}`)
+	id, secret := registerAndApprove(t, server, cfg, `{"mode":"system","local_port":22,"name":"corrupt-box"}`)
 	tok := setupTokenFor(t, server, id, secret)
 	if _, err := store.db.Exec(`UPDATE requests SET metadata_json='{not json' WHERE id=?`, id); err != nil {
 		t.Fatal(err)
@@ -110,7 +110,7 @@ func TestProvisionFailsClosedOnCorruptMetadata(t *testing.T) {
 func TestReservedSlugsRejected(t *testing.T) {
 	server, _, _ := newReliabilityTestServer(t)
 	for _, name := range []string{"jason-ts", "jason", "home-public", "localhost", "reach-hub"} {
-		rec := doJSON(t, server, http.MethodPost, "/api/client/register", `{"name":"`+name+`"}`, "")
+		rec := doJSON(t, server, http.MethodPost, "/api/client/register", `{"mode":"system","local_port":22,"name":"`+name+`"}`, "")
 		if rec.Code != 400 {
 			t.Fatalf("reserved %q register = %d", name, rec.Code)
 		}
@@ -124,7 +124,7 @@ func TestReservedSlugsRejected(t *testing.T) {
 // Daybreak P2-2 PoC: two keys in one pubkey field.
 func TestProvisionRejectsMultiLineKey(t *testing.T) {
 	server, _, cfg := newReliabilityTestServer(t)
-	id, secret := registerAndApprove(t, server, cfg, `{"name":"multi-key"}`)
+	id, secret := registerAndApprove(t, server, cfg, `{"mode":"system","local_port":22,"name":"multi-key"}`)
 	tok := setupTokenFor(t, server, id, secret)
 	m := map[string]any{"request_id": id, "setup_token": tok, "slug": "multi-key", "pubkey": testPubkey + "\n" + testPubkey}
 	b, _ := json.Marshal(m)
@@ -135,9 +135,9 @@ func TestProvisionRejectsMultiLineKey(t *testing.T) {
 
 func TestRequestsListExposesObservedIPAndFilter(t *testing.T) {
 	server, _, cfg := newReliabilityTestServer(t)
-	registerAndApprove(t, server, cfg, `{"name":"listed-box"}`)
+	registerAndApprove(t, server, cfg, `{"mode":"system","local_port":22,"name":"listed-box"}`)
 	server.registerL = newRateLimiter(1000, time.Minute)
-	_ = doJSON(t, server, http.MethodPost, "/api/client/register", `{"name":"pending-box"}`, "")
+	_ = doJSON(t, server, http.MethodPost, "/api/client/register", `{"mode":"system","local_port":22,"name":"pending-box"}`, "")
 	admin, _ := adminTestToken(t, server.store, cfg)
 	rec := doJSON(t, server, http.MethodGet, "/api/admin/requests?status=pending", "", admin)
 	var rows []map[string]any
@@ -150,7 +150,7 @@ func TestRequestsListExposesObservedIPAndFilter(t *testing.T) {
 func TestDuplicateSlugRejectedBeforeTokenIsSpent(t *testing.T) {
 	server, store, _ := newReliabilityTestServer(t)
 	insertTestMachine(t, store, "m_taken", "taken-box")
-	rec := doJSON(t, server, http.MethodPost, "/api/client/register", `{"name":"taken-box"}`, "")
+	rec := doJSON(t, server, http.MethodPost, "/api/client/register", `{"mode":"system","local_port":22,"name":"taken-box"}`, "")
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("register duplicate = %d %s", rec.Code, rec.Body.String())
 	}
@@ -160,7 +160,7 @@ func TestDuplicateSlugRejectedBeforeTokenIsSpent(t *testing.T) {
 // the defaults (root/system/22); provision cannot pick other values.
 func TestOmittedFieldsAreBoundToDefaults(t *testing.T) {
 	server, store, cfg := newReliabilityTestServer(t)
-	id, secret := registerAndApprove(t, server, cfg, `{"name":"bare-box"}`)
+	id, secret := registerAndApprove(t, server, cfg, `{"mode":"system","local_port":22,"name":"bare-box"}`)
 	var meta string
 	_ = store.db.QueryRow(`SELECT metadata_json FROM requests WHERE id=?`, id).Scan(&meta)
 	for _, want := range []string{`"target_user":"root"`, `"mode":"system"`, `"local_port":22`} {
@@ -185,7 +185,7 @@ func TestOmittedFieldsAreBoundToDefaults(t *testing.T) {
 
 func TestLegacyRequestWithoutBindingMustReregister(t *testing.T) {
 	server, store, cfg := newReliabilityTestServer(t)
-	id, secret := registerAndApprove(t, server, cfg, `{"name":"legacy-req"}`)
+	id, secret := registerAndApprove(t, server, cfg, `{"mode":"system","local_port":22,"name":"legacy-req"}`)
 	tok := setupTokenFor(t, server, id, secret)
 	if _, err := store.db.Exec(`UPDATE requests SET metadata_json='{"name":"legacy-req","slug":"legacy-req"}' WHERE id=?`, id); err != nil {
 		t.Fatal(err)
@@ -199,7 +199,7 @@ func TestLegacyRequestWithoutBindingMustReregister(t *testing.T) {
 // minted a fresh setup token.
 func TestExpiredRequestCannotBeApprovedOrPolled(t *testing.T) {
 	server, store, cfg := newReliabilityTestServer(t)
-	rec := doJSON(t, server, http.MethodPost, "/api/client/register", `{"name":"stale-box"}`, "")
+	rec := doJSON(t, server, http.MethodPost, "/api/client/register", `{"mode":"system","local_port":22,"name":"stale-box"}`, "")
 	var out struct {
 		RequestID    string `json:"request_id"`
 		ClientSecret string `json:"client_secret"`
@@ -215,7 +215,7 @@ func TestExpiredRequestCannotBeApprovedOrPolled(t *testing.T) {
 	}
 	// Approved before expiry, polled after: no new setup token.
 	server.registerL = newRateLimiter(100, time.Minute)
-	id2, secret2 := registerAndApprove(t, server, cfg, `{"name":"late-poll"}`)
+	id2, secret2 := registerAndApprove(t, server, cfg, `{"mode":"system","local_port":22,"name":"late-poll"}`)
 	if _, err := store.db.Exec(`UPDATE requests SET expires_at=? WHERE id=?`, past, id2); err != nil {
 		t.Fatal(err)
 	}
@@ -227,7 +227,7 @@ func TestExpiredRequestCannotBeApprovedOrPolled(t *testing.T) {
 
 func TestSetupTokenExpiryClampedToRequest(t *testing.T) {
 	server, store, cfg := newReliabilityTestServer(t)
-	id, secret := registerAndApprove(t, server, cfg, `{"name":"clamp-box"}`)
+	id, secret := registerAndApprove(t, server, cfg, `{"mode":"system","local_port":22,"name":"clamp-box"}`)
 	soon := time.Now().UTC().Add(2 * time.Minute).Format(time.RFC3339)
 	if _, err := store.db.Exec(`UPDATE requests SET expires_at=? WHERE id=?`, soon, id); err != nil {
 		t.Fatal(err)
@@ -245,10 +245,10 @@ func TestSetupTokenExpiryClampedToRequest(t *testing.T) {
 func TestSlugReservedAcrossLiveRequests(t *testing.T) {
 	server, store, cfg := newReliabilityTestServer(t)
 	server.registerL = newRateLimiter(100, time.Minute)
-	if rec := doJSON(t, server, http.MethodPost, "/api/client/register", `{"name":"twin-box"}`, ""); rec.Code != 200 {
+	if rec := doJSON(t, server, http.MethodPost, "/api/client/register", `{"mode":"system","local_port":22,"name":"twin-box"}`, ""); rec.Code != 200 {
 		t.Fatalf("first register %d", rec.Code)
 	}
-	if rec := doJSON(t, server, http.MethodPost, "/api/client/register", `{"name":"twin-box"}`, ""); rec.Code != http.StatusConflict {
+	if rec := doJSON(t, server, http.MethodPost, "/api/client/register", `{"mode":"system","local_port":22,"name":"twin-box"}`, ""); rec.Code != http.StatusConflict {
 		t.Fatalf("second live request for the same slug = %d, want 409", rec.Code)
 	}
 	var id string
@@ -257,14 +257,37 @@ func TestSlugReservedAcrossLiveRequests(t *testing.T) {
 	if rec := doJSON(t, server, http.MethodPost, "/api/admin/requests/"+id+"/deny", "", admin); rec.Code != 200 {
 		t.Fatalf("deny %d", rec.Code)
 	}
-	if rec := doJSON(t, server, http.MethodPost, "/api/client/register", `{"name":"twin-box"}`, ""); rec.Code != 200 {
+	if rec := doJSON(t, server, http.MethodPost, "/api/client/register", `{"mode":"system","local_port":22,"name":"twin-box"}`, ""); rec.Code != 200 {
 		t.Fatalf("register after deny = %d", rec.Code)
 	}
 	// An abandoned (expired but unmarked) request does not block the slug.
 	if _, err := store.db.Exec(`UPDATE requests SET expires_at=? WHERE slug='twin-box' AND status='pending'`, time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)); err != nil {
 		t.Fatal(err)
 	}
-	if rec := doJSON(t, server, http.MethodPost, "/api/client/register", `{"name":"twin-box"}`, ""); rec.Code != 200 {
+	if rec := doJSON(t, server, http.MethodPost, "/api/client/register", `{"mode":"system","local_port":22,"name":"twin-box"}`, ""); rec.Code != 200 {
 		t.Fatalf("register after expiry = %d", rec.Code)
+	}
+}
+
+// Astra R2-08: an 8c74086-era installer registers with only name,
+// auth_code and target_user, and used to fail at provision (403) after the
+// operator had approved. It is now refused at registration with 426 and a
+// clear message; nothing is stored and no invite is claimed.
+func TestOldInstallerGetsUpgradeRequiredAtRegister(t *testing.T) {
+	server, store, _ := newReliabilityTestServer(t)
+	for _, body := range []string{
+		`{"name":"old-box","auth_code":"","target_user":"arthur"}`,
+		`{"name":"old-box","target_user":"arthur","mode":"system-existing"}`,
+		`{"name":"old-box","target_user":"arthur","local_port":22}`,
+	} {
+		rec := doJSON(t, server, http.MethodPost, "/api/client/register", body, "")
+		if rec.Code != http.StatusUpgradeRequired || !strings.Contains(rec.Body.String(), "too old") {
+			t.Fatalf("%s -> %d %s", body, rec.Code, rec.Body.String())
+		}
+	}
+	var n int
+	_ = store.db.QueryRow(`SELECT COUNT(*) FROM requests`).Scan(&n)
+	if n != 0 {
+		t.Fatalf("%d requests stored for refused registrations", n)
 	}
 }

@@ -48,7 +48,7 @@ func TestExpiredCommandResultIndependentOfMaintenanceOrder(t *testing.T) {
 // Astra P2-09: an expired setup token is terminal, not "busy".
 func TestExpiredSetupTokenIsTerminal(t *testing.T) {
 	server, store, cfg := newReliabilityTestServer(t)
-	id, secret := registerAndApprove(t, server, cfg, `{"name":"expired-setup"}`)
+	id, secret := registerAndApprove(t, server, cfg, `{"mode":"system","local_port":22,"name":"expired-setup"}`)
 	token := setupTokenFor(t, server, id, secret)
 	if _, err := store.db.Exec(`UPDATE requests SET setup_token_expires_at=? WHERE id=?`, time.Now().Add(-time.Minute).UTC().Format(time.RFC3339), id); err != nil {
 		t.Fatal(err)
@@ -61,7 +61,7 @@ func TestExpiredSetupTokenIsTerminal(t *testing.T) {
 
 func TestUsedSetupTokenIsUnauthorizedNotBusy(t *testing.T) {
 	server, _, cfg := newReliabilityTestServer(t)
-	id, secret := registerAndApprove(t, server, cfg, `{"name":"used-setup"}`)
+	id, secret := registerAndApprove(t, server, cfg, `{"mode":"system","local_port":22,"name":"used-setup"}`)
 	token := setupTokenFor(t, server, id, secret)
 	if rec := doJSON(t, server, http.MethodPost, "/api/client/provision", provisionBody(id, token, map[string]any{"slug": "used-setup"}), ""); rec.Code != 200 {
 		t.Fatalf("first provision %d", rec.Code)
@@ -80,7 +80,7 @@ func TestStuckProvisioningIsRecovered(t *testing.T) {
 	if _, err := store.db.Exec(`INSERT INTO invites (code_hash,type,expires_at,created_at) VALUES (?,'friend',?,?)`, hash, time.Now().Add(time.Hour).UTC().Format(time.RFC3339), nowUTC()); err != nil {
 		t.Fatal(err)
 	}
-	rec := doJSON(t, server, http.MethodPost, "/api/client/register", `{"name":"stuck-box","auth_code":"inv-stuck"}`, "")
+	rec := doJSON(t, server, http.MethodPost, "/api/client/register", `{"mode":"system","local_port":22,"name":"stuck-box","auth_code":"inv-stuck"}`, "")
 	if rec.Code != 200 {
 		t.Fatalf("register %d", rec.Code)
 	}

@@ -25,7 +25,7 @@ func doJSON(t *testing.T, server *Server, method, path, body, bearer string) *ht
 
 func registerPending(t *testing.T, server *Server) (string, string) {
 	t.Helper()
-	rec := doJSON(t, server, http.MethodPost, "/api/client/register", `{"name":"poll-box"}`, "")
+	rec := doJSON(t, server, http.MethodPost, "/api/client/register", `{"mode":"system","local_port":22,"name":"poll-box"}`, "")
 	if rec.Code != 200 {
 		t.Fatalf("register = %d %s", rec.Code, rec.Body.String())
 	}

@@ -52,7 +52,7 @@ func TestDeployFenceIgnoresDiscardableWrites(t *testing.T) {
 	if err := server.prov.ExpireOnce(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if rec := doJSON(t, server, http.MethodPost, "/api/client/register", `{"name":"pending-box"}`, ""); rec.Code != 200 {
+	if rec := doJSON(t, server, http.MethodPost, "/api/client/register", `{"mode":"system","local_port":22,"name":"pending-box"}`, ""); rec.Code != 200 {
 		t.Fatalf("register %d", rec.Code)
 	}
 	if w := durable(t, server, f); len(w) != 0 {
@@ -79,7 +79,7 @@ func TestDeployFenceDetectsDurableWrites(t *testing.T) {
 		}},
 		"approve": {"request.approve", func(t *testing.T, s *Server, admin string) {
 			s.registerL = newRateLimiter(100, time.Minute)
-			rec := doJSON(t, s, http.MethodPost, "/api/client/register", `{"name":"to-approve"}`, "")
+			rec := doJSON(t, s, http.MethodPost, "/api/client/register", `{"mode":"system","local_port":22,"name":"to-approve"}`, "")
 			var id string
 			_ = s.store.db.QueryRow(`SELECT id FROM requests ORDER BY created_at DESC LIMIT 1`).Scan(&id)
 			_ = rec
@@ -102,7 +102,7 @@ func TestDeployFenceDetectsDurableWrites(t *testing.T) {
 			if _, err := s.store.db.Exec(`INSERT INTO invites (code_hash,type,expires_at,created_at) VALUES (?,'friend',?,'2026-01-01T00:00:00Z')`, hash, time.Now().Add(time.Hour).UTC().Format(time.RFC3339)); err != nil {
 				t.Fatal(err)
 			}
-			doJSON(t, s, http.MethodPost, "/api/client/register", `{"name":"inv-box","auth_code":"inv-code"}`, "")
+			doJSON(t, s, http.MethodPost, "/api/client/register", `{"mode":"system","local_port":22,"name":"inv-box","auth_code":"inv-code"}`, "")
 		}},
 		"god-code provision": {"machine.create", func(t *testing.T, s *Server, admin string) {
 			_, _ = s.prov.CreateMachine(context.Background(), CreateMachineInput{Slug: "new-box", Pubkey: testPubkey})
