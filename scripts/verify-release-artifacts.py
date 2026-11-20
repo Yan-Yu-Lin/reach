@@ -59,6 +59,10 @@ def main() -> None:
     parser.add_argument("--dir", required=True)
     parser.add_argument("--version", required=True)
     parser.add_argument("--commit", required=True)
+    parser.add_argument(
+        "--previous-manifest",
+        help="manifest.json of the currently published release; the new sequence must be greater",
+    )
     args = parser.parse_args()
 
     directory = Path(args.dir)
@@ -76,8 +80,22 @@ def main() -> None:
         fail(f"manifest commit is {manifest.get('git_commit')!r}, expected {args.commit!r}")
 
     sequence = manifest.get("sequence")
-    if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence <= 0:
-        fail("manifest sequence must be a positive integer (agent anti-rollback)")
+    # Same ordering space as legacy created_at (Unix seconds); see
+    # minReleaseSequence in cmd/reach-agent/update_binary.go.
+    if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 1_000_000_000:
+        fail("manifest sequence must be Unix seconds >= 1000000000 (agent anti-rollback)")
+    if args.previous_manifest:
+        previous = json.loads(Path(args.previous_manifest).read_text())
+        previous_sequence = previous.get("sequence")
+        if not isinstance(previous_sequence, int):
+            created = previous.get("created_at", "")
+            from datetime import datetime
+            try:
+                previous_sequence = int(datetime.fromisoformat(created.replace("Z", "+00:00")).timestamp())
+            except ValueError:
+                fail(f"previous manifest has no usable sequence or created_at: {created!r}")
+        if sequence <= previous_sequence:
+            fail(f"manifest sequence {sequence} is not greater than the published {previous_sequence}")
 
     assets = manifest.get("assets")
     if not isinstance(assets, dict) or set(assets) != ASSET_NAMES:

@@ -87,7 +87,7 @@ func manifestCommand(args []string) error {
 	dir := fs.String("dir", ".", "directory containing release assets")
 	version := fs.String("version", "", "release version")
 	commit := fs.String("commit", "", "git commit")
-	sequence := fs.Int64("sequence", 0, "monotonic release sequence (default: current Unix time)")
+	sequence := fs.Int64("sequence", 0, "monotonic release sequence in Unix seconds (default: current time)")
 	outPath := fs.String("out", "", "manifest output path (default: DIR/manifest.json)")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -113,9 +113,14 @@ func manifestCommand(args []string) error {
 		sum := sha256.Sum256(b)
 		assets[name] = releaseAsset{SHA256: hex.EncodeToString(sum[:]), Size: st.Size()}
 	}
+	// Sequence shares the Unix-seconds space with the created_at fallback of
+	// older manifests (see minReleaseSequence in cmd/reach-agent).
 	seq := *sequence
-	if seq <= 0 {
+	if seq == 0 {
 		seq = time.Now().UTC().Unix()
+	}
+	if seq < 1_000_000_000 {
+		return fmt.Errorf("--sequence must be Unix seconds (>= 1000000000), got %d", seq)
 	}
 	manifest := releaseManifest{Schema: 1, Project: "reach-agent", Version: *version, Sequence: seq, GitCommit: *commit, CreatedAt: nowUTC(), Assets: assets}
 	b, err := json.MarshalIndent(manifest, "", "  ")

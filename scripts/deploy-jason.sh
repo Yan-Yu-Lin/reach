@@ -397,6 +397,16 @@ case "$BACKUP_RETAIN" in
   ''|*[!0-9]*|0) echo "[deploy] ERROR: REACH_BACKUP_RETAIN must be a positive integer" >&2; exit 1 ;;
 esac
 
+# The published release's manifest, so a new release must carry a strictly
+# greater anti-rollback sequence (astra P2-04).
+PREVIOUS_MANIFEST=""
+if [ "$PUBLISH_AGENT_RELEASE" = 1 ] && [ -r "$AGENT_DOWNLOAD_ROOT/latest.txt" ]; then
+  previous_version="$(tr -d '\r\n' < "$AGENT_DOWNLOAD_ROOT/latest.txt")"
+  if [ -n "$previous_version" ] && [ "$previous_version" != "$AGENT_VERSION" ] && [ -r "$AGENT_DOWNLOAD_ROOT/v$previous_version/manifest.json" ]; then
+    PREVIOUS_MANIFEST="$AGENT_DOWNLOAD_ROOT/v$previous_version/manifest.json"
+  fi
+fi
+
 if [ "$PUBLISH_AGENT_RELEASE" = 1 ] && [ -z "$ARTIFACT_DIR" ]; then
   if [ -z "${REACH_RELEASE_KEY:-}" ]; then
     echo "[deploy] ERROR: publishing hub-built artifacts requires REACH_RELEASE_KEY" >&2
@@ -417,7 +427,8 @@ if [ "$PUBLISH_AGENT_RELEASE" = 1 ] && [ -z "$ARTIFACT_DIR" ]; then
   write_checksums "$ARTIFACT_DIR"
   create_manifest "$ARTIFACT_DIR"
   "$UV_BIN" run --script scripts/verify-release-artifacts.py \
-    --dir "$ARTIFACT_DIR" --version "$AGENT_VERSION" --commit "$deploy_commit"
+    --dir "$ARTIFACT_DIR" --version "$AGENT_VERSION" --commit "$deploy_commit" \
+    ${PREVIOUS_MANIFEST:+--previous-manifest "$PREVIOUS_MANIFEST"}
   if sign_manifest_if_configured "$ARTIFACT_DIR"; then
     echo "[deploy] signed release manifest"
   else
@@ -428,7 +439,8 @@ if [ "$PUBLISH_AGENT_RELEASE" = 1 ] && [ -z "$ARTIFACT_DIR" ]; then
 elif [ "$PUBLISH_AGENT_RELEASE" = 1 ]; then
   require_agent_artifacts "$ARTIFACT_DIR"
   "$UV_BIN" run --script scripts/verify-release-artifacts.py \
-    --dir "$ARTIFACT_DIR" --version "$AGENT_VERSION" --commit "$deploy_commit"
+    --dir "$ARTIFACT_DIR" --version "$AGENT_VERSION" --commit "$deploy_commit" \
+    ${PREVIOUS_MANIFEST:+--previous-manifest "$PREVIOUS_MANIFEST"}
   go run ./cmd/reach-release verify --manifest "$ARTIFACT_DIR/manifest.json" --artifacts-dir "$ARTIFACT_DIR"
 fi
 

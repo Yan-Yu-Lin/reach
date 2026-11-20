@@ -745,15 +745,24 @@ func runUpdateRollbackWatcher(ctx context.Context, opt updateBinaryOptions) erro
 	if opt.confirmFlag == "" || opt.backupPath == "" || opt.agentPath == "" {
 		return fmt.Errorf("rollback watcher missing required paths")
 	}
-	if _, err := os.Stat(opt.confirmFlag); errors.Is(err, os.ErrNotExist) {
+	// Claim the pending update atomically. If confirm already claimed it,
+	// the update stands; otherwise confirm can no longer raise the floor
+	// for a binary we are about to replace (astra P2-03).
+	claim, err := claimPendingUpdate(opt.confirmFlag, "rollback")
+	if errors.Is(err, os.ErrNotExist) {
 		fmt.Printf("[reach] update was confirmed; rollback canceled\n")
 		return nil
 	}
-	fmt.Printf("[reach] update was not confirmed; restoring %s to %s\n", opt.backupPath, opt.agentPath)
-	if err := restoreBinary(opt.backupPath, opt.agentPath); err != nil {
+	if err != nil {
 		return err
 	}
-	_ = os.Remove(opt.confirmFlag)
+	fmt.Printf("[reach] update was not confirmed; restoring %s to %s\n", opt.backupPath, opt.agentPath)
+	if err := restoreBinary(opt.backupPath, opt.agentPath); err != nil {
+		// Keep the pending state so a later confirm/rollback still sees it.
+		_ = os.Rename(claim, opt.confirmFlag)
+		return err
+	}
+	_ = os.Remove(claim)
 	st := reachInstallState{AgentPath: opt.agentPath, InstallMode: opt.installMode, ConfigPath: opt.configPath, DataDir: opt.dataDir, PIDFile: filepath.Join(opt.dataDir, "reach-agent.pid"), LogPath: filepath.Join(opt.dataDir, "agent.log")}
 	if err := restartReachAgent(ctx, st); err != nil {
 		return fmt.Errorf("rollback restored binary but restart failed: %w", err)
@@ -766,27 +775,54 @@ func restoreBinary(backupPath, agentPath string) error {
 	return atomicInstallBinary(backupPath, agentPath)
 }
 
+// confirmUpdate cancels the pending rollback and raises the anti-rollback
+// floor. The pending flag is claimed atomically (rename) so the rollback
+// watcher and confirm can never both act; if the floor cannot be read or
+// written, the flag is restored and an error is returned, leaving the
+// rollback armed (astra P2-03).
 func confirmUpdate(st reachInstallState) error {
 	flag := filepath.Join(st.DataDir, "update-confirm-required")
-	if b, err := os.ReadFile(flag); err == nil {
-		// Raise the anti-rollback floor only once the new binary has proven
-		// itself, so an unconfirmed (rolled back) update does not lock the
-		// agent out of reinstalling the previous release.
-		if seq := confirmFlagSequence(string(b)); seq > 0 {
-			if err := raiseReleaseFloor(st.DataDir, seq); err != nil {
-				fmt.Printf("[reach warning] could not record release floor: %v\n", err)
-			}
+	claim, err := claimPendingUpdate(flag, "confirm")
+	if errors.Is(err, os.ErrNotExist) {
+		fmt.Printf("[reach] no pending update confirmation found at %s\n", flag)
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	restore := func(cause error) error {
+		if rerr := os.Rename(claim, flag); rerr != nil {
+			return fmt.Errorf("%v; additionally could not restore %s: %w", cause, flag, rerr)
+		}
+		return cause
+	}
+	b, err := os.ReadFile(claim)
+	if err != nil {
+		return restore(fmt.Errorf("read pending update: %w", err))
+	}
+	// Raise the floor only once the new binary has proven itself, so an
+	// unconfirmed (rolled back) update can still reinstall the previous one.
+	if seq := confirmFlagSequence(string(b)); seq > 0 {
+		if err := raiseReleaseFloor(st.DataDir, seq); err != nil {
+			return restore(fmt.Errorf("record release floor: %w", err))
 		}
 	}
-	if err := os.Remove(flag); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			fmt.Printf("[reach] no pending update confirmation found at %s\n", flag)
-			return nil
-		}
+	if err := os.Remove(claim); err != nil {
 		return err
 	}
 	fmt.Printf("[reach] update confirmed; rollback canceled.\n")
 	return nil
+}
+
+// claimPendingUpdate atomically renames the pending-update flag to a
+// claim file owned by the caller. os.ErrNotExist means another party
+// already claimed (or there was nothing pending).
+func claimPendingUpdate(flag, who string) (string, error) {
+	claim := fmt.Sprintf("%s.%s-%d", flag, who, os.Getpid())
+	if err := os.Rename(flag, claim); err != nil {
+		return "", err
+	}
+	return claim, nil
 }
 
 func restartLaunchdAgent(ctx context.Context, st reachInstallState) error {
@@ -871,12 +907,23 @@ type releaseFloor struct {
 	UpdatedAt string `json:"updated_at"`
 }
 
-// manifestSequence returns the signed ordering key of a manifest.
+// minReleaseSequence pins the ordering contract (astra P2-04): a release
+// sequence is a Unix-seconds value, in the same space as the created_at
+// fallback of legacy manifests. reach-release defaults to the build time and
+// deploy refuses to publish a sequence not greater than the previous one, so
+// counters may advance faster than the clock but never restart small.
+const minReleaseSequence int64 = 1_000_000_000
+
+// manifestSequence returns the signed ordering key of a manifest, or 0 if it
+// has none usable.
 func manifestSequence(m releaseManifest) int64 {
-	if m.Sequence > 0 {
+	if m.Sequence != 0 {
+		if m.Sequence < minReleaseSequence {
+			return 0
+		}
 		return m.Sequence
 	}
-	if t, err := time.Parse(time.RFC3339, m.CreatedAt); err == nil {
+	if t, err := time.Parse(time.RFC3339, m.CreatedAt); err == nil && t.Unix() >= minReleaseSequence {
 		return t.Unix()
 	}
 	return 0
@@ -906,7 +953,7 @@ func readReleaseFloor(dataDir string) (int64, error) {
 func checkReleaseFloor(dataDir string, m releaseManifest, allowDowngrade bool) error {
 	seq := manifestSequence(m)
 	if seq <= 0 {
-		return fmt.Errorf("release manifest %s has no usable sequence or created_at", m.Version)
+		return fmt.Errorf("release manifest %s has no usable sequence (must be Unix seconds >= %d) or created_at", m.Version, minReleaseSequence)
 	}
 	floor, err := readReleaseFloor(dataDir)
 	if err != nil {

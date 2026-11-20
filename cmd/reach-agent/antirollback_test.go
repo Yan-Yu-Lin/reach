@@ -10,8 +10,8 @@ import (
 // Daybreak P2-6: a compromised hub offers an older, validly signed release.
 func TestReleaseFloorRefusesDowngrade(t *testing.T) {
 	dir := t.TempDir()
-	newer := releaseManifest{Version: "0.2.0", Sequence: 2000}
-	older := releaseManifest{Version: "0.1.0", Sequence: 1000}
+	newer := releaseManifest{Version: "0.2.0", Sequence: 1_790_000_000}
+	older := releaseManifest{Version: "0.1.0", Sequence: 1_780_000_000}
 	if err := checkReleaseFloor(dir, older, false); err != nil {
 		t.Fatalf("fresh install refused: %v", err)
 	}
@@ -31,7 +31,7 @@ func TestReleaseFloorRefusesDowngrade(t *testing.T) {
 	if err := raiseReleaseFloor(dir, 10); err != nil {
 		t.Fatal(err)
 	}
-	if f, _ := readReleaseFloor(dir); f != 2000 {
+	if f, _ := readReleaseFloor(dir); f != 1_790_000_000 {
 		t.Fatalf("floor = %d", f)
 	}
 }
@@ -48,13 +48,72 @@ func TestLegacyManifestUsesCreatedAt(t *testing.T) {
 
 func TestConfirmRaisesFloorFromFlag(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "update-confirm-required"), []byte("backup=x\ncandidate_version=0.2.0\ncandidate_sequence=4242\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "update-confirm-required"), []byte("backup=x\ncandidate_version=0.2.0\ncandidate_sequence=1790000042\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := confirmUpdate(reachInstallState{DataDir: dir}); err != nil {
 		t.Fatal(err)
 	}
-	if f, _ := readReleaseFloor(dir); f != 4242 {
+	if f, _ := readReleaseFloor(dir); f != 1790000042 {
 		t.Fatalf("floor after confirm = %d", f)
+	}
+}
+
+// Astra P2-03: a floor that cannot be recorded must not cancel rollback.
+func TestConfirmKeepsRollbackArmedWhenFloorFails(t *testing.T) {
+	dir := t.TempDir()
+	flag := filepath.Join(dir, "update-confirm-required")
+	if err := os.WriteFile(flag, []byte("candidate_sequence=1790000000\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, releaseFloorFile), []byte("corrupt-json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := confirmUpdate(reachInstallState{DataDir: dir}); err == nil {
+		t.Fatal("confirm succeeded although the floor could not be recorded")
+	}
+	if _, err := os.Stat(flag); err != nil {
+		t.Fatalf("pending update flag lost: %v", err)
+	}
+}
+
+// The watcher and confirm claim the same pending state; only one wins.
+func TestConfirmAndRollbackClaimExclusively(t *testing.T) {
+	dir := t.TempDir()
+	flag := filepath.Join(dir, "update-confirm-required")
+	if err := os.WriteFile(flag, []byte("candidate_sequence=1790000000\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := claimPendingUpdate(flag, "rollback")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(claim)
+	if err := confirmUpdate(reachInstallState{DataDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+	if f, _ := readReleaseFloor(dir); f != 0 {
+		t.Fatalf("confirm raised floor to %d while rollback held the update", f)
+	}
+}
+
+// Astra P2-04: legacy created_at floors and explicit sequences share one
+// ordering space; a small counter is rejected outright instead of being
+// silently compared against a timestamp.
+func TestSequenceSpaceIsUnixSeconds(t *testing.T) {
+	dir := t.TempDir()
+	legacy := releaseManifest{Version: "0.1.0", CreatedAt: "2026-07-01T00:00:00Z"}
+	if err := raiseReleaseFloor(dir, manifestSequence(legacy)); err != nil {
+		t.Fatal(err)
+	}
+	newer := releaseManifest{Version: "0.2.0", Sequence: 1_795_000_000, CreatedAt: "2026-11-21T00:00:00Z"}
+	if err := checkReleaseFloor(dir, newer, false); err != nil {
+		t.Fatalf("newer release with timestamp sequence refused: %v", err)
+	}
+	if manifestSequence(releaseManifest{Version: "x", Sequence: 1}) != 0 {
+		t.Fatal("small counter accepted as a sequence")
+	}
+	if err := checkReleaseFloor(dir, releaseManifest{Version: "x", Sequence: 1}, false); err == nil {
+		t.Fatal("small counter passed the floor check")
 	}
 }
