@@ -402,6 +402,25 @@ await test('R3-04 an undated REPLAYED state change (older reachd) does not roll 
   await ctx.close()
 })
 
+await test('R3-05 every read overflows during a storm: backoff, a visible notice, then convergence', async () => {
+  await ctl('/__resetall?scenario=audit&n=1&hbfmt=new&v2=1&pending=0&latency=1500')
+  const { ctx, page } = await open(undefined, { path: '/' })
+  await ctl('/__storm?kind=heartbeat&rate=10000&seconds=14')
+  await sleep(12000)
+  const during = (await ctl('/__stats')).counts['GET /api/admin/machines'] || 0
+  // 1.5 s per read; without backoff ~8 reads in 12 s (astra saw 5 in 7.2 s). With 1,2,4 s backoff: <= 5.
+  expect(during <= 5, `${during} snapshot reads in 12 s: no backoff`)
+  const notice = await page.locator('.notice-error').innerText().catch(() => '')
+  expect(/Too many live updates/.test(notice), `no overflow notice: "${notice}"`)
+  expect((await page.locator('.mrow').count()) > 0, 'nothing on screen during the storm')
+  await ctl('/__stop')
+  await waitFor(async () => (await page.locator('.notice-error').count()) === 0, 40000, 'converged after the storm')
+  const settled = (await ctl('/__stats')).counts['GET /api/admin/machines']
+  await sleep(4000)
+  expect((await ctl('/__stats')).counts['GET /api/admin/machines'] === settled, 'kept re-reading after the storm ended')
+  await ctx.close()
+})
+
 // ---------------------------------------------------------------- F09
 await test('F09 a failed disable is reported as a failed disable, not a stuck removal', async () => {
   await reset()

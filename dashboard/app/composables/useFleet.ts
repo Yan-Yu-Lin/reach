@@ -39,6 +39,11 @@ export function useFleet() {
   const selectedId = ref<string | null>(null)
   const laneErrors = reactive({ machines: '', requests: '', machine: '' })
   const error = computed(() => laneErrors.machines || laneErrors.requests || laneErrors.machine)
+  /**
+   * Consecutive reads thrown away because more events arrived while they were in flight than
+   * the patch log can hold (astra R3-05). >0 means the screen may be behind the hub.
+   */
+  const overflowCount = ref(0)
   const patchLog = createPatchLog()
   let disposeSSE: (() => void) | null = null
   let bootstrapTimer: ReturnType<typeof setTimeout> | null = null
@@ -118,11 +123,20 @@ export function useFleet() {
     try {
       const snapshot = await api.machines()
       if (!patchLog.valid(token)) {
-        // Too many events arrived while this read was in flight to replay them safely:
-        // the response is stale, read again.
-        void refreshCoordinator.requestFull().catch(() => {})
-        return true
+        // Too many events arrived while this read was in flight to replay them safely: the
+        // response is stale. NOT a success - retry with the same bounded backoff as a
+        // failed read (1 s, 2 s, 4 s ... 30 s), so a sustained storm cannot spin.
+        overflowCount.value++
+        laneErrors.machines = 'Too many live updates to keep up; the list may be behind. Retrying...'
+        if (!loaded.value) {
+          // Nothing on screen yet: a list as of the read is better than an empty page while
+          // the storm lasts. It is shown as possibly behind and re-read with backoff.
+          applySnapshot(byId, snapshot || [])
+          loaded.value = true
+        }
+        return false
       }
+      overflowCount.value = 0
       const touched = patchLog.touchedSince(mark)
       applySnapshot(byId, snapshot || [], touched)
       replaySince(mark)
@@ -146,7 +160,10 @@ export function useFleet() {
     try {
       const results = await mapSettledLimited(ids, machineRefreshConcurrency, id => api.machine(id))
       if (!patchLog.valid(token)) {
-        void refreshCoordinator.requestFull().catch(() => {})
+        // Same as a voided snapshot: go through the backed-off full read.
+        overflowCount.value++
+        laneErrors.machine = 'Too many live updates to keep up; retrying...'
+        fullRetry.failed()
         return
       }
       let failures = 0
@@ -358,6 +375,7 @@ export function useFleet() {
     loading,
     loaded,
     error,
+    overflowCount,
     selectedId,
     selectedMachine,
     statusOf,
