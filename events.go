@@ -24,7 +24,7 @@ const (
 	// eventReplayMaxBytes bounds the encoded payload held for one replay
 	// (daybreak P2-12); exceeding it forces a resnapshot like the count cap.
 	eventReplayMaxBytes = 4 << 20
-	eventPublishTimeout  = 3 * time.Second
+	eventPublishTimeout = 3 * time.Second
 )
 
 type ReachEvent struct {
