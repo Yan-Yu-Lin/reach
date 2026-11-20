@@ -54,6 +54,7 @@
 | god code 改成短效（daybreak P2-7／Opus P2-1） | 不在指定範圍。Arthur 的第 0 批清單裡是直接清空 `god_code_hash` | |
 | 收集 target host key（daybreak P3-2 的 TOFU 部分） | 不在範圍內；這次只做了 ForwardAgent 和 port tombstone，避免冒充 | |
 | 把 `/var/lib/rt-*` 搬到專用目錄 | 要搬家目錄，和方案 B 一起做 | 方案 B 設計 |
+| internal-sshd 本身降權（daybreak round 3 P2-D） | 要改 key 檔 owner／mode 契約、migration、root 實測，只能跟 agent release 一起出 | `docs/design/2026-11-21-internal-sshd-privilege-drop.md` |
 
 ## 相容性（本機實測，2026-11-21 更新）
 
@@ -61,9 +62,11 @@
 - **舊 JWT（沒有 `sv`）接新 reachd：會失效（401），所有人都要重新登入一次**（daybreak P1-3）。Mac 的 `sat_` service token 不受影響。
 - 新 mac-agent 接舊 reachd 8c74086：退回解析文字，可以正常同步。
 - 舊 mac-agent 接新 reachd：文字 API 保留，可以用，但預設不再帶 target 回報的演算法選項（`legacy_ssh_config_options: false`）。
-- 舊 agent：heartbeat、poll、provision 的格式都沒變。部署前就已建立、但還沒 provision 的 request 會收到 410，要重新跑 setup（最多影響 request_ttl 30 分鐘內的請求）。
+- 舊 agent：**已經裝好的機器**，heartbeat 格式沒變，照常運作。部署前就已建立、但還沒 provision 的 request 仍然可以 poll、可以被核准，但 **provision 時**會收到 410，要重新跑 setup。部署時盡量不要有 pending request，也不要去核准舊的 pending。
+- **舊的 installer（8c74086 的 setup.sh／setup.ps1／reach-agent）不能再新增機器**：register 時就回 **426 Upgrade Required**，並提示要更新（astra R2-08）。以前是核准後 provision 才 403。新版後端上線後、新版 agent release（Stage 5）發布前，**這段期間不能新增或重裝機器**，除非手動用新版 reach-agent 安裝。binding 規則沒有放寬。
 - **新安裝、而且機器上沒有 sshd 的 target，會改用 agent 內建的 internal-sshd**（只聽 loopback；沒有 sftp；system 安裝時 session 以 target user 身分跑）。已經裝好的機器不受影響。Windows 系統安裝如果還沒裝 OpenSSH Server，要加 `-InstallOpenSSH` 才會裝。
-- 部署 rollback 在 Ubuntu 24.04 container 裡實測過兩種情境（`scripts/test-rollback-in-container.sh`）。
+- 部署 rollback 在 Ubuntu 24.04 container 裡實測 A～G 七種情境，載入的是 `deploy-jason.sh` 裡真正的 transaction 步驟、正式路徑（`scripts/test-rollback-in-container.sh`）。
+- **舊版的 rollback 會擋自動還原**：新版 fence 檔案帶 journal 欄位，舊格式的 fence 一律不准自動還原（fail closed）。
 
 ## 要 Arthur 決定（2026-11-21 更新）
 
@@ -80,17 +83,28 @@
 6. **nginx 範本、HAProxy 建議 diff 都要手動套用**。HAProxy 是公網唯一的入口，套之前請先看過。營區如果是 CGNAT，數字可能要調高；nginx `/api/client/` 2r/s burst 20 在 31 台同時重連時可能先回 429，agent 會重試。
 7. **carrier 現在沒有 path 就不啟動**：deploy 會從 config 的 `websocket_tunnel.path_prefix` 自動寫 `/etc/reach/ws-carrier.env`。目前有 2 台用 websocket transport。
 8. **revoke-all 會讓 mac-agent 斷線**：如果勾「連 service token 一起撤銷」，Mac 上要重新拿 token。
-9. **rollback 規則**：部署失敗時，如果新版上線後沒有「不能丟的寫入」（provision、approve、disable、retire、invite、service token、登出、revoke），就自動把 DB snapshot 和舊 binary 一起還原；有的話，reachd 會停著，等人決定。heartbeat、token 遷移、observation 這些可丟的寫入不會擋自動回滾。
+9. **rollback 規則**：部署失敗時，如果新版上線後 `durable_actions` journal 沒有新的列（provision、approve／deny、disable／enable／retire、invite、service token、登出、revoke-all、update policy、process title；包括只寫了 intent、OS 動作做到一半的），就自動把 DB snapshot 和舊 binary 一起還原；有的話，reachd 會停著，等人決定。這些動作的 journal 列和動作本身在同一個 transaction，journal 寫不進去動作就不會發生（回 5xx）。heartbeat、token 遷移、observation 這些可丟的寫入不會擋自動回滾。另外：stop 不成功、forensic copy 失敗、找不到 probe binary，也都不會自動還原。
+10. **新增機器的空窗**：見「相容性」。Stage 4 之後、Stage 5 之前，舊 installer 會收到 426。如果這段期間一定要加機器，用新版 `reach-agent` 手動 install。
+11. **新 agent 的 update confirm 比較嚴格**：更新前是 active 的機器，新版要 tunnel 連上、local sshd 健康，並且真的用一次性 key SSH 登入跑一個指令成功，才會 confirm；做不到就在 5 分鐘後自動 rollback。
 
-## 部署順序（建議，每一步之間至少觀察一天）
+## 部署順序（daybreak round 3 的兩階段；每一步之間至少觀察一天）
 
-1. **reachd + 資源上限 drop-in**（`deploy-from-mac.sh`，不帶 `REACH_INSTALL_REACHD_UNIT`）。會先在 snapshot 副本上演練 rollback。部署後：從外面 `ssh omarchy`、`ssh jack`；dashboard 重新登入；確認 carrier 有起來（2 台 websocket 機器有連上）。
-2. **Mac 上換新的 reach-mac-agent**（結構化 ssh config）。確認 `~/.ssh/reach-tunnels.conf` 內容正確、`ssh -G jack` 正常。
-3. **dashboard 前端**（`fix/dashboard-2026-11`），可以和第 1 步同一天，但在 reachd 之後。
-4. **nginx 範本**：先在 jason 上 `nginx -t`（1.24），再 reload。觀察 429。
-5. **HAProxy 建議 diff**：Arthur 看過後才套；套完從外面測 SSH 和 HTTPS。
-6. **sandbox unit**（`REACH_INSTALL_REACHD_UNIT=1`）：只在有退路的時候，並實際做一次 新增→停用→啟用→退役。
-7. **agent release**：新的 agent（anti-rollback floor、internal-sshd run-as、Windows ACL）透過 update policy 逐台更新，先從可以實體救回的機器開始。
+**Stage 4：只部署 server 端，不發布 agent。**
+
+1. **部署前（唯讀）**：確認 jason 現行 unit、DB 路徑、carrier mode、websocket target 數量（`agent_observations.transport='websocket'`）、沒有 pending request。
+2. **reachd + 資源上限 drop-in**（`deploy-from-mac.sh`，不帶 `REACH_INSTALL_REACHD_UNIT`、不帶 `REACH_PUBLISH_AGENT_RELEASE`）。流程：停 reachd（確認真的停了）→ snapshot → 在 snapshot 私有副本上演練 rollback → 記錄 fence → 換 binary → 啟動 → TCP 加認證的 readiness。部署後：從外面 `ssh omarchy`、`ssh jack`；dashboard 重新登入；確認 carrier 起來、2 台 websocket 機器連上（用 README 的 101 preflight，不要把 secret path 印出來）。
+3. **dashboard 前端**（`fix/dashboard-2026-11`），可以和第 2 步同一天，但在 reachd 之後。
+4. **Mac 上換新的 reach-mac-agent**。確認 `~/.ssh/reach-tunnels.conf` 內容正確、`ssh -G jack` 正常。
+5. **nginx 範本**：先在 jason 上 `nginx -t`（1.24），再 reload。觀察 429。
+6. **HAProxy 建議 diff**：Arthur 看過後才套；套完從外面測 SSH 和 HTTPS。
+7. **sandbox unit**（`REACH_INSTALL_REACHD_UNIT=1`）：只在有退路的時候，並實際做一次 新增→停用→啟用→退役。
+
+**Stage 5：發布 agent（等 Arthur 有 Windows 測試環境再做）。**
+
+- 前提：Linux container 和 **Windows VM** 都驗證過「不會重新開啟全介面的 port 22」（Disabled／Manual 的 OpenSSH 在沒有 `-InstallOpenSSH` 時保持原樣）、Windows authorized_keys ACL／junction、update confirm 的真實 tunnel + SSH 登入 gate。**我們現在沒有 Windows VM，所以這一步要等 Arthur 有 Windows 測試環境再做。**
+- 三平台 artifact 和 manifest 簽章完成後，才更新 release manifest 和 setup 腳本（`REACH_PUBLISH_AGENT_RELEASE=1`）。
+- 先從可以實體救回的機器開始，用 update policy 逐台更新。
+- 評估過「setup.sh 和 reachd 一起發、agent 之後再發」：不可行。新的 setup.sh 只會下載並驗證已發布的 agent，沒有新 agent 就不能用；而舊 agent 正是 register 被 426 的那一個。所以新增機器的空窗只能靠「縮短 Stage 4 到 Stage 5 的時間」或「空窗期間用新版 reach-agent 手動安裝」處理。
 
 ## astra round 1（審 17707dc，2026-11-21）
 
@@ -149,3 +163,42 @@
 - 已在 Linux（Ubuntu 24.04 container）實際跑過：rollback 兩種情境、internal-sshd 降權、systemd unit／drop-in verify。
 - 只在 Mac 上跑過：其他所有 Go 測試、`go test -race ./...`、setup.sh 的 offline 測試。
 - **還沒有實測**：Windows（ACL、junction、setup.ps1）、CentOS 6、nginx 1.24 的 `nginx -t`、HAProxy 2.8、sandbox unit 下真的 useradd／sshd reload。
+
+## astra round 2 + daybreak round 3（審 a2ba0cc，2026-11-21）
+
+兩份報告：`~/30-39-Research/34-tech-research/2026-11-21-reach-hardening-astra-review-r2.md`、`2026-11-21-reach-security-round3.md`。重複的合併成一列。
+
+| 編號 | 發現 | 怎麼修 | 證明（都做過 mutation 或「舊版會失敗」驗證） | commit |
+|---|---|---|---|---|
+| daybreak P1-A ＝ astra R2-02 | deploy-fence 靠 best-effort audit；audit 寫不進去時，revoke-all／disable／enable 成功但 fence 看不到，snapshot 還原會讓已撤銷的 JWT 復活 | 新表 `durable_actions`。只動 DB 的決策（revoke-all、登出、service token 建立／撤銷、approve／deny、invite claim、god code 自動核准、update policy、process title）和 journal 列在**同一個 transaction**，journal 寫失敗就整個 rollback 並回 5xx。有 OS 副作用的（provision、enable／disable／retire、provisioning recovery）**先 commit intent** 再動 OS，事後標 done／failed；intent 本身就擋還原。fence 只看 journal 的 MAX(id)；舊格式 fence 檔一律不准還原。snapshot 和 fence 都在 reachd 確認停止後才做 | `TestDeployFenceDetectsDurableActionsWhenAuditFails`（7 種動作，audit trigger 失敗）、`TestDurableActionRollsBackWhenJournalFails`、`TestOSActionsCommitIntentFirst`、`TestDeployFenceBlocksOnOpenIntent`、`TestDeployFenceOnPreJournalSchema`；container 情境 F（audit 失敗時 revoke-all → reachd 停著、DB 沒被換） | d260ae6 |
+| daybreak P1-B ＝ astra R2-01 | 正式 rollback 把 probe 也換回不支援 `admin-probe-token` 的舊 binary，情境 A 最後停機 | 新 binary 另存一份到 `/var/lib/reach/deploy-backups/reachd-probe.<ts>`（0700），readiness 和 `deploy-fence check` 都用它，`test -x` 檢查；舊 binary 用 copy 還原（不 move，備份不會被吃掉）；找不到 probe 就不還原、不宣稱成功。container 測試改成直接載入 `deploy-jason.sh` 的 transaction 函式（BEGIN/END 標記），用正式路徑 | container 情境 A（還原成功、舊 binary、heartbeat 200、備份仍在）、B（durable 動作→停著）、C（probe 不見→停著、沒宣稱成功） | a0880aa |
+| daybreak P1-C ＝ astra R2-07 | session_version migration 中斷後重跑不會再撤銷舊 JWT | `schema_migrations` marker 和 +1 在同一個 transaction | `TestInterruptedSessionMigrationIsRetried`（fault injection） | 01d9f26 |
+| daybreak P1-D | systemd disabled 的 sshd 仍會被 `service sshd start` 啟動；Windows Disabled 的 OpenSSH 會被改成 Automatic | 共用 policy（`cmd/reach-agent/sshd_policy.go`）：只重啟開機就啟用的 sshd；有 systemd 時絕不 fall through 到 `service`；沒有 systemd 時只對有 rc S-link 的 script 用 `service`。Windows Go installer／daemon 和 setup.ps1：Disabled／Manual 沒有 `-InstallOpenSSH` 就不改。macOS 只在 Remote Login 已啟用時 kickstart。刪掉會 `systemctl enable --now` 的舊 installer 死碼 | `TestDaemonDoesNotStartDisabledSystemdSSHD`（Linux container，真的 `Daemon.startLocalSSH` 加假 systemctl／service；舊版失敗、新版通過）、`TestDisabledSystemdSSHDIsNotStartedThroughService`、`TestWindowsSSHDScriptPolicy`。**Windows／PowerShell 沒有實測** | a4bfeba |
+| astra R2-03 | rollback 不檢查 stop 是否成功，就換 DB／WAL／binary | `stop_reachd_verified`：systemctl 回傳值、unit inactive、舊 MainPID 已結束、（有 fuser 時）沒人開著 DB；不成立就什麼都不動、停止 transaction。之後每一步（cp／rm／mv／start）都檢查回傳值 | container 情境 D（stop 回 70：新 process 照跑、binary 和 DB 都沒被換、沒有 forensic copy、沒宣稱成功） | a0880aa |
+| astra R2-04 | process-title 不在 machine lock 裡，retire 會留下「tunnel 已退役、machine 仍 active、token 有效」 | process-title 進同一把 lock，lock 內重讀並 generation CAS；enable／disable／retire 的 machine 和 tunnel finalize 放在同一個 transaction，CAS 輸了就全部 rollback。CAS 在 DB 裡做，所以其他 process（reachd CLI）的寫入也擋得住。順便：補償失敗會把 machine 標成 disable_failed（astra 的附帶觀察） | `TestProcessTitleCannotSplitRetire`、`TestRetireFinalizeIsAtomicAgainstOtherWriters`（模擬跨 process 的 generation 變動）、`TestFailedCompensationIsRecorded` | d260ae6 |
+| astra R2-05 | forensic copy 失敗仍覆蓋 live DB | 先完整複製到 staging 目錄、逐一 `cmp` 驗證，再 rename 成 failed set；任何一步失敗就不自動還原 | container 情境 E（copy 失敗→停著、live DB 沒被換、沒有半套 failed set） | a0880aa |
+| astra R2-06 | carrier rollback 沒還原 `ws-carrier.env` | env 也記錄 existed／backup；rollback 時還原，原本沒有就移走這次新增的 | container 情境 G（兩種情況） | a0880aa |
+| astra R2-08 | 舊 installer 新註冊會在核准後 provision 403 | **不改 binding 規則**。register 沒帶 mode／local_port（舊協定）就直接回 426 和更新提示，不存任何東西。部署文件寫明 Stage 4～5 之間不能用舊 installer 新增機器；評估「setup.sh 先發」不可行（見上方部署順序） | `TestOldInstallerGetsUpgradeRequiredAtRegister`；用 astra 留下的**真的 8c74086 binary** 跑 `TestRealOldAgentGetsUpgradeRequired`（`REACH_OLD_AGENT_BIN=...`）：install 在 register 就停在 426 | 7b83370 |
+| astra R2-09 ＋ daybreak P2-E | watcher 把「confirm 正在進行」當成已 confirm；orphan claim；hub 事後回 disabled 就能繞過 confirm gate；local SSH 只測 banner | 改成持久的狀態機 `update-state.json`（pending／confirming／confirmed／rolling_back／rolled_back），atomic write + fsync，每次轉換都拿 OS file lock；只有 confirmed 會取消 rollback；agent 啟動時，過期未 confirm 的更新直接 rollback，還沒過期就重新 arm watcher。狀態裡記錄**更新前**是否 active；active 的機器要 tunnel connected、local sshd healthy，並用一次性 ed25519 key 真的 SSH 登入跑 `echo` 且輸出正確（事後移除 key，marker 讓 sync_keys 也會清掉）。舊的 flag 檔仍可 confirm | `TestWatcherDoesNotTrustAnInProgressConfirm`、`TestCrashedConfirmIsRolledBack`、`TestStartupRollsBackOrphanedUpdate`、`TestConfirmKeepsRollbackArmedWhenFloorFails`、`TestConfirmGateIgnoresHubDisabledAfterUpdate`、`TestLocalSSHLoginProbe`（真的 internal-sshd：成功、指令沒跑成、沒有 sshd 三種） | d3cdd4c |
+| astra R2-10 ＋ daybreak P2-A | provisioning recovery 只改 DB；machine 已 offline、request 還沒 finalize 的窗口漏掉；正常 finalize 沒有 CAS | recovery 先對 request 做 CAS claim（expired），同一個 transaction 撤銷沒送出的 agent token 並寫 journal，再走正常的 locked retire（DisableAuth／Remove／驗證沒殘留），不管 machine 是 provisioning、offline 還是 failed；清不掉就留 cleanup_failed tombstone，maintenance 會一直重試。CreateMachine 和 finalize 都要求 request 還是 provisioning，否則回 410、不給 token；finalize 和 invite consume 同一個 transaction；provision 的 OS 階段拿 machine lock | `TestRecoveryRevokesHalfFinishedProvision`（provisioning／offline／failed 三種）、`TestRecoveryCleanupFailureIsRetried`、`TestProvisionFinalizeLosesToRecovery`、更新後的 `TestStuckProvisioningIsRecovered` | 4c1171c |
+| astra R2-11 | desired key 全部無效時，清掉最後一把有效 key 還回成功 | 先建好候選 key 集合才動檔案；desired 非空但沒有一把有效就回錯、檔案不動；明確 disable 或空集合才清空 | `TestSyncKeysKeepsFileWhenNoDesiredKeyIsValid`、`TestSyncKeysRevocationsStillRemoveReachKeys`、`TestSyncKeysInstallsValidSubset` | 874443b |
+| astra R2-12 ＝ daybreak P3-A | 容量滿時 Mac 重連會同時失去新舊兩條 stream | 先以「舊的已讓出」計算容量，放得下才把舊的 slot 轉給新的並 cancel 舊的；放不下就保留舊的；舊的 release 不會重複扣 | `TestSingleStreamReplacementAtCapKeepsOneStream`、`TestRejectedReplacementKeepsIncumbent`（兩個在舊版都失敗） | 48438ad |
+| astra R2-13 | `reachd ws-server` 沒有強制 path | 兩個入口共用 `wscarrier.RunServerCLI`（同樣的 flag、path gate、上限）；沒有 gate 的 Serve 改名 `ServeAnyPathForTests` | `TestRunServerCLIRequiresPath`、`TestReachdWSServerRequiresPath` | 304905b |
+| astra R2-14 | README 的 `proxy_pass .../;` 會改寫 path → 404；unit 沒有 EnvironmentFile | README 改成無 URI 的 proxy_pass、exact location、X-Real-IP、101 preflight（不把 secret 留在 history）；unit 加 `EnvironmentFile`、`User`、建立 env 檔的方法。`deploy/nginx` 範本本來就正確 | 文件 | 304905b |
+| daybreak P2-B | 307/308 redirect 會把 heartbeat token 和 body 送到 HTTP | `internal/safehttp`：control-plane 的 client 一律拒絕 redirect；下載 client 每一跳都重驗，不准 https→http，最多 5 跳；第一個下載 URL 也驗證。reach-agent（register／poll／provision／heartbeat／uninstall／更新／carrier 下載）和 reach-mac-agent 都不再用 `http.DefaultClient`；mac-agent 拒絕非 loopback 的 http api_url；`reach-sync-mac.sh` 登入前就拒絕 | `TestHeartbeatDoesNotFollowRedirect`（daybreak 的 307 PoC）、`TestDownloadRedirectPolicy`、`TestValidateURL`、`scripts/test-reach-sync-mac.sh`（新增 3 個拒絕案例） | af54683 |
+| daybreak P2-H | 同一個 NAT 後面，錯的 secret 用光 bucket 後，對的也被 429 | bucket 用光後，錯的仍然 429（不再計數）；但 SHA-256 存的 secret／token 仍會檢查一次（便宜），對的可以通過。舊 Argon2 hash 在被擋時一律不算（保護 CPU）。poll、heartbeat、uninstall 都一樣 | `TestSameIPBadAuthDoesNotBlockRightSecret`、`TestSameIPBadAgentTokensDoNotBlockRightToken`、`TestBlockedBucketSkipsArgonForLegacyHashes` | 982ae53 |
+| daybreak P3-B | server 和 Mac 的部署專屬保留名稱是兩份設定 | `ssh-config.json` 加 `reserved_hosts`（reserved_slugs 加 ProxyJump alias，空的時候不送，舊 Mac 不受影響）；Mac 取內建、server、本機三者聯集 | `TestSSHConfigJSONIncludesReservedHosts`、`TestSyncHonoursServerReservedHosts` | 991086c |
+| daybreak P3-C | Mac 一次拿掉所有 host 的 options | 先整份驗證；失敗時逐 host 單獨驗證，只拿掉被 ssh 拒絕的那台；`ssh -G` 也改成檢查每一台有 options 的 host | `TestBadOptionsOnlyAffectTheirHost`（老機器的 KexAlgorithms 留著、壞 cipher 拿掉） | 991086c |
+| daybreak P2-C | carrier path 仍是全 fleet 共用 secret | 設計文件加上過渡期操作規則（部署前數 websocket target、用 repo 的 nginx route、出事要 rotate path 不能只按 Disable） | `docs/design/2026-11-21-carrier-credentials.md` | cc04b1b |
+| daybreak P2-D | internal-sshd 的 SSH 處理仍是 root | **沒做，只寫設計**：要改 internal-sshd 的 key 檔 owner／mode 契約和剛加固的 writer 檢查、要 migration 和 root 實測、只能跟 agent release 一起出，不算小 | `docs/design/2026-11-21-internal-sshd-privilege-drop.md` | cc04b1b |
+| daybreak P2-F | bootstrap script 仍由 jason 提供 | 只寫設計（加上 Stage 5 之後的順序） | `docs/design/2026-11-21-bootstrap-trust-root.md` | cc04b1b |
+| daybreak P2-G | Windows junction 的 check-to-rename race | 只寫設計（加上 Windows VM 上的測試計畫） | `docs/design/2026-11-21-windows-keyfile-traversal.md` | cc04b1b |
+| daybreak P3-D／P3-E | dashboard | 交給前端 builder | | |
+| 其他 | rehearsal canary 固定 id 可能和真的 machine 撞（astra 的 deploy 子報告） | canary 的 id／slug 改成隨機 | container 測試 | a0880aa |
+
+### 平台驗證現況（round 3 後）
+
+- Linux（Ubuntu 24.04 container）實際跑過：rollback A～G（真的 `deploy-jason.sh` 函式、正式路徑、真的 8c74086 和新版 binary）、`Daemon.startLocalSSH` 不會啟動 disabled sshd、reach-agent 全部測試。
+- Mac：`go test -race ./...` 全過；`scripts/test-reach-sync-mac.sh`；真的 8c74086 reach-agent 對新 reachd 註冊得到 426。
+- 跨平台編譯：reach-agent（linux amd64／arm64／386／armv6／armv7、darwin、windows）、reach-mac-agent。
+- **還沒有實測**：Windows（ACL、junction、setup.ps1、sshd StartupType policy、PowerShell）、CentOS 6、HAProxy 2.8、sandbox unit 下真的 useradd／sshd reload、PID 1 systemd 下完整的部署和 rollback、從外部 vantage 的 WebSocket 101 和 SSH E2E。
