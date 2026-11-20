@@ -39,6 +39,9 @@ type Config struct {
 	// *-public, pi, localhost, ...). Use it for hand-written Host entries in
 	// the operator's ~/.ssh/config.
 	ReservedSlugs []string `yaml:"reserved_slugs"`
+	// RetiringTimeout is how long a machine may wait for its agent to confirm
+	// uninstall before it is flagged timed_out for an operator decision.
+	RetiringTimeout time.Duration `yaml:"retiring_timeout"`
 }
 
 type InitialAdmin struct {

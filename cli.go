@@ -152,7 +152,7 @@ func cliList(ctx context.Context, args []string) error {
 		return err
 	}
 	defer store.Close()
-	ms, err := prov.ListMachines(ctx)
+	ms, err := prov.ListMachines(ctx, true)
 	if err != nil {
 		return err
 	}

@@ -35,6 +35,7 @@ type Provisioner struct {
 	healthMu     sync.RWMutex
 	healthReport []map[string]any
 	argon        *argonGate
+	osOps        tunnelOS
 }
 
 type CreateMachineInput struct {
@@ -60,7 +61,20 @@ type CreateMachineResult struct {
 }
 
 func NewProvisioner(store *Store, cfg Config) *Provisioner {
-	return &Provisioner{store: store, cfg: cfg, probeTunnel: checkTunnelPort}
+	p := &Provisioner{store: store, cfg: cfg, probeTunnel: checkTunnelPort}
+	if cfg.ProvisioningEnabled {
+		p.osOps = systemTunnelOS{cfg: cfg}
+	} else {
+		p.osOps = noopTunnelOS{}
+	}
+	return p
+}
+
+func (p *Provisioner) ops() tunnelOS {
+	if p.osOps == nil {
+		return noopTunnelOS{}
+	}
+	return p.osOps
 }
 
 func (p *Provisioner) CreateMachine(ctx context.Context, in CreateMachineInput) (CreateMachineResult, error) {
@@ -118,7 +132,11 @@ func (p *Provisioner) CreateMachine(ctx context.Context, in CreateMachineInput) 
 	if err != nil {
 		return res, err
 	}
-	port, err := allocatePortTx(ctx, tx, hub)
+	dropIn, err := p.ops().DropInPorts()
+	if err != nil {
+		return res, fmt.Errorf("read sshd drop-ins: %w", err)
+	}
+	port, err := allocatePortTx(ctx, tx, hub, dropIn)
 	if err != nil {
 		return res, err
 	}
@@ -140,8 +158,12 @@ func (p *Provisioner) CreateMachine(ctx context.Context, in CreateMachineInput) 
 
 	if p.cfg.ProvisioningEnabled {
 		if err := p.createSystemAccount(ctx, unixUser, port, in.Pubkey, in.ExpiresAt); err != nil {
+			// The tunnel row keeps status 'failed' and its port/user as a
+			// tombstone; the allocator never reuses non-retired rows.
 			p.markProvisionFailed(ctx, machineID, tunnelID, err)
-			_ = p.cleanupSystem(ctx, unixUser)
+			if cerr := p.ops().Remove(ctx, unixUser); cerr != nil {
+				log.Printf("cleanup after failed provision of %s: %v", unixUser, cerr)
+			}
 			return res, err
 		}
 	}
@@ -179,8 +201,15 @@ func portListening(port int) bool {
 	return true
 }
 
-func allocatePortTx(ctx context.Context, tx *sql.Tx, h Hub) (int, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT remote_port FROM tunnels WHERE hub_id=? AND status NOT IN ('retired') AND remote_port BETWEEN ? AND ?`, h.ID, h.PortStart, h.PortEnd)
+// allocatePortTx picks a free loopback port. Ports are checked against the
+// tunnels of every hub row, not only h: all hub rows describe listeners on the
+// same machine, and per-hub checks let two "active" tunnels share 9205
+// (perf #5). Rows in any state except fully retired keep their port, so a
+// cleanup_failed or failed tunnel is a tombstone. Ports still named by a
+// Reach sshd drop-in are skipped too (daybreak P1-2).
+func allocatePortTx(ctx context.Context, tx *sql.Tx, h Hub, dropIn map[int]bool) (int, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT remote_port FROM tunnels WHERE status<>'retired' AND remote_port BETWEEN ? AND ?
+		UNION SELECT original_remote_port FROM tunnels WHERE status='retired' AND original_remote_port BETWEEN ? AND ? AND (cleanup_verified_at IS NULL OR cleanup_verified_at='')`, h.PortStart, h.PortEnd, h.PortStart, h.PortEnd)
 	if err != nil {
 		return 0, err
 	}
@@ -197,7 +226,7 @@ func allocatePortTx(ctx context.Context, tx *sql.Tx, h Hub) (int, error) {
 		return 0, err
 	}
 	for port := h.PortStart; port <= h.PortEnd; port++ {
-		if used[port] || reservedTunnelPort(port) || portListening(port) {
+		if used[port] || dropIn[port] || reservedTunnelPort(port) || portListening(port) {
 			continue
 		}
 		return port, nil
@@ -297,6 +326,27 @@ func (p *Provisioner) markProvisionFailed(ctx context.Context, machineID, tunnel
 	p.store.Audit(ctx, "machine.provision_failed", "system", machineID, msg)
 }
 
+// Cleanup states recorded in machines.cleanup_state (and mirrored into
+// machines.status for the failure cases). See docs/EVENTS.md.
+const (
+	CleanupPending  = "pending"
+	CleanupTimedOut = "timed_out"
+	CleanupFailed   = "cleanup_failed"
+	DisableFailed   = "disable_failed"
+	CleanupComplete = "complete"
+)
+
+// ErrCleanupFailed wraps any OS-level revoke/cleanup failure. The DB is left
+// showing the failure; nothing is reported as disabled or retired.
+var ErrCleanupFailed = errors.New("hub-side cleanup failed")
+
+func tunnelCleanupUser(t Tunnel) string {
+	if t.OriginalUnixUser != nil && *t.OriginalUnixUser != "" && !strings.HasPrefix(t.UnixUser, "rt-") {
+		return *t.OriginalUnixUser
+	}
+	return t.UnixUser
+}
+
 func (p *Provisioner) SetDesiredState(ctx context.Context, idOrSlug, desired, actor string) (Machine, error) {
 	m, tunnels, err := p.getMachineAndTunnels(ctx, idOrSlug)
 	if err != nil {
@@ -307,7 +357,13 @@ func (p *Provisioner) SetDesiredState(ctx context.Context, idOrSlug, desired, ac
 	switch desired {
 	case DesiredActive:
 		for _, t := range tunnels {
-			_ = p.enableTunnelAuth(ctx, t)
+			if t.Status == "retired" {
+				continue
+			}
+			if err := p.ops().EnableAuth(ctx, t.UnixUser); err != nil {
+				p.store.Audit(ctx, "machine.enable_failed", actor, m.ID, err.Error())
+				return Machine{}, fmt.Errorf("%w: enable %s: %v", ErrCleanupFailed, t.UnixUser, err)
+			}
 		}
 		_, err = p.store.db.ExecContext(ctx, `UPDATE machines SET desired_state=?, desired_generation=?, desired_changed_at=?, desired_changed_by=?, status=CASE WHEN observed_state='online' THEN 'online' ELSE 'offline' END, disabled_at=NULL, cleanup_state=NULL, updated_at=? WHERE id=?`, desired, gen, now, actor, now, m.ID)
 		if err == nil {
@@ -315,45 +371,33 @@ func (p *Provisioner) SetDesiredState(ctx context.Context, idOrSlug, desired, ac
 		}
 		_ = p.QueueCommand(ctx, m.ID, gen, "sync_keys", map[string]any{"enabled": true}, time.Hour)
 		_ = p.QueueCommand(ctx, m.ID, gen, "start_tunnel", nil, time.Hour)
-	case DesiredDisabled:
-		for _, t := range tunnels {
-			_ = p.disableTunnelAuth(ctx, t)
+	case DesiredDisabled, DesiredRetiring:
+		failures := p.disableTunnels(ctx, tunnels)
+		if len(failures) > 0 {
+			// Record intent and the failure; never claim the machine is
+			// disabled while its key may still log in.
+			msg := strings.Join(failures, "; ")
+			_, _ = p.store.db.ExecContext(ctx, `UPDATE machines SET desired_state=?, desired_generation=?, desired_changed_at=?, desired_changed_by=?, status=?, cleanup_state=?, provision_error=?, updated_at=? WHERE id=?`, desired, gen, now, actor, DisableFailed, DisableFailed, msg, now, m.ID)
+			p.store.Audit(ctx, "machine.disable_failed", actor, m.ID, msg)
+			p.publish("machine.cleanup_failed", m.ID, map[string]any{"machine_id": m.ID, "cleanup_state": DisableFailed, "desired_state": desired})
+			return Machine{}, fmt.Errorf("%w: %s", ErrCleanupFailed, msg)
 		}
-		_, err = p.store.db.ExecContext(ctx, `UPDATE machines SET desired_state=?, desired_generation=?, desired_changed_at=?, desired_changed_by=?, status='disabled', disabled_at=?, cleanup_state=NULL, updated_at=? WHERE id=?`, desired, gen, now, actor, now, now, m.ID)
+		if desired == DesiredDisabled {
+			_, err = p.store.db.ExecContext(ctx, `UPDATE machines SET desired_state=?, desired_generation=?, desired_changed_at=?, desired_changed_by=?, status='disabled', disabled_at=?, cleanup_state=NULL, provision_error=NULL, updated_at=? WHERE id=?`, desired, gen, now, actor, now, now, m.ID)
+		} else {
+			_, err = p.store.db.ExecContext(ctx, `UPDATE machines SET desired_state=?, desired_generation=?, desired_changed_at=?, desired_changed_by=?, status='retiring', cleanup_state=?, provision_error=NULL, updated_at=? WHERE id=?`, desired, gen, now, actor, CleanupPending, now, m.ID)
+		}
 		if err == nil {
-			_, _ = p.store.db.ExecContext(ctx, `UPDATE tunnels SET status='disabled' WHERE machine_id=?`, m.ID)
+			_, _ = p.store.db.ExecContext(ctx, `UPDATE tunnels SET status='disabled' WHERE machine_id=? AND status NOT IN ('retired','cleanup_failed')`, m.ID)
 		}
-		_ = p.QueueCommand(ctx, m.ID, gen, "stop_tunnel", nil, time.Hour)
-		_ = p.QueueCommand(ctx, m.ID, gen, "sync_keys", map[string]any{"enabled": false}, time.Hour)
-	case DesiredRetiring:
-		for _, t := range tunnels {
-			_ = p.disableTunnelAuth(ctx, t)
+		if desired == DesiredDisabled {
+			_ = p.QueueCommand(ctx, m.ID, gen, "stop_tunnel", nil, time.Hour)
+			_ = p.QueueCommand(ctx, m.ID, gen, "sync_keys", map[string]any{"enabled": false}, time.Hour)
+		} else {
+			_ = p.QueueCommand(ctx, m.ID, gen, "uninstall", map[string]any{"remove_agent": true, "remove_config": true, "remove_data": true, "remove_admin_keys": true, "stop_local_user_sshd": true}, p.retiringTimeout())
 		}
-		_, err = p.store.db.ExecContext(ctx, `UPDATE machines SET desired_state=?, desired_generation=?, desired_changed_at=?, desired_changed_by=?, status='retiring', cleanup_state='pending', updated_at=? WHERE id=?`, desired, gen, now, actor, now, m.ID)
-		if err == nil {
-			_, _ = p.store.db.ExecContext(ctx, `UPDATE tunnels SET status='disabled' WHERE machine_id=?`, m.ID)
-		}
-		_ = p.QueueCommand(ctx, m.ID, gen, "uninstall", map[string]any{"remove_agent": true, "remove_config": true, "remove_data": true, "remove_admin_keys": true, "stop_local_user_sshd": true}, 24*time.Hour)
 	case DesiredRetired:
-		for _, t := range tunnels {
-			cleanupUser := t.UnixUser
-			if t.OriginalUnixUser != nil && *t.OriginalUnixUser != "" {
-				cleanupUser = *t.OriginalUnixUser
-			}
-			if t.Status != "retired" {
-				_ = p.removeTunnelSystem(ctx, cleanupUser)
-			}
-			_, _ = p.retireTunnelRow(ctx, t)
-		}
-		original := m.Slug
-		if m.OriginalSlug != nil && *m.OriginalSlug != "" {
-			original = *m.OriginalSlug
-		}
-		retiredSlug, slugErr := p.retiredSlug(ctx, original, m.ID)
-		if slugErr != nil {
-			return Machine{}, slugErr
-		}
-		_, err = p.store.db.ExecContext(ctx, `UPDATE machines SET slug=?, original_slug=COALESCE(NULLIF(original_slug,''),?), desired_state=?, desired_generation=?, desired_changed_at=?, desired_changed_by=?, status='retired', cleanup_state=COALESCE(cleanup_state,'server-only'), retired_at=COALESCE(retired_at,?), updated_at=? WHERE id=?`, retiredSlug, original, desired, gen, now, actor, now, now, m.ID)
+		return p.retire(ctx, m, tunnels, gen, actor)
 	default:
 		return Machine{}, fmt.Errorf("invalid desired state %q", desired)
 	}
@@ -362,6 +406,85 @@ func (p *Provisioner) SetDesiredState(ctx context.Context, idOrSlug, desired, ac
 	}
 	p.store.Audit(ctx, "machine.desired."+desired, actor, m.ID, "")
 	return p.GetMachine(ctx, m.ID)
+}
+
+func (p *Provisioner) disableTunnels(ctx context.Context, tunnels []Tunnel) []string {
+	var failures []string
+	for _, t := range tunnels {
+		if t.Status == "retired" || !strings.HasPrefix(t.UnixUser, "rt-") {
+			continue
+		}
+		if err := p.ops().DisableAuth(ctx, t.UnixUser); err != nil {
+			failures = append(failures, t.UnixUser+": "+err.Error())
+		}
+	}
+	return failures
+}
+
+// retire removes every hub-side trace of the machine and only then frees
+// its port and slug. Any failure leaves a cleanup_failed tombstone that keeps
+// the Unix user and port reserved; retire-now retries it (daybreak P1-2).
+func (p *Provisioner) retire(ctx context.Context, m Machine, tunnels []Tunnel, gen int64, actor string) (Machine, error) {
+	now := nowUTC()
+	var failures []string
+	for _, t := range tunnels {
+		if t.Status == "retired" {
+			continue
+		}
+		u := tunnelCleanupUser(t)
+		if err := ValidateUnixUser(u); err != nil {
+			failures = append(failures, err.Error())
+			continue
+		}
+		if err := p.ops().Remove(ctx, u); err != nil {
+			failures = append(failures, u+": "+err.Error())
+		}
+		residue, err := p.ops().Residue(ctx, u)
+		if err != nil {
+			failures = append(failures, u+": verify: "+err.Error())
+		} else if len(residue) > 0 {
+			failures = append(failures, u+": still present: "+strings.Join(residue, ", "))
+		}
+	}
+	if len(failures) > 0 {
+		msg := strings.Join(failures, "; ")
+		_, _ = p.store.db.ExecContext(ctx, `UPDATE tunnels SET status='cleanup_failed' WHERE machine_id=? AND status<>'retired'`, m.ID)
+		_, _ = p.store.db.ExecContext(ctx, `UPDATE machines SET desired_state=?, desired_generation=?, desired_changed_at=?, desired_changed_by=?, status=?, cleanup_state=?, provision_error=?, updated_at=? WHERE id=?`, DesiredRetiring, gen, now, actor, CleanupFailed, CleanupFailed, msg, now, m.ID)
+		p.store.Audit(ctx, "machine.cleanup_failed", actor, m.ID, msg)
+		p.publish("machine.cleanup_failed", m.ID, map[string]any{"machine_id": m.ID, "cleanup_state": CleanupFailed, "desired_state": DesiredRetiring})
+		return Machine{}, fmt.Errorf("%w: %s", ErrCleanupFailed, msg)
+	}
+	for _, t := range tunnels {
+		if t.Status == "retired" {
+			continue
+		}
+		if _, err := p.retireTunnelRow(ctx, t); err != nil {
+			return Machine{}, err
+		}
+	}
+	original := m.Slug
+	if m.OriginalSlug != nil && *m.OriginalSlug != "" {
+		original = *m.OriginalSlug
+	}
+	retiredSlug, err := p.retiredSlug(ctx, original, m.ID)
+	if err != nil {
+		return Machine{}, err
+	}
+	// The agent token is revoked: a retired agent can no longer heartbeat or
+	// report results (daybreak P2-5).
+	if _, err := p.store.db.ExecContext(ctx, `UPDATE machines SET slug=?, original_slug=COALESCE(NULLIF(original_slug,''),?), desired_state=?, desired_generation=?, desired_changed_at=?, desired_changed_by=?, status='retired', cleanup_state=?, provision_error=NULL, agent_token_hash=NULL, retired_at=COALESCE(retired_at,?), updated_at=? WHERE id=?`, retiredSlug, original, DesiredRetired, gen, now, actor, CleanupComplete, now, now, m.ID); err != nil {
+		return Machine{}, err
+	}
+	_, _ = p.store.db.ExecContext(ctx, `UPDATE agent_commands SET status='cancelled', last_error='machine retired' WHERE machine_id=? AND status IN ('pending','sent')`, m.ID)
+	p.store.Audit(ctx, "machine.desired."+DesiredRetired, actor, m.ID, "")
+	return p.GetMachine(ctx, m.ID)
+}
+
+func (p *Provisioner) retiringTimeout() time.Duration {
+	if p.cfg.RetiringTimeout > 0 {
+		return p.cfg.RetiringTimeout
+	}
+	return 24 * time.Hour
 }
 
 func (p *Provisioner) SetUpdatePolicy(ctx context.Context, idOrSlug, policy, actor string) (Machine, error) {
@@ -517,7 +640,7 @@ func (p *Provisioner) retireTunnelRow(ctx context.Context, t Tunnel) (Tunnel, er
 			retiredPort = int(min.Int64) - 1
 		}
 	}
-	_, err := p.store.db.ExecContext(ctx, `UPDATE tunnels SET status='retired', original_unix_user=COALESCE(NULLIF(original_unix_user,''),?), original_remote_port=COALESCE(NULLIF(original_remote_port,0),?), unix_user=?, remote_port=? WHERE id=?`, originalUser, originalPort, retiredUser, retiredPort, t.ID)
+	_, err := p.store.db.ExecContext(ctx, `UPDATE tunnels SET status='retired', original_unix_user=COALESCE(NULLIF(original_unix_user,''),?), original_remote_port=COALESCE(NULLIF(original_remote_port,0),?), unix_user=?, remote_port=?, cleanup_verified_at=? WHERE id=?`, originalUser, originalPort, retiredUser, retiredPort, nowUTC(), t.ID)
 	if err != nil {
 		return t, err
 	}
@@ -544,31 +667,6 @@ func (p *Provisioner) QueueCommand(ctx context.Context, machineID string, genera
 	return err
 }
 
-func (p *Provisioner) disableTunnelAuth(ctx context.Context, t Tunnel) error {
-	if err := ValidateUnixUser(t.UnixUser); err != nil {
-		return err
-	}
-	ak := filepath.Join(p.cfg.TunnelHomeBase, t.UnixUser, ".ssh", "authorized_keys")
-	if _, err := os.Stat(ak); err == nil {
-		_ = os.Rename(ak, ak+".disabled")
-	}
-	_ = killUser(ctx, t.UnixUser)
-	return nil
-}
-
-func (p *Provisioner) enableTunnelAuth(ctx context.Context, t Tunnel) error {
-	if err := ValidateUnixUser(t.UnixUser); err != nil {
-		return err
-	}
-	ak := filepath.Join(p.cfg.TunnelHomeBase, t.UnixUser, ".ssh", "authorized_keys")
-	if _, err := os.Stat(ak); os.IsNotExist(err) {
-		if _, err := os.Stat(ak + ".disabled"); err == nil {
-			_ = os.Rename(ak+".disabled", ak)
-		}
-	}
-	return nil
-}
-
 func (p *Provisioner) DisableMachine(ctx context.Context, idOrSlug string, actor string) error {
 	_, err := p.SetDesiredState(ctx, idOrSlug, DesiredDisabled, actor)
 	return err
@@ -586,57 +684,12 @@ func (p *Provisioner) RetireMachineNow(ctx context.Context, idOrSlug string, act
 	return err
 }
 
-func (p *Provisioner) removeTunnelSystem(ctx context.Context, unixUser string) error {
-	if err := ValidateUnixUser(unixUser); err != nil {
-		return err
-	}
-	var errs []string
-	_ = killUser(ctx, unixUser)
-	if err := run(ctx, "userdel", unixUser); err != nil && !strings.Contains(err.Error(), "does not exist") {
-		errs = append(errs, err.Error())
-	}
-	conf := filepath.Join(p.cfg.SSHDConfigDir, "90-"+unixUser+".conf")
-	if err := os.Remove(conf); err != nil && !os.IsNotExist(err) {
-		errs = append(errs, err.Error())
-	}
-	home := filepath.Join(p.cfg.TunnelHomeBase, unixUser)
-	if err := validateHomePath(home); err != nil {
-		errs = append(errs, err.Error())
-	} else if err := os.RemoveAll(home); err != nil {
-		errs = append(errs, err.Error())
-	}
-	if len(errs) > 0 {
-		return errors.New(strings.Join(errs, "; "))
-	}
-	return nil
-}
-
-func (p *Provisioner) cleanupSystem(ctx context.Context, unixUser string) error {
-	return p.removeTunnelSystem(ctx, unixUser)
-}
-
 func validateHomePath(path string) error {
 	clean := filepath.Clean(path)
 	if !strings.HasPrefix(clean, "/var/lib/rt-") {
 		return fmt.Errorf("refusing unsafe home path %s", clean)
 	}
 	return ValidateUnixUser(filepath.Base(clean))
-}
-
-func killUser(ctx context.Context, unixUser string) error {
-	if err := ValidateUnixUser(unixUser); err != nil {
-		return err
-	}
-	_ = exec.CommandContext(ctx, "pkill", "-TERM", "-u", unixUser).Run()
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if exec.CommandContext(ctx, "pgrep", "-u", unixUser).Run() != nil {
-			return nil
-		}
-		time.Sleep(250 * time.Millisecond)
-	}
-	_ = exec.CommandContext(ctx, "pkill", "-KILL", "-u", unixUser).Run()
-	return nil
 }
 
 func run(ctx context.Context, name string, args ...string) error {
@@ -744,8 +797,14 @@ func (p *Provisioner) loadMachineOpenCommands(ctx context.Context, machineID str
 	return out, rows.Err()
 }
 
-func (p *Provisioner) ListMachines(ctx context.Context) ([]MachineWithTunnels, error) {
-	rows, err := p.store.db.QueryContext(ctx, `SELECT `+machineCols+` FROM machines ORDER BY created_at DESC`)
+// ListMachines returns the fleet. Retired machines are history and are left
+// out unless includeRetired is set (perf #7).
+func (p *Provisioner) ListMachines(ctx context.Context, includeRetired ...bool) ([]MachineWithTunnels, error) {
+	q := `SELECT ` + machineCols + ` FROM machines`
+	if len(includeRetired) == 0 || !includeRetired[0] {
+		q += ` WHERE desired_state<>'retired'`
+	}
+	rows, err := p.store.db.QueryContext(ctx, q+` ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -915,7 +974,7 @@ func (p *Provisioner) publish(typ, machineID string, data map[string]any) {
 }
 
 func (p *Provisioner) RunHealthCheck(ctx context.Context) ([]map[string]any, error) {
-	rows, err := p.store.db.QueryContext(ctx, `SELECT `+tunnelCols+` FROM tunnels WHERE status NOT IN ('disabled','retired','failed')`)
+	rows, err := p.store.db.QueryContext(ctx, `SELECT `+tunnelCols+` FROM tunnels WHERE status NOT IN ('disabled','retired','failed','cleanup_failed')`)
 	if err != nil {
 		return nil, err
 	}
@@ -956,7 +1015,7 @@ func (p *Provisioner) RunHealthCheck(ctx context.Context) ([]map[string]any, err
 		if ok {
 			nextTunnelStatus = "online"
 		}
-		if _, err := p.store.db.ExecContext(ctx, `UPDATE tunnels SET status=?,last_seen_at=CASE WHEN ?='online' THEN ? ELSE last_seen_at END WHERE id=? AND status NOT IN ('disabled','retired','failed')`, nextTunnelStatus, nextTunnelStatus, now, t.ID); err != nil {
+		if _, err := p.store.db.ExecContext(ctx, `UPDATE tunnels SET status=?,last_seen_at=CASE WHEN ?='online' THEN ? ELSE last_seen_at END WHERE id=? AND status NOT IN ('disabled','retired','failed','cleanup_failed')`, nextTunnelStatus, nextTunnelStatus, now, t.ID); err != nil {
 			return nil, err
 		}
 		if _, err := p.store.db.ExecContext(ctx, `INSERT INTO hub_observations (tunnel_id,machine_id,probe_state,last_probe_at,last_success_at,probe_error) VALUES (?,?,?,?,?,?) ON CONFLICT(tunnel_id) DO UPDATE SET probe_state=excluded.probe_state,last_probe_at=excluded.last_probe_at,last_success_at=COALESCE(excluded.last_success_at,hub_observations.last_success_at),probe_error=excluded.probe_error`, t.ID, t.MachineID, state, now, lastSuccess, nullable(probeErr)); err != nil {
@@ -1133,6 +1192,15 @@ func (p *Provisioner) ExpireOnce(ctx context.Context) error {
 	if _, err := p.store.db.ExecContext(ctx, `UPDATE requests SET status='expired' WHERE status='approved' AND setup_token_expires_at IS NOT NULL AND setup_token_expires_at < ?`, now); err != nil {
 		return err
 	}
+	if err := p.expireCommands(ctx, now); err != nil {
+		return err
+	}
+	if err := p.flagStuckRetiring(ctx, nowTime); err != nil {
+		return err
+	}
+	if err := p.verifyRetiredTunnels(ctx); err != nil {
+		log.Printf("verify retired tunnels: %v", err)
+	}
 	rows, err := p.store.db.QueryContext(ctx, `SELECT id FROM machines WHERE desired_state NOT IN ('disabled','retiring','retired') AND expires_at IS NOT NULL AND expires_at < ?`, now)
 	if err != nil {
 		return err
@@ -1152,6 +1220,88 @@ func (p *Provisioner) ExpireOnce(ctx context.Context) error {
 	for _, id := range ids {
 		if err := p.DisableMachine(ctx, id, "system-expire"); err != nil {
 			log.Printf("auto-expire disable %s: %v", id, err)
+		}
+	}
+	return nil
+}
+
+// expireCommands marks commands past expires_at so they stop showing as open
+// work (perf #7).
+func (p *Provisioner) expireCommands(ctx context.Context, now string) error {
+	_, err := p.store.db.ExecContext(ctx, `UPDATE agent_commands SET status='expired', last_error=COALESCE(last_error,'expired before the agent acknowledged it') WHERE status IN ('pending','sent') AND expires_at IS NOT NULL AND expires_at<=?`, now)
+	return err
+}
+
+// flagStuckRetiring marks machines whose agent never confirmed uninstall.
+// It does not retire them: the operator decides with retire-now, which runs
+// the full verified cleanup.
+func (p *Provisioner) flagStuckRetiring(ctx context.Context, now time.Time) error {
+	cutoff := now.Add(-p.retiringTimeout()).Format(time.RFC3339)
+	rows, err := p.store.db.QueryContext(ctx, `SELECT id FROM machines WHERE desired_state='retiring' AND (cleanup_state IS NULL OR cleanup_state=?) AND desired_changed_at IS NOT NULL AND desired_changed_at<?`, CleanupPending, cutoff)
+	if err != nil {
+		return err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, id := range ids {
+		res, err := p.store.db.ExecContext(ctx, `UPDATE machines SET cleanup_state=?, updated_at=? WHERE id=? AND desired_state='retiring' AND (cleanup_state IS NULL OR cleanup_state=?)`, CleanupTimedOut, nowUTC(), id, CleanupPending)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 1 {
+			p.store.Audit(ctx, "machine.retiring_timed_out", "system", id, "")
+			p.publish("machine.retiring_timed_out", id, map[string]any{"machine_id": id, "cleanup_state": CleanupTimedOut})
+		}
+	}
+	return nil
+}
+
+// verifyRetiredTunnels checks tunnels retired by older releases (which did
+// not verify cleanup) and releases their original port once nothing is left
+// on the hub. Until then the allocator treats the port as taken.
+func (p *Provisioner) verifyRetiredTunnels(ctx context.Context) error {
+	rows, err := p.store.db.QueryContext(ctx, `SELECT id,original_unix_user FROM tunnels WHERE status='retired' AND (cleanup_verified_at IS NULL OR cleanup_verified_at='') LIMIT 50`)
+	if err != nil {
+		return err
+	}
+	type pending struct{ id, user string }
+	var list []pending
+	for rows.Next() {
+		var id string
+		var u sql.NullString
+		if err := rows.Scan(&id, &u); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		list = append(list, pending{id, u.String})
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, t := range list {
+		if ValidateUnixUser(t.user) != nil {
+			continue
+		}
+		residue, err := p.ops().Residue(ctx, t.user)
+		if err != nil {
+			return err
+		}
+		if len(residue) > 0 {
+			log.Printf("retired tunnel %s (%s) still has hub residue: %s", t.id, t.user, strings.Join(residue, ", "))
+			continue
+		}
+		if _, err := p.store.db.ExecContext(ctx, `UPDATE tunnels SET cleanup_verified_at=? WHERE id=?`, nowUTC(), t.id); err != nil {
+			return err
 		}
 	}
 	return nil

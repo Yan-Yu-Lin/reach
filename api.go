@@ -1083,15 +1083,29 @@ func (s *Server) handleAgentUninstall(w http.ResponseWriter, r *http.Request, co
 		writeClientAuthErr(w)
 		return
 	}
+	// cleanup_state='complete' is only written by retire() after the hub
+	// side is verified clean; a failure is reported, not hidden (P1-2).
+	var opErr error
 	if complete {
-		_ = s.prov.RetireMachineNow(r.Context(), req.MachineID, "agent-uninstall")
-		_, _ = s.store.db.ExecContext(r.Context(), `UPDATE machines SET cleanup_state='complete' WHERE id=?`, req.MachineID)
-		s.publishEvent(r.Context(), "machine.retired", req.MachineID, map[string]any{"machine_id": req.MachineID})
+		opErr = s.prov.RetireMachineNow(r.Context(), req.MachineID, "agent-uninstall")
+		if opErr == nil {
+			s.publishEvent(r.Context(), "machine.retired", req.MachineID, map[string]any{"machine_id": req.MachineID})
+		}
 	} else {
-		_ = s.prov.RemoveMachine(r.Context(), req.MachineID, "agent-uninstall")
-		s.publishEvent(r.Context(), "machine.retiring", req.MachineID, map[string]any{"machine_id": req.MachineID, "reason": req.Reason})
+		m, err := s.prov.GetMachine(r.Context(), req.MachineID)
+		if err == nil && m.DesiredState != DesiredRetiring {
+			opErr = s.prov.RemoveMachine(r.Context(), req.MachineID, "agent-uninstall")
+		}
+		if opErr == nil {
+			s.publishEvent(r.Context(), "machine.retiring", req.MachineID, map[string]any{"machine_id": req.MachineID, "reason": truncateUTF8(req.Reason, 128)})
+		}
 	}
 	s.publishEvent(r.Context(), "ssh_config.changed", req.MachineID, map[string]any{"machine_id": req.MachineID})
+	if opErr != nil {
+		log.Printf("agent uninstall for %s: %v", req.MachineID, opErr)
+		writeErr(w, http.StatusConflict, "hub-side cleanup failed; operator action required")
+		return
+	}
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
@@ -1306,7 +1320,8 @@ func (s *Server) handleAdminRequestAction(w http.ResponseWriter, r *http.Request
 }
 
 func (s *Server) handleAdminMachines(w http.ResponseWriter, r *http.Request) {
-	ms, err := s.prov.ListMachines(r.Context())
+	include := r.URL.Query().Get("include_retired")
+	ms, err := s.prov.ListMachines(r.Context(), include == "1" || include == "true")
 	if err != nil {
 		writeErr(w, 500, "query failed")
 		return
@@ -1370,7 +1385,17 @@ func (s *Server) handleAdminMachineAction(w http.ResponseWriter, r *http.Request
 	}
 	m, err := s.prov.SetDesiredState(r.Context(), id, desired, claims.Username)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		if errors.Is(err, sql.ErrNoRows) {
+			writeErr(w, 404, "machine not found")
+			return
+		}
+		if errors.Is(err, ErrCleanupFailed) {
+			s.publishEvent(r.Context(), "ssh_config.changed", id, map[string]any{"reason": action, "machine_id": id})
+			writeErr(w, http.StatusConflict, err.Error())
+			return
+		}
+		log.Printf("machine %s %s: %v", id, action, err)
+		writeErr(w, 500, "action failed")
 		return
 	}
 	s.publishEvent(r.Context(), "machine.desired_changed", m.ID, map[string]any{"machine_id": m.ID, "desired_state": m.DesiredState, "generation": m.DesiredGeneration})

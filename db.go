@@ -315,6 +315,7 @@ func (s *Store) Migrate(ctx context.Context, cfg Config) error {
 		{"machines", "process_title_config_json", "TEXT"},
 		{"tunnels", "original_unix_user", "TEXT"},
 		{"tunnels", "original_remote_port", "INTEGER"},
+		{"tunnels", "cleanup_verified_at", "TEXT"},
 		{"requests", "metadata_json", "TEXT"},
 		{"requests", "observed_ip", "TEXT"},
 	} {
@@ -332,6 +333,10 @@ func (s *Store) Migrate(ctx context.Context, cfg Config) error {
 		return err
 	}
 	if _, err := s.db.ExecContext(ctx, `UPDATE machines SET update_policy='manual' WHERE update_policy IS NULL OR update_policy=''`); err != nil {
+		return err
+	}
+	// Retired machines must not keep a working agent token (daybreak P2-5).
+	if _, err := s.db.ExecContext(ctx, `UPDATE machines SET agent_token_hash=NULL WHERE desired_state='retired' AND agent_token_hash IS NOT NULL`); err != nil {
 		return err
 	}
 	if err := s.releaseRetiredSlugs(ctx); err != nil {
