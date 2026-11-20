@@ -62,6 +62,10 @@ type updateBinaryOptions struct {
 	// AllowDowngrade is a local break-glass flag. Remote update_agent
 	// commands never pass it.
 	AllowDowngrade bool
+	// WasActive: the machine was meant to be online (tunnel enabled) when
+	// the update started. The confirm gate uses this recorded value, not
+	// the hub's answer after the update (daybreak round 3 P2-E).
+	WasActive bool
 
 	rollbackWatcher bool
 	confirmFlag     string
@@ -94,6 +98,7 @@ func updateBinaryCommand(ctx context.Context, args []string) error {
 	fs.BoolVar(&opt.Foreground, "foreground", false, "perform the update in this process instead of spawning a detached worker")
 	fs.BoolVar(&opt.Confirm, "confirm", false, "confirm the current manual update and cancel rollback")
 	fs.BoolVar(&opt.AllowDowngrade, "allow-downgrade", false, "local break-glass: accept a signed release older than the last confirmed one")
+	fs.BoolVar(&opt.WasActive, "was-active", true, "the machine is meant to be online; confirmation then requires a working tunnel and SSH login")
 	fs.BoolVar(&opt.rollbackWatcher, "rollback-watcher", false, "internal: run rollback watcher")
 	fs.StringVar(&opt.confirmFlag, "confirm-flag", "", "internal: confirmation flag path")
 	fs.StringVar(&opt.backupPath, "backup", "", "internal: backup binary path")
@@ -322,21 +327,29 @@ func performBinaryUpdate(ctx context.Context, st reachInstallState, opt updateBi
 	}
 	fmt.Printf("[reach] backed up current binary to %s\n", backupPath)
 
-	confirmFlag := filepath.Join(st.DataDir, "update-confirm-required")
-	if err := os.WriteFile(confirmFlag, []byte(fmt.Sprintf("backup=%s\ninstalled_at=%s\ncandidate_version=%s\ncandidate_sequence=%d\n", backupPath, time.Now().UTC().Format(time.RFC3339), candidateVersion, manifestSequence(manifest))), 0o600); err != nil {
-		return fmt.Errorf("write confirmation flag: %w", err)
+	if prev, err := readUpdateState(st.DataDir); err != nil {
+		return err
+	} else if !prev.terminal() {
+		return fmt.Errorf("an update to %s is still %s; confirm it or let it roll back first", prev.CandidateVersion, prev.State)
+	}
+	now := time.Now().UTC()
+	ust := &updateState{State: updPending, Backup: backupPath, AgentPath: st.AgentPath, InstallMode: st.InstallMode, ConfigPath: st.ConfigPath, CandidateVersion: candidateVersion, CandidateSequence: manifestSequence(manifest), WasActive: opt.WasActive, InstalledAt: now.Format(time.RFC3339), Deadline: now.Add(opt.RollbackAfter).Format(time.RFC3339)}
+	if err := withUpdateLock(st.DataDir, func() error { return writeUpdateState(st.DataDir, ust) }); err != nil {
+		return fmt.Errorf("record update state: %w", err)
 	}
 
 	if err := atomicInstallBinary(candidatePath, st.AgentPath); err != nil {
-		_ = os.Remove(confirmFlag)
+		ust.State = updRolledBack
+		_ = withUpdateLock(st.DataDir, func() error { return writeUpdateState(st.DataDir, ust) })
 		return err
 	}
 	fmt.Printf("[reach] installed candidate at %s\n", st.AgentPath)
 
 	rollbackLog := filepath.Join(st.DataDir, "update-rollback-"+id+".log")
-	if err := startRollbackWatcher(st, confirmFlag, backupPath, rollbackLog, opt.RollbackAfter); err != nil {
-		_ = restoreBinary(backupPath, st.AgentPath)
-		_ = os.Remove(confirmFlag)
+	if err := startRollbackWatcher(st, rollbackLog, opt.RollbackAfter); err != nil {
+		if _, rerr := rollbackIfUnconfirmed(st.DataDir); rerr != nil {
+			return fmt.Errorf("start rollback watcher failed (%v) and restoring the backup failed: %w", err, rerr)
+		}
 		return fmt.Errorf("start rollback watcher failed; restored backup: %w", err)
 	}
 	fmt.Printf("[reach] rollback watcher armed: %s (timeout %s)\n", rollbackLog, opt.RollbackAfter)
@@ -728,7 +741,7 @@ func syncDir(dir string) error {
 	return d.Sync()
 }
 
-func startRollbackWatcher(st reachInstallState, confirmFlag, backupPath, logPath string, after time.Duration) error {
+func startRollbackWatcher(st reachInstallState, logPath string, after time.Duration) error {
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
@@ -739,7 +752,7 @@ func startRollbackWatcher(st reachInstallState, confirmFlag, backupPath, logPath
 		return err
 	}
 	defer devNull.Close()
-	args := []string{"update-binary", "--rollback-watcher", "--confirm-flag", confirmFlag, "--backup", backupPath, "--agent-path", st.AgentPath, "--install-mode", st.InstallMode, "--config", st.ConfigPath, "--data-dir", st.DataDir, "--rollback-after", after.String(), "--log", logPath}
+	args := []string{"update-binary", "--rollback-watcher", "--agent-path", st.AgentPath, "--install-mode", st.InstallMode, "--config", st.ConfigPath, "--data-dir", st.DataDir, "--rollback-after", after.String(), "--log", logPath}
 	cmd := exec.Command(st.AgentPath, args...)
 	cmd.Stdin = devNull
 	cmd.Stdout = logFile
@@ -755,39 +768,99 @@ func runUpdateRollbackWatcher(ctx context.Context, opt updateBinaryOptions) erro
 	if opt.RollbackAfter <= 0 {
 		opt.RollbackAfter = defaultUpdateRollbackAfter
 	}
-	fmt.Printf("[reach] rollback watcher waiting %s for confirmation flag %s\n", opt.RollbackAfter, opt.confirmFlag)
+	if opt.dataDir == "" {
+		return fmt.Errorf("rollback watcher missing --data-dir")
+	}
+	// Legacy watchers were given a flag and backup; finish those the old way.
+	if opt.confirmFlag != "" {
+		return runLegacyRollbackWatcher(ctx, opt)
+	}
+	fmt.Printf("[reach] rollback watcher waiting %s for confirmation\n", opt.RollbackAfter)
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-time.After(opt.RollbackAfter):
 	}
-	if opt.confirmFlag == "" || opt.backupPath == "" || opt.agentPath == "" {
-		return fmt.Errorf("rollback watcher missing required paths")
-	}
-	// Claim the pending update atomically. If confirm already claimed it,
-	// the update stands; otherwise confirm can no longer raise the floor
-	// for a binary we are about to replace (astra P2-03).
-	claim, err := claimPendingUpdate(opt.confirmFlag, "rollback")
-	if errors.Is(err, os.ErrNotExist) {
-		fmt.Printf("[reach] update was confirmed; rollback canceled\n")
-		return nil
-	}
+	// Decide under the update lock from the durable state: anything but
+	// "confirmed" (including a confirm still running or one that crashed)
+	// is rolled back (astra R2-09).
+	restored, err := rollbackIfUnconfirmed(opt.dataDir)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("[reach] update was not confirmed; restoring %s to %s\n", opt.backupPath, opt.agentPath)
-	if err := restoreBinary(opt.backupPath, opt.agentPath); err != nil {
-		// Keep the pending state so a later confirm/rollback still sees it.
-		_ = os.Rename(claim, opt.confirmFlag)
-		return err
+	if !restored {
+		fmt.Printf("[reach] update was confirmed; rollback canceled\n")
+		return nil
 	}
-	_ = os.Remove(claim)
 	st := reachInstallState{AgentPath: opt.agentPath, InstallMode: opt.installMode, ConfigPath: opt.configPath, DataDir: opt.dataDir, PIDFile: filepath.Join(opt.dataDir, "reach-agent.pid"), LogPath: filepath.Join(opt.dataDir, "agent.log")}
 	if err := restartReachAgent(ctx, st); err != nil {
 		return fmt.Errorf("rollback restored binary but restart failed: %w", err)
 	}
-	fmt.Printf("[reach] rollback complete\n")
+	fmt.Printf("[reach] update was not confirmed; rollback complete\n")
 	return nil
+}
+
+// resumeInterruptedUpdate runs at agent start. If an update is unfinished
+// and its deadline passed (the watcher died, or a confirm/rollback
+// crashed), roll it back now; if the deadline is still ahead, make sure a
+// watcher exists by starting a new one for the remaining time.
+func resumeInterruptedUpdate(ctx context.Context, st reachInstallState, logf func(string, ...any)) {
+	ust, err := readUpdateState(st.DataDir)
+	if err != nil {
+		logf("update state unreadable: %v", err)
+		return
+	}
+	if ust.terminal() {
+		return
+	}
+	remaining := time.Until(ust.deadline())
+	if remaining > 0 {
+		logPath := filepath.Join(st.DataDir, "update-rollback-resume-"+time.Now().UTC().Format("20060102T150405Z")+".log")
+		if err := startRollbackWatcher(st, logPath, remaining); err != nil {
+			logf("could not re-arm rollback watcher: %v", err)
+		}
+		return
+	}
+	restored, err := rollbackIfUnconfirmed(st.DataDir)
+	if err != nil {
+		logf("interrupted update rollback failed: %v", err)
+		return
+	}
+	if restored {
+		logf("rolled back unconfirmed update to %s; restarting", ust.CandidateVersion)
+		if err := restartReachAgent(ctx, st); err != nil {
+			logf("restart after rollback failed: %v", err)
+		}
+	}
+}
+
+// runLegacyRollbackWatcher handles a watcher started by an older agent
+// (flag file protocol), so an in-flight update survives the upgrade.
+func runLegacyRollbackWatcher(ctx context.Context, opt updateBinaryOptions) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(opt.RollbackAfter):
+	}
+	if opt.backupPath == "" || opt.agentPath == "" {
+		return fmt.Errorf("rollback watcher missing required paths")
+	}
+	var restored bool
+	err := withUpdateLock(opt.dataDir, func() error {
+		if _, err := os.Stat(opt.confirmFlag); err != nil {
+			return nil // confirmed (legacy confirm removes the flag under the lock)
+		}
+		if err := restoreBinary(opt.backupPath, opt.agentPath); err != nil {
+			return err
+		}
+		restored = true
+		return os.Remove(opt.confirmFlag)
+	})
+	if err != nil || !restored {
+		return err
+	}
+	st := reachInstallState{AgentPath: opt.agentPath, InstallMode: opt.installMode, ConfigPath: opt.configPath, DataDir: opt.dataDir, PIDFile: filepath.Join(opt.dataDir, "reach-agent.pid"), LogPath: filepath.Join(opt.dataDir, "agent.log")}
+	return restartReachAgent(ctx, st)
 }
 
 func restoreBinary(backupPath, agentPath string) error {
@@ -795,53 +868,44 @@ func restoreBinary(backupPath, agentPath string) error {
 }
 
 // confirmUpdate cancels the pending rollback and raises the anti-rollback
-// floor. The pending flag is claimed atomically (rename) so the rollback
-// watcher and confirm can never both act; if the floor cannot be read or
-// written, the flag is restored and an error is returned, leaving the
-// rollback armed (astra P2-03).
+// floor, through the durable state machine (update_state.go). If the floor
+// cannot be recorded the update stays pending and the rollback armed.
 func confirmUpdate(st reachInstallState) error {
-	flag := filepath.Join(st.DataDir, "update-confirm-required")
-	claim, err := claimPendingUpdate(flag, "confirm")
-	if errors.Is(err, os.ErrNotExist) {
-		fmt.Printf("[reach] no pending update confirmation found at %s\n", flag)
+	handled, err := confirmUpdateState(st.DataDir)
+	if err != nil {
+		return err
+	}
+	if handled {
+		fmt.Printf("[reach] update confirmed; rollback canceled.\n")
 		return nil
 	}
-	if err != nil {
-		return err
-	}
-	restore := func(cause error) error {
-		if rerr := os.Rename(claim, flag); rerr != nil {
-			return fmt.Errorf("%v; additionally could not restore %s: %w", cause, flag, rerr)
-		}
-		return cause
-	}
-	b, err := os.ReadFile(claim)
-	if err != nil {
-		return restore(fmt.Errorf("read pending update: %w", err))
-	}
-	// Raise the floor only once the new binary has proven itself, so an
-	// unconfirmed (rolled back) update can still reinstall the previous one.
-	if seq := confirmFlagSequence(string(b)); seq > 0 {
-		if err := raiseReleaseFloor(st.DataDir, seq); err != nil {
-			return restore(fmt.Errorf("record release floor: %w", err))
-		}
-	}
-	if err := os.Remove(claim); err != nil {
-		return err
-	}
-	fmt.Printf("[reach] update confirmed; rollback canceled.\n")
-	return nil
+	return confirmLegacyFlag(st)
 }
 
-// claimPendingUpdate atomically renames the pending-update flag to a
-// claim file owned by the caller. os.ErrNotExist means another party
-// already claimed (or there was nothing pending).
-func claimPendingUpdate(flag, who string) (string, error) {
-	claim := fmt.Sprintf("%s.%s-%d", flag, who, os.Getpid())
-	if err := os.Rename(flag, claim); err != nil {
-		return "", err
-	}
-	return claim, nil
+// confirmLegacyFlag confirms an update started by an older agent (flag
+// file). It holds the update lock, so a legacy watcher cannot act halfway.
+func confirmLegacyFlag(st reachInstallState) error {
+	flag := filepath.Join(st.DataDir, "update-confirm-required")
+	return withUpdateLock(st.DataDir, func() error {
+		b, err := os.ReadFile(flag)
+		if errors.Is(err, os.ErrNotExist) {
+			fmt.Printf("[reach] no pending update confirmation found\n")
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if seq := confirmFlagSequence(string(b)); seq > 0 {
+			if err := raiseReleaseFloor(st.DataDir, seq); err != nil {
+				return fmt.Errorf("record release floor: %w", err)
+			}
+		}
+		if err := os.Remove(flag); err != nil {
+			return err
+		}
+		fmt.Printf("[reach] update confirmed; rollback canceled.\n")
+		return syncDir(st.DataDir)
+	})
 }
 
 func restartLaunchdAgent(ctx context.Context, st reachInstallState) error {
@@ -1040,7 +1104,7 @@ func (d *Daemon) seedReleaseFloor() {
 	if seq == 0 || dir == "" {
 		return
 	}
-	if _, err := os.Stat(filepath.Join(dir, "update-confirm-required")); err == nil {
+	if updatePending(dir) {
 		return
 	}
 	if err := raiseReleaseFloor(dir, seq); err != nil {

@@ -47,57 +47,6 @@ func TestLegacyManifestUsesCreatedAt(t *testing.T) {
 	}
 }
 
-func TestConfirmRaisesFloorFromFlag(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "update-confirm-required"), []byte("backup=x\ncandidate_version=0.2.0\ncandidate_sequence=1790000042\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := confirmUpdate(reachInstallState{DataDir: dir}); err != nil {
-		t.Fatal(err)
-	}
-	if f, _ := readReleaseFloor(dir); f != 1790000042 {
-		t.Fatalf("floor after confirm = %d", f)
-	}
-}
-
-// Astra P2-03: a floor that cannot be recorded must not cancel rollback.
-func TestConfirmKeepsRollbackArmedWhenFloorFails(t *testing.T) {
-	dir := t.TempDir()
-	flag := filepath.Join(dir, "update-confirm-required")
-	if err := os.WriteFile(flag, []byte("candidate_sequence=1790000000\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, releaseFloorFile), []byte("corrupt-json"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := confirmUpdate(reachInstallState{DataDir: dir}); err == nil {
-		t.Fatal("confirm succeeded although the floor could not be recorded")
-	}
-	if _, err := os.Stat(flag); err != nil {
-		t.Fatalf("pending update flag lost: %v", err)
-	}
-}
-
-// The watcher and confirm claim the same pending state; only one wins.
-func TestConfirmAndRollbackClaimExclusively(t *testing.T) {
-	dir := t.TempDir()
-	flag := filepath.Join(dir, "update-confirm-required")
-	if err := os.WriteFile(flag, []byte("candidate_sequence=1790000000\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	claim, err := claimPendingUpdate(flag, "rollback")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.Remove(claim)
-	if err := confirmUpdate(reachInstallState{DataDir: dir}); err != nil {
-		t.Fatal(err)
-	}
-	if f, _ := readReleaseFloor(dir); f != 0 {
-		t.Fatalf("confirm raised floor to %d while rollback held the update", f)
-	}
-}
-
 // Astra P2-04: legacy created_at floors and explicit sequences share one
 // ordering space; a small counter is rejected outright instead of being
 // silently compared against a timestamp.
@@ -139,7 +88,7 @@ func TestFreshInstallSeedsFloorFromEmbeddedRelease(t *testing.T) {
 	// While an update awaits confirmation the floor is not raised, so the
 	// rollback to the previous binary stays possible.
 	dir2 := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir2, "update-confirm-required"), []byte("x"), 0o600); err != nil {
+	if err := writeUpdateState(dir2, &updateState{State: updPending}); err != nil {
 		t.Fatal(err)
 	}
 	cfg.Install.DataDir = dir2

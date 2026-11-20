@@ -517,6 +517,11 @@ func NewDaemon(cfg Config) *Daemon {
 
 func (d *Daemon) Run(ctx context.Context) error {
 	d.logger.Printf("starting reach-agent %s for machine=%s slug=%s", version, d.cfg.MachineID, d.cfg.Slug)
+	if d.canSelfUpdate() {
+		if st, err := loadReachInstallState(""); err == nil {
+			resumeInterruptedUpdate(ctx, st, d.logger.Printf)
+		}
+	}
 	d.seedReleaseFloor()
 	currentInterval := d.heartbeatInterval()
 	hbTicker := time.NewTicker(currentInterval)
@@ -740,7 +745,11 @@ func (d *Daemon) applyCommand(ctx context.Context, cmd AgentCommand) {
 			res.Message = "update payload missing version"
 			break
 		}
-		args := []string{"--version", payload.Version}
+		// Record whether the machine is meant to be online now, before
+		// the update; the new binary's confirm gate uses this value
+		// (daybreak round 3 P2-E).
+		wasActive := d.desired.DesiredState == "active" && d.desired.DesiredConfig.TunnelEnabled
+		args := []string{"--version", payload.Version, "--was-active=" + strconv.FormatBool(wasActive)}
 		if payload.APIURL != "" {
 			args = append(args, "--api-url", payload.APIURL)
 		}
@@ -778,33 +787,6 @@ func (d *Daemon) canSelfUpdate() bool {
 		return false
 	}
 	return true
-}
-
-func (d *Daemon) confirmPendingUpdateAfterHeartbeat() {
-	if d.updateConfirmed || !d.canSelfUpdate() {
-		return
-	}
-	// A heartbeat only proves HTTP works. Confirm (and raise the release
-	// floor) only once the new binary also runs the tunnel and local SSH,
-	// so a binary that breaks the actual path home is rolled back
-	// (daybreak P3-2).
-	// A machine that is disabled (tunnel intentionally stopped) confirms on
-	// HTTP alone, otherwise it could never accept an update.
-	if st := d.snapshot(); d.desired.DesiredState == "active" && d.desired.DesiredConfig.TunnelEnabled && (st.Tunnel.State != "connected" || st.LocalSSH.State != "healthy") {
-		return
-	}
-	d.updateConfirmed = true
-	st, err := loadReachInstallState("")
-	if err != nil {
-		d.logger.Printf("update confirm skipped: %v", err)
-		return
-	}
-	if _, err := os.Stat(filepath.Join(st.DataDir, "update-confirm-required")); err != nil {
-		return
-	}
-	if err := confirmUpdate(st); err != nil {
-		d.logger.Printf("update confirm failed: %v", err)
-	}
 }
 
 func (d *Daemon) queueResult(res CommandResult) {
