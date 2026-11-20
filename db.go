@@ -323,6 +323,7 @@ func (s *Store) Migrate(ctx context.Context, cfg Config) error {
 		{"invites", "consumed_at", "TEXT"},
 		{"requests", "metadata_json", "TEXT"},
 		{"requests", "observed_ip", "TEXT"},
+		{"requests", "slug", "TEXT"},
 	} {
 		if err := s.ensureColumn(ctx, col.table, col.name, col.decl); err != nil {
 			return err
@@ -357,6 +358,12 @@ func (s *Store) Migrate(ctx context.Context, cfg Config) error {
 		return err
 	}
 	if err := s.releaseRetiredTunnels(ctx); err != nil {
+		return err
+	}
+	// One live request per slug (daybreak P2-6). Live = pending, approved or
+	// provisioning; denied/expired/provisioned release it. Existing
+	// duplicates (from before) keep their NULL slug and are not blocked.
+	if _, err := s.db.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS idx_requests_live_slug ON requests(slug) WHERE slug IS NOT NULL AND status IN ('pending','approved','provisioning')`); err != nil {
 		return err
 	}
 	return s.seed(ctx, cfg)

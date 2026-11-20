@@ -377,9 +377,13 @@ func (s *Server) handleClientRegister(w http.ResponseWriter, r *http.Request) {
 			inviteHash = matchedHash
 		}
 	}
-	if err := s.insertRequestClaimingInvite(r.Context(), requestID, name, clientHash, status, inviteHash, setupHash, setupExpires, string(metaJSON), ip, now, expires, approvedAt); err != nil {
+	if err := s.insertRequestClaimingInvite(r.Context(), requestID, name, slug, clientHash, status, inviteHash, setupHash, setupExpires, string(metaJSON), ip, now, expires, approvedAt); err != nil {
 		if errors.Is(err, errInviteAlreadyClaimed) {
 			writeClientAuthErr(w)
+			return
+		}
+		if errors.Is(err, errSlugReserved) {
+			writeErr(w, 409, fmt.Sprintf("machine name %q is already requested by another pending registration; choose another name", slug))
 			return
 		}
 		log.Printf("register insert: %v", err)
@@ -400,13 +404,16 @@ func (s *Server) handleClientRegister(w http.ResponseWriter, r *http.Request) {
 
 // validateClientAuth checks a god code or invite code. Both are human-handled
 // secrets stored as Argon2id, so every check runs under the Argon2 gate.
-var errInviteAlreadyClaimed = errors.New("invite already claimed")
+var (
+	errInviteAlreadyClaimed = errors.New("invite already claimed")
+	errSlugReserved         = errors.New("slug reserved by another live request")
+)
 
 // insertRequestClaimingInvite creates the request and, for invite codes,
 // claims the invite in the same transaction. The conditional UPDATE makes the
 // claim atomic: of N concurrent registrations with one invite exactly one
 // gets RowsAffected=1 (daybreak P1-4).
-func (s *Server) insertRequestClaimingInvite(ctx context.Context, requestID, name, clientHash, status string, inviteHash, setupHash, setupExpires any, metaJSON, ip string, now time.Time, expires string, approvedAt any) error {
+func (s *Server) insertRequestClaimingInvite(ctx context.Context, requestID, name, slug, clientHash, status string, inviteHash, setupHash, setupExpires any, metaJSON, ip string, now time.Time, expires string, approvedAt any) error {
 	tx, err := s.store.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -421,7 +428,15 @@ func (s *Server) insertRequestClaimingInvite(ctx context.Context, requestID, nam
 			return errInviteAlreadyClaimed
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO requests (id,name,client_secret_hash,status,invite_code_hash,setup_token_hash,setup_token_expires_at,metadata_json,observed_ip,created_at,expires_at,approved_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`, requestID, name, clientHash, status, inviteHash, setupHash, setupExpires, metaJSON, ip, now.Format(time.RFC3339), expires, approvedAt); err != nil {
+	// Release reservations held by requests that have quietly expired, so
+	// an abandoned request does not block its slug until maintenance runs.
+	if _, err := tx.ExecContext(ctx, `UPDATE requests SET status='expired', setup_token_hash=NULL WHERE slug=? AND status IN ('pending','approved') AND expires_at<=?`, slug, now.Format(time.RFC3339)); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO requests (id,name,client_secret_hash,status,invite_code_hash,setup_token_hash,setup_token_expires_at,metadata_json,observed_ip,slug,created_at,expires_at,approved_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`, requestID, name, clientHash, status, inviteHash, setupHash, setupExpires, metaJSON, ip, slug, now.Format(time.RFC3339), expires, approvedAt); err != nil {
+		if strings.Contains(err.Error(), "UNIQUE constraint failed: requests.slug") {
+			return errSlugReserved
+		}
 		return err
 	}
 	return tx.Commit()

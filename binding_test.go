@@ -239,3 +239,32 @@ func TestSetupTokenExpiryClampedToRequest(t *testing.T) {
 		t.Fatalf("setup token expires %s after request %s", exp, soon)
 	}
 }
+
+// Daybreak P2-6: two live requests may not hold the same slug; denying or
+// expiring one releases it.
+func TestSlugReservedAcrossLiveRequests(t *testing.T) {
+	server, store, cfg := newReliabilityTestServer(t)
+	server.registerL = newRateLimiter(100, time.Minute)
+	if rec := doJSON(t, server, http.MethodPost, "/api/client/register", `{"name":"twin-box"}`, ""); rec.Code != 200 {
+		t.Fatalf("first register %d", rec.Code)
+	}
+	if rec := doJSON(t, server, http.MethodPost, "/api/client/register", `{"name":"twin-box"}`, ""); rec.Code != http.StatusConflict {
+		t.Fatalf("second live request for the same slug = %d, want 409", rec.Code)
+	}
+	var id string
+	_ = store.db.QueryRow(`SELECT id FROM requests WHERE slug='twin-box'`).Scan(&id)
+	admin, _ := adminTestToken(t, store, cfg)
+	if rec := doJSON(t, server, http.MethodPost, "/api/admin/requests/"+id+"/deny", "", admin); rec.Code != 200 {
+		t.Fatalf("deny %d", rec.Code)
+	}
+	if rec := doJSON(t, server, http.MethodPost, "/api/client/register", `{"name":"twin-box"}`, ""); rec.Code != 200 {
+		t.Fatalf("register after deny = %d", rec.Code)
+	}
+	// An abandoned (expired but unmarked) request does not block the slug.
+	if _, err := store.db.Exec(`UPDATE requests SET expires_at=? WHERE slug='twin-box' AND status='pending'`, time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+	if rec := doJSON(t, server, http.MethodPost, "/api/client/register", `{"name":"twin-box"}`, ""); rec.Code != 200 {
+		t.Fatalf("register after expiry = %d", rec.Code)
+	}
+}
