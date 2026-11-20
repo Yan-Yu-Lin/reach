@@ -64,6 +64,15 @@ func (r *rateLimiter) allow(key string) bool {
 	return true
 }
 
+// blocked reports whether key has used up its quota, without counting this
+// call. Only in-memory limiters support it.
+func (r *rateLimiter) blocked(key string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	b := r.buckets[key]
+	return b != nil && time.Now().Before(b.reset) && b.count >= r.limit
+}
+
 func clientIP(req *http.Request) string {
 	remoteHost, _, err := net.SplitHostPort(req.RemoteAddr)
 	if err != nil {

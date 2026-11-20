@@ -58,12 +58,13 @@ func TestPollDoesNotRunArgonForSHATokensOrTerminalStates(t *testing.T) {
 	server, store, _ := newReliabilityTestServer(t)
 	server.argon = newArgonGate(2, time.Second)
 	id, secret := registerPending(t, server)
-	for i := 0; i < 10; i++ {
+	for i := 0; i < badAuthPerIPObjectPerMinute; i++ {
 		rec := doJSON(t, server, http.MethodPost, "/api/client/register/"+id+"/poll", `{"client_secret":"wrong"}`, "")
 		if rec.Code != http.StatusUnauthorized {
 			t.Fatalf("wrong secret poll = %d", rec.Code)
 		}
 	}
+	server.badAuthL = newRateLimiter(1000, time.Minute)
 	rec := doJSON(t, server, http.MethodPost, "/api/client/register/"+id+"/poll", `{"client_secret":"`+secret+`"}`, "")
 	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"pending"`) {
 		t.Fatalf("right secret poll = %d %s", rec.Code, rec.Body.String())
@@ -96,13 +97,23 @@ func TestPollDoesNotRunArgonForSHATokensOrTerminalStates(t *testing.T) {
 	}
 }
 
-func TestPollRateLimitedPerRequestAndPerIP(t *testing.T) {
+func pollFrom(t *testing.T, server *Server, ip, id, secret string) int {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/api/client/register/"+id+"/poll", strings.NewReader(`{"client_secret":"`+secret+`"}`))
+	req.RemoteAddr = "127.0.0.1:1234"
+	req.Header.Set("X-Real-IP", ip)
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	return rec.Code
+}
+
+func TestPollRateLimits(t *testing.T) {
 	server, _, _ := newReliabilityTestServer(t)
-	id, _ := registerPending(t, server)
+	id, secret := registerPending(t, server)
+	// Authenticated polls are limited per request.
 	limited := false
 	for i := 0; i < pollPerRequestPerMinute+5; i++ {
-		rec := doJSON(t, server, http.MethodPost, "/api/client/register/"+id+"/poll", `{"client_secret":"wrong"}`, "")
-		if rec.Code == http.StatusTooManyRequests {
+		if pollFrom(t, server, "198.51.100.1", id, secret) == http.StatusTooManyRequests {
 			limited = true
 			break
 		}
@@ -110,11 +121,10 @@ func TestPollRateLimitedPerRequestAndPerIP(t *testing.T) {
 	if !limited {
 		t.Fatal("per-request poll limit never triggered")
 	}
-	server.pollReqL = newRateLimiter(100000, time.Minute)
+	// Per-IP limit across many request IDs.
 	limited = false
 	for i := 0; i < pollPerIPPerMinute+5; i++ {
-		rec := doJSON(t, server, http.MethodPost, "/api/client/register/r_other"+string(rune('a'+i%26))+"/poll", `{"client_secret":"x"}`, "")
-		if rec.Code == http.StatusTooManyRequests {
+		if pollFrom(t, server, "198.51.100.2", "r_other"+string(rune('a'+i%26)), "x") == http.StatusTooManyRequests {
 			limited = true
 			break
 		}
@@ -122,6 +132,54 @@ func TestPollRateLimitedPerRequestAndPerIP(t *testing.T) {
 	if !limited {
 		t.Fatal("per-IP poll limit never triggered")
 	}
+}
+
+// Daybreak P2-5: someone who knows a request ID but not its secret must not
+// exhaust the real installer's quota.
+func TestWrongSecretsDoNotLockOutLegitimatePoller(t *testing.T) {
+	server, _, _ := newReliabilityTestServer(t)
+	id, secret := registerPending(t, server)
+	blocked := false
+	for i := 0; i < 50; i++ {
+		if pollFrom(t, server, "203.0.113.66", id, "wrong") == http.StatusTooManyRequests {
+			blocked = true
+		}
+	}
+	if !blocked {
+		t.Fatal("attacker was never throttled")
+	}
+	if code := pollFrom(t, server, "198.51.100.10", id, secret); code != 200 {
+		t.Fatalf("legitimate poll after attack = %d", code)
+	}
+}
+
+func TestWrongAgentTokensDoNotLockOutAgent(t *testing.T) {
+	server, store, _ := newReliabilityTestServer(t)
+	if _, err := store.db.Exec(`INSERT INTO machines (id,slug,original_slug,status,desired_state,observed_state,desired_generation,agent_token_hash,created_at) VALUES ('m_rl','rl-box','rl-box','offline','active','offline',1,?,?)`, HashToken("at_rl"), nowUTC()); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"machine_id":"m_rl","agent_version":"t","applied_generation":1,"observed":{"local_ssh":{},"tunnel":{},"persistence":{},"keys":{}}}`
+	hb := func(ip, tok string) int {
+		req := httptest.NewRequest(http.MethodPost, "/api/client/agent/heartbeat", strings.NewReader(body))
+		req.RemoteAddr = "127.0.0.1:1"
+		req.Header.Set("X-Real-IP", ip)
+		req.Header.Set("Authorization", "Bearer "+tok)
+		rec := httptest.NewRecorder()
+		server.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	for i := 0; i < agentPerMachinePerMinute+20; i++ {
+		hb("203.0.113.66", "at_wrong")
+	}
+	if code := hb("198.51.100.20", "at_rl"); code != 200 {
+		t.Fatalf("real agent after wrong-token flood = %d", code)
+	}
+	for i := 0; i < agentPerMachinePerMinute+5; i++ {
+		if hb("198.51.100.20", "at_rl") == http.StatusTooManyRequests {
+			return
+		}
+	}
+	t.Fatal("authenticated per-machine heartbeat limit never triggered")
 }
 
 func TestLegacyArgonClientSecretMigratesOnSuccess(t *testing.T) {
@@ -201,20 +259,6 @@ func TestHeartbeatMigratesLegacyAgentTokenAndRejectsWrongToken(t *testing.T) {
 	if server.argon.runs.Load() != runs {
 		t.Fatal("heartbeats after migration still ran Argon2")
 	}
-}
-
-func TestHeartbeatPerMachineRateLimit(t *testing.T) {
-	server, store, _ := newReliabilityTestServer(t)
-	if _, err := store.db.Exec(`INSERT INTO machines (id,slug,original_slug,status,desired_state,observed_state,desired_generation,agent_token_hash,created_at) VALUES ('m_rl','rl-box','rl-box','offline','active','offline',1,?,?)`, HashToken("at_rl"), nowUTC()); err != nil {
-		t.Fatal(err)
-	}
-	body := `{"machine_id":"m_rl","agent_version":"t","applied_generation":1,"observed":{"local_ssh":{},"tunnel":{},"persistence":{},"keys":{}}}`
-	for i := 0; i < agentPerMachinePerMinute+5; i++ {
-		if rec := doJSON(t, server, http.MethodPost, "/api/client/agent/heartbeat", body, "at_wrong"); rec.Code == http.StatusTooManyRequests {
-			return
-		}
-	}
-	t.Fatal("per-machine heartbeat limit never triggered")
 }
 
 func TestLoginUnknownUserStillRunsArgon(t *testing.T) {

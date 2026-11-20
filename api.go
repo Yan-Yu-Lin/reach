@@ -32,34 +32,44 @@ type Server struct {
 	agentIPL     *rateLimiter
 	agentMachL   *rateLimiter
 	uninstallIPL *rateLimiter
-	argon        *argonGate
+	// Failed attempts are counted per (IP, object), so someone who knows a
+	// request or machine ID but not its secret cannot use up the quota of
+	// the real installer or agent (daybreak P2-5). Per-object quotas apply
+	// only after successful authentication.
+	badAuthL      *rateLimiter
+	uninstallMach *rateLimiter
+	argon         *argonGate
 	// revocations wakes open SSE streams so they re-authenticate at once
 	// after logout, revoke-all or service-token revocation (astra F01).
 	revocations *revocationNotifier
 }
 
 const (
-	pollPerIPPerMinute         = 60
-	pollPerRequestPerMinute    = 30
-	agentPerIPPerMinute        = 240
-	agentPerMachinePerMinute   = 60
-	uninstallPerIPPerMinute    = 20
-	maxHeartbeatCommandResults = 32
-	maxHeartbeatBodyBytes      = 128 << 10
-	maxCommandResultMessage    = 1024
+	pollPerIPPerMinute           = 60
+	pollPerRequestPerMinute      = 30
+	agentPerIPPerMinute          = 240
+	agentPerMachinePerMinute     = 60
+	uninstallPerIPPerMinute      = 20
+	maxHeartbeatCommandResults   = 32
+	badAuthPerIPObjectPerMinute  = 10
+	uninstallPerMachinePerMinute = 10
+	maxHeartbeatBodyBytes        = 128 << 10
+	maxCommandResultMessage      = 1024
 )
 
 func NewServer(cfg Config, store *Store, prov *Provisioner) *Server {
 	s := &Server{cfg: cfg, store: store, prov: prov, mux: http.NewServeMux(), events: newEventBroker(store),
-		registerL:    newPersistentRateLimiter(store.db, "client_register", 3, time.Minute),
-		loginL:       newPersistentRateLimiter(store.db, "admin_login", 8, time.Minute),
-		pollIPL:      newRateLimiter(pollPerIPPerMinute, time.Minute),
-		pollReqL:     newRateLimiter(pollPerRequestPerMinute, time.Minute),
-		agentIPL:     newRateLimiter(agentPerIPPerMinute, time.Minute),
-		agentMachL:   newRateLimiter(agentPerMachinePerMinute, time.Minute),
-		uninstallIPL: newRateLimiter(uninstallPerIPPerMinute, time.Minute),
-		argon:        defaultArgonGate,
-		revocations:  newRevocationNotifier(),
+		registerL:     newPersistentRateLimiter(store.db, "client_register", 3, time.Minute),
+		loginL:        newPersistentRateLimiter(store.db, "admin_login", 8, time.Minute),
+		pollIPL:       newRateLimiter(pollPerIPPerMinute, time.Minute),
+		pollReqL:      newRateLimiter(pollPerRequestPerMinute, time.Minute),
+		agentIPL:      newRateLimiter(agentPerIPPerMinute, time.Minute),
+		agentMachL:    newRateLimiter(agentPerMachinePerMinute, time.Minute),
+		uninstallIPL:  newRateLimiter(uninstallPerIPPerMinute, time.Minute),
+		badAuthL:      newRateLimiter(badAuthPerIPObjectPerMinute, time.Minute),
+		uninstallMach: newRateLimiter(uninstallPerMachinePerMinute, time.Minute),
+		argon:         defaultArgonGate,
+		revocations:   newRevocationNotifier(),
 	}
 	if prov != nil {
 		prov.argon = s.argon
@@ -465,7 +475,8 @@ func (s *Server) handleClientPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Rate limits come before any DB or hash work (daybreak P1-1, Opus P0-1).
-	if !s.pollIPL.allow(clientIP(r)) || !s.pollReqL.allow(id) {
+	ip := clientIP(r)
+	if !s.pollIPL.allow(ip) || s.badAuthL.blocked("poll|"+ip+"|"+id) {
 		writeRateLimited(w)
 		return
 	}
@@ -512,7 +523,12 @@ func (s *Server) handleClientPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !ok {
+		s.badAuthL.allow("poll|" + ip + "|" + id)
 		writeClientAuthErr(w)
+		return
+	}
+	if !s.pollReqL.allow(id) {
+		writeRateLimited(w)
 		return
 	}
 	if upgraded != "" {
@@ -914,7 +930,8 @@ func (s *Server) handleAdminEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
-	if !s.agentIPL.allow(clientIP(r)) {
+	ip := clientIP(r)
+	if !s.agentIPL.allow(ip) {
 		writeRateLimited(w)
 		return
 	}
@@ -922,7 +939,8 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !s.agentMachL.allow(hb.MachineID) {
+	badKey := "hb|" + ip + "|" + hb.MachineID
+	if s.badAuthL.blocked(badKey) {
 		writeRateLimited(w)
 		return
 	}
@@ -930,7 +948,12 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		if !errors.Is(err, errAgentTokenInvalid) && writeAuthBackendErr(w, err) {
 			return
 		}
+		s.badAuthL.allow(badKey)
 		writeClientAuthErr(w)
+		return
+	}
+	if !s.agentMachL.allow(hb.MachineID) {
+		writeRateLimited(w)
 		return
 	}
 	m, tunnels, err := s.prov.getMachineAndTunnels(r.Context(), hb.MachineID)
@@ -1225,7 +1248,9 @@ func (s *Server) handleAgentUninstall(w http.ResponseWriter, r *http.Request, co
 		writeClientAuthErr(w)
 		return
 	}
-	if !s.uninstallIPL.allow(clientIP(r)) || !s.agentMachL.allow(req.MachineID) {
+	ip := clientIP(r)
+	badKey := "un|" + ip + "|" + req.MachineID
+	if !s.uninstallIPL.allow(ip) || s.badAuthL.blocked(badKey) {
 		writeRateLimited(w)
 		return
 	}
@@ -1233,7 +1258,13 @@ func (s *Server) handleAgentUninstall(w http.ResponseWriter, r *http.Request, co
 		if !errors.Is(err, errAgentTokenInvalid) && writeAuthBackendErr(w, err) {
 			return
 		}
+		s.badAuthL.allow(badKey)
 		writeClientAuthErr(w)
+		return
+	}
+	// Separate bucket from heartbeats so heartbeats cannot starve uninstall.
+	if !s.uninstallMach.allow(req.MachineID) {
+		writeRateLimited(w)
 		return
 	}
 	// cleanup_state='complete' is only written by retire() after the hub
