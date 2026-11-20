@@ -37,7 +37,7 @@ type aclApplier func(path string) error
 // Writing content only after the DACL is in place means even a crash
 // mid-write leaves no readable key material under a broad inherited ACL.
 // If applying the ACL fails and strict is set, target is left untouched.
-func replaceWithACL(target string, content []byte, applyACL aclApplier, strict bool, warn func(string, ...any)) error {
+func replaceWithACL(target string, content []byte, applyACL aclApplier, strict bool, warn func(string, ...any), beforeRename ...func() error) error {
 	dir := filepath.Dir(target)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
@@ -72,6 +72,11 @@ func replaceWithACL(target string, content []byte, applyACL aclApplier, strict b
 	}
 	if err := f.Close(); err != nil {
 		return err
+	}
+	for _, check := range beforeRename {
+		if err := check(); err != nil {
+			return err
+		}
 	}
 	if err := os.Rename(tmp, target); err != nil {
 		return err
