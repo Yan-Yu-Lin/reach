@@ -43,6 +43,29 @@ while [ "$#" -gt 0 ]; do
 done
 
 command -v curl >/dev/null 2>&1 || die "curl is required"
+
+# Login sends the admin password and receives a service token: only over
+# https, or plain http to this machine (daybreak round 3 P2-B). Exact host
+# match after parsing; prefixes like http://localhost.evil.example fail.
+validate_api_url() {
+  local rest host
+  case "$1" in
+    https://*) rest="${1#https://}" ;;
+    http://*) rest="${1#http://}" ;;
+    *) return 1 ;;
+  esac
+  rest="${rest%%/*}"
+  case "$rest" in *@*|'') return 1 ;; esac
+  case "$1" in https://*) return 0 ;; esac
+  case "$rest" in
+    \[*\]*) host="${rest#[}"; host="${host%%]*}" ;;
+    *) host="${rest%%:*}" ;;
+  esac
+  case "$host" in localhost|127.0.0.1|::1) return 0 ;; esac
+  return 1
+}
+validate_api_url "$API_URL" || die "API URL must be https:// (plain http only for localhost/127.0.0.1/[::1]): $API_URL"
+# curl below runs without -L: redirects are not followed.
 PYTHON=""
 if command -v python3 >/dev/null 2>&1; then PYTHON=python3; elif command -v python >/dev/null 2>&1; then PYTHON=python; else die "python3/python is required for JSON parsing"; fi
 

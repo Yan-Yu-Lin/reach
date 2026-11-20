@@ -126,3 +126,34 @@ func TestCommandLedgerPreventsReexecutionAfterRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// Daybreak round 3 P2-B PoC: the hub answers 307 to a plain-HTTP sink. The
+// heartbeat must not follow it (307 keeps the body and bearer token).
+func TestHeartbeatDoesNotFollowRedirect(t *testing.T) {
+	var leaked atomic.Int32
+	sink := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" {
+			leaked.Add(1)
+		}
+	}))
+	defer sink.Close()
+	hub := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, sink.URL+"/api/client/agent/heartbeat", http.StatusTemporaryRedirect)
+	}))
+	defer hub.Close()
+	old := apiClient.Transport
+	apiClient.Transport = hub.Client().Transport
+	defer func() { apiClient.Transport = old }()
+	cfg := defaultConfig()
+	cfg.Heartbeat.Enabled = true
+	cfg.Heartbeat.APIURL = hub.URL
+	cfg.Heartbeat.Token = "secret-token"
+	d := NewDaemon(cfg)
+	d.logger = log.New(io.Discard, "", 0)
+	if _, err := d.sendHeartbeat(context.Background(), nil); err == nil {
+		t.Fatal("heartbeat followed a redirect and succeeded")
+	}
+	if leaked.Load() != 0 {
+		t.Fatal("heartbeat credential sent to the redirect target")
+	}
+}

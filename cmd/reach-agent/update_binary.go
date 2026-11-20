@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reach/internal/safehttp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -566,11 +567,14 @@ func maxDownloadBytes(size int64) int64 {
 func downloadFile(ctx context.Context, url, path string, maxBytes int64) error {
 	reqCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
+	if err := safehttp.ValidateURL(url); err != nil {
+		return err
+	}
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := downloadClient.Do(req)
 	if err != nil {
 		return err
 	}

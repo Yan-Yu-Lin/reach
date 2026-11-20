@@ -2,6 +2,11 @@
 /reach
 /reachd
 /reachctl
+/reach-agent
+/reach-agent.exe
+/reach-mac-agent
+/reach-ws-carrier
+/reach-release
 /cmd/*/reach-agent
 /cmd/*/reach-agent.exe
 /cmd/*/reach-mac-agent

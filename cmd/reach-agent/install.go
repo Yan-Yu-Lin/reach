@@ -19,6 +19,7 @@ import (
 	"os/exec"
 	osuser "os/user"
 	"path/filepath"
+	"reach/internal/safehttp"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -663,7 +664,7 @@ func postJSON(ctx context.Context, url string, payload any, out any, bearer stri
 	if bearer != "" {
 		req.Header.Set("Authorization", "Bearer "+bearer)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := apiClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -839,11 +840,14 @@ func installWSTunnel(ctx context.Context, dest string, ws *websocketTunnelConfig
 }
 
 func download(ctx context.Context, url string) ([]byte, error) {
+	if err := safehttp.ValidateURL(url); err != nil {
+		return nil, err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := downloadClient.Do(req)
 	if err != nil {
 		return nil, err
 	}

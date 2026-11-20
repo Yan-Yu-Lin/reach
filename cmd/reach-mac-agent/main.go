@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"reach/internal/safehttp"
 	"strings"
 	"syscall"
 	"time"
@@ -177,7 +178,7 @@ func (a Agent) stream(ctx context.Context, lastID *string) error {
 	if lastID != nil && *lastID != "" {
 		req.Header.Set("Last-Event-ID", *lastID)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := apiClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -421,7 +422,7 @@ func (a Agent) get(ctx context.Context, url string) ([]byte, int, error) {
 		return nil, 0, err
 	}
 	req.Header.Set("Authorization", "Bearer "+a.token())
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := apiClient.Do(req)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -465,7 +466,7 @@ func (a *Agent) ensureServiceToken(ctx context.Context) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+tok)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := apiClient.Do(req)
 	if err != nil {
 		a.log.Printf("could not request service token: %v", err)
 		return
@@ -544,6 +545,11 @@ func loadConfig(path string) (Config, error) {
 	cfg.SSHConfigFile = expandHome(cfg.SSHConfigFile)
 	if cfg.APIURL == "" {
 		cfg.APIURL = envDefault("REACH_API_URL", "https://tunnels.your-domain.example")
+	}
+	// The service token and admin API must not cross the network in clear
+	// text (daybreak round 3 P2-B).
+	if err := safehttp.ValidateURL(cfg.APIURL); err != nil {
+		return cfg, fmt.Errorf("api_url: %w", err)
 	}
 	if cfg.OutFile == "" || cfg.SSHConfigFile == "" {
 		return cfg, fmt.Errorf("out_file and ssh_config_file are required")

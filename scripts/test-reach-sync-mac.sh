@@ -41,3 +41,12 @@ if grep -q 'Match' "$work/reach.conf"; then echo "FAIL: raw server text reached 
 ssh -G -F "$work/reach.conf" jack >/dev/null
 [ ! -e "$marker" ] || { echo "FAIL: marker command executed"; exit 1; }
 echo "ok: reach-sync-mac.sh wrote only template output; raw Match exec ignored"
+# Remote plain http is refused before any login or token use (daybreak
+# round 3 P2-B).
+for bad in http://10.0.0.1:9300 http://localhost.evil.example http://user@127.0.0.1:1; do
+  if REACH_MAC_AGENT="$work/reach-mac-agent" bash scripts/reach-sync-mac.sh --api-url "$bad" \
+      --token-file "$work/token" --out "$work/bad.conf" --no-include >/dev/null 2>&1; then
+    echo "FAIL: accepted $bad"; exit 1
+  fi
+done
+echo "ok: reach-sync-mac.sh refuses non-loopback http API URLs"

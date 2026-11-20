@@ -1019,7 +1019,7 @@ func (d *Daemon) sendHeartbeat(ctx context.Context, shutdown *ShutdownNotice) (H
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+d.cfg.Heartbeat.Token)
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := apiClient.Do(req)
 		if err == nil {
 			b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 			_ = resp.Body.Close()
