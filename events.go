@@ -14,8 +14,14 @@ import (
 
 const (
 	eventSubscriberBuffer = 32
-	eventReplayLimit      = 500
-	eventPublishTimeout   = 3 * time.Second
+	// eventReplayWindow is how far back a reconnecting client may resume.
+	// Heartbeats are live-only, so durable events are rare and a time window
+	// replaces the old fixed 500-event limit that overflowed in about an hour.
+	eventReplayWindow = 72 * time.Hour
+	// eventReplayMaxEvents bounds memory for one replay; exceeding it still
+	// forces a resnapshot.
+	eventReplayMaxEvents = 5000
+	eventPublishTimeout  = 3 * time.Second
 )
 
 type ReachEvent struct {
@@ -38,7 +44,7 @@ func newEventBroker(store *Store) *eventBroker {
 }
 
 func (b *eventBroker) Subscribe(ctx context.Context) (chan ReachEvent, int64, int64, func(), error) {
-	ch, oldest, boundary, _, _, cancel, err := b.SubscribeSince(ctx, 0, false, eventReplayLimit)
+	ch, oldest, boundary, _, _, cancel, err := b.SubscribeSince(ctx, 0, false, eventReplayMaxEvents)
 	return ch, oldest, boundary, cancel, err
 }
 
@@ -47,15 +53,29 @@ func (b *eventBroker) SubscribeSince(ctx context.Context, cursor int64, hasCurso
 	b.publishMu.Lock()
 	defer b.publishMu.Unlock()
 	var oldest, boundary int64
+	var windowStart sql.NullInt64
 	if b.store != nil {
-		if err := b.store.db.QueryRowContext(ctx, `SELECT COALESCE(MIN(id),0),COALESCE(MAX(id),0) FROM events`).Scan(&oldest, &boundary); err != nil {
+		// Separate MIN/MAX subqueries use the rowid directly; the combined
+		// form scanned the whole covering index (perf #7/#8).
+		if err := b.store.db.QueryRowContext(ctx, `SELECT COALESCE((SELECT MIN(id) FROM events),0),COALESCE((SELECT MAX(id) FROM events),0)`).Scan(&oldest, &boundary); err != nil {
 			return nil, 0, 0, nil, "", nil, err
 		}
+		if hasCursor {
+			cutoff := time.Now().UTC().Add(-eventReplayWindow).Format(time.RFC3339)
+			if err := b.store.db.QueryRowContext(ctx, `SELECT MIN(id) FROM events WHERE created_at>=?`, cutoff).Scan(&windowStart); err != nil {
+				return nil, 0, 0, nil, "", nil, err
+			}
+		}
+	}
+	// The oldest id a client may still be missing without a resnapshot.
+	firstReplayable := boundary + 1
+	if windowStart.Valid {
+		firstReplayable = windowStart.Int64
 	}
 	var replay []ReachEvent
 	var reason string
 	if hasCursor {
-		if cursor > boundary || (oldest > 0 && cursor < oldest-1) {
+		if cursor > boundary || (oldest > 0 && cursor < oldest-1) || cursor < firstReplayable-1 {
 			reason = "cursor_out_of_range"
 		} else {
 			var overflow bool
@@ -119,6 +139,22 @@ func (b *eventBroker) Publish(ctx context.Context, typ, machineID string, data m
 	return ev
 }
 
+// PublishLive sends a transient event to current subscribers only. It is not
+// stored, has no id and is never replayed. A subscriber whose buffer is full
+// simply misses it; live events are advisory (see docs/EVENTS.md).
+func (b *eventBroker) PublishLive(typ, machineID string, data map[string]any) ReachEvent {
+	ev := ReachEvent{Type: typ, MachineID: machineID, Data: data, CreatedAt: nowUTC()}
+	b.subsMu.Lock()
+	for ch := range b.subs {
+		select {
+		case ch <- ev:
+		default:
+		}
+	}
+	b.subsMu.Unlock()
+	return ev
+}
+
 func (b *eventBroker) resyncSubscribers(reason string) ReachEvent {
 	ev := ReachEvent{Type: "machine.resync_required", Data: map[string]any{"reason": reason}, CreatedAt: nowUTC()}
 	b.subsMu.Lock()
@@ -156,8 +192,8 @@ func (b *eventBroker) replayRange(ctx context.Context, lastID, throughID int64, 
 	if b.store == nil || throughID <= lastID {
 		return nil, false, nil
 	}
-	if limit <= 0 || limit > eventReplayLimit {
-		limit = eventReplayLimit
+	if limit <= 0 || limit > eventReplayMaxEvents {
+		limit = eventReplayMaxEvents
 	}
 	rows, err := b.store.db.QueryContext(ctx, `SELECT id,type,machine_id,payload_json,created_at FROM events WHERE id>? AND id<=? ORDER BY id LIMIT ?`, lastID, throughID, limit+1)
 	if err != nil {

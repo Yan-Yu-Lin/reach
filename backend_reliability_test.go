@@ -123,19 +123,20 @@ func TestHealthCheckPublishesOnlyOnActualHealthChange(t *testing.T) {
 	}
 }
 
-func TestStableHeartbeatAlwaysPublishesMachineScopedInvalidation(t *testing.T) {
+func TestHeartbeatIsLiveOnlyEventWithoutDurableRow(t *testing.T) {
 	server, store, _ := newReliabilityTestServer(t)
 	token := "agent-test-token"
-	hash, err := HashSecret(token)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.db.Exec(`INSERT INTO machines (id,slug,original_slug,status,desired_state,observed_state,desired_generation,agent_token_hash,created_at) VALUES ('m_heartbeat','heartbeat-box','heartbeat-box','degraded','active','degraded',1,?,?)`, hash, nowUTC()); err != nil {
+	if _, err := store.db.Exec(`INSERT INTO machines (id,slug,original_slug,status,desired_state,observed_state,desired_generation,agent_token_hash,created_at) VALUES ('m_heartbeat','heartbeat-box','heartbeat-box','degraded','active','degraded',1,?,?)`, HashToken(token), nowUTC()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.db.Exec(`INSERT INTO tunnels (id,machine_id,hub_id,unix_user,remote_port,tunnel_pubkey,status,created_at) VALUES ('t_heartbeat','m_heartbeat','primary','rt-heartb1',9201,'ssh-ed25519 test','online',?)`, nowUTC()); err != nil {
 		t.Fatal(err)
 	}
+	ch, _, _, cancel, err := server.events.Subscribe(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
 	body := `{"machine_id":"m_heartbeat","agent_version":"test","applied_generation":1,"observed":{"agent_state":"running","local_ssh":{"state":"healthy"},"tunnel":{"state":"connected","transport":"direct"},"persistence":{"reboot_safe":true},"keys":{}}}`
 	for i := 0; i < 2; i++ {
 		req := httptest.NewRequest(http.MethodPost, "/api/client/agent/heartbeat", strings.NewReader(body))
@@ -146,12 +147,130 @@ func TestStableHeartbeatAlwaysPublishesMachineScopedInvalidation(t *testing.T) {
 			t.Fatalf("heartbeat %d returned %d: %s", i, recorder.Code, recorder.Body.String())
 		}
 	}
-	var count int
-	if err := store.db.QueryRow(`SELECT COUNT(*) FROM events WHERE type='agent.heartbeat' AND machine_id='m_heartbeat'`).Scan(&count); err != nil {
+	var stored, legacyStatus int
+	_ = store.db.QueryRow(`SELECT COUNT(*) FROM events WHERE type='agent.heartbeat'`).Scan(&stored)
+	_ = store.db.QueryRow(`SELECT COUNT(*) FROM agent_status`).Scan(&legacyStatus)
+	if stored != 0 || legacyStatus != 0 {
+		t.Fatalf("heartbeat persisted events=%d agent_status=%d", stored, legacyStatus)
+	}
+	live := 0
+	timeout := time.After(time.Second)
+	for live < 2 {
+		select {
+		case ev := <-ch:
+			if ev.Type != "agent.heartbeat" {
+				continue
+			}
+			if ev.ID != "" || ev.Data["machine_id"] != "m_heartbeat" || ev.Data["heartbeat_at"] == "" || ev.Data["observed_state"] == nil || ev.Data["status"] == nil {
+				t.Fatalf("unexpected live heartbeat: %#v", ev)
+			}
+			var out bytes.Buffer
+			_ = writeSSE(&out, ev)
+			if strings.Contains(out.String(), "id:") {
+				t.Fatalf("live heartbeat carried an SSE id:\n%s", out.String())
+			}
+			live++
+		case <-timeout:
+			t.Fatalf("received %d live heartbeats, want 2", live)
+		}
+	}
+}
+
+// Daybreak P2-5: forged or repeated command results must not publish events.
+func TestCommandResultsPublishOnlyRealTransitions(t *testing.T) {
+	server, store, _ := newReliabilityTestServer(t)
+	token := "agent-cmd-token"
+	if _, err := store.db.Exec(`INSERT INTO machines (id,slug,original_slug,status,desired_state,observed_state,desired_generation,agent_token_hash,created_at) VALUES ('m_cmd','cmd-box','cmd-box','offline','active','offline',1,?,?)`, HashToken(token), nowUTC()); err != nil {
 		t.Fatal(err)
 	}
-	if count != 2 {
-		t.Fatalf("stable heartbeats emitted %d invalidations, want 2", count)
+	if _, err := store.db.Exec(`INSERT INTO machines (id,slug,original_slug,status,desired_state,observed_state,created_at) VALUES ('m_other','other-box','other-box','offline','active','offline',?)`, nowUTC()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`INSERT INTO agent_commands (id,machine_id,generation,type,status,created_at) VALUES ('cmd_real','m_cmd',1,'sync_keys','sent',?),('cmd_theirs','m_other',1,'sync_keys','sent',?)`, nowUTC(), nowUTC()); err != nil {
+		t.Fatal(err)
+	}
+	results := `[{"command_id":"cmd_real","status":"acked"},{"command_id":"cmd_fake","status":"acked"},{"command_id":"cmd_theirs","status":"failed"}]`
+	body := `{"machine_id":"m_cmd","agent_version":"t","applied_generation":1,"observed":{"local_ssh":{},"tunnel":{},"persistence":{},"keys":{}},"command_results":` + results + `}`
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/api/client/agent/heartbeat", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+		server.ServeHTTP(rec, req)
+		if rec.Code != 200 {
+			t.Fatalf("heartbeat = %d %s", rec.Code, rec.Body.String())
+		}
+	}
+	var n int
+	_ = store.db.QueryRow(`SELECT COUNT(*) FROM events WHERE type LIKE 'agent.command_%'`).Scan(&n)
+	if n != 1 {
+		t.Fatalf("command result events = %d, want 1", n)
+	}
+	var theirs string
+	_ = store.db.QueryRow(`SELECT status FROM agent_commands WHERE id='cmd_theirs'`).Scan(&theirs)
+	if theirs != "sent" {
+		t.Fatalf("other machine's command changed to %q", theirs)
+	}
+}
+
+func TestHeartbeatBodyIsBounded(t *testing.T) {
+	server, store, _ := newReliabilityTestServer(t)
+	if _, err := store.db.Exec(`INSERT INTO machines (id,slug,original_slug,status,desired_state,observed_state,desired_generation,agent_token_hash,created_at) VALUES ('m_big','big-box','big-box','offline','active','offline',1,?,?)`, HashToken("tok"), nowUTC()); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"machine_id":"m_big","last_error":"` + strings.Repeat("x", maxHeartbeatBodyBytes) + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/client/agent/heartbeat", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer tok")
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized heartbeat = %d", rec.Code)
+	}
+}
+
+func TestReplayWindowIsTimeBased(t *testing.T) {
+	server, store, cfg := newReliabilityTestServer(t)
+	old := time.Now().UTC().Add(-eventReplayWindow - time.Hour).Format(time.RFC3339)
+	if _, err := store.db.Exec(`INSERT INTO events (type,payload_json,created_at) VALUES ('old.one','{}',?)`, old); err != nil {
+		t.Fatal(err)
+	}
+	tx, _ := store.db.Begin()
+	for i := 0; i < 600; i++ {
+		if _, err := tx.Exec(`INSERT INTO events (type,payload_json,created_at) VALUES ('recent.page','{}',?)`, nowUTC()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = tx.Commit()
+	token, _ := SignJWT(cfg.JWTSecret, "u", "tester", "owner", time.Hour)
+	ts := httptest.NewServer(server)
+	defer ts.Close()
+	read := func(cursor string) string {
+		req, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/admin/events", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Last-Event-ID", cursor)
+		resp, err := ts.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var out strings.Builder
+		sc := bufio.NewScanner(resp.Body)
+		for sc.Scan() {
+			out.WriteString(sc.Text() + "\n")
+			if strings.HasPrefix(sc.Text(), "event: hello") || strings.Contains(sc.Text(), "resync_required") {
+				sc.Scan()
+				out.WriteString(sc.Text() + "\n")
+				break
+			}
+		}
+		return out.String()
+	}
+	// Cursor just after the expired event: 600 recent events replay without overflow.
+	if out := read("1"); strings.Contains(out, "resync_required") || strings.Count(out, "event: recent.page") != 600 {
+		t.Fatalf("recent replay failed: resync=%v pages=%d", strings.Contains(out, "resync_required"), strings.Count(out, "event: recent.page"))
+	}
+	// Cursor older than the window must resnapshot.
+	if out := read("0"); !strings.Contains(out, "cursor_out_of_range") {
+		t.Fatalf("cursor older than window replayed:\n%.300s", out)
 	}
 }
 
@@ -386,7 +505,7 @@ func TestEventReplayOverflowRequiresResnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < eventReplayLimit+1; i++ {
+	for i := 0; i < eventReplayMaxEvents+1; i++ {
 		if _, err := tx.Exec(`INSERT INTO events (type,payload_json,created_at) VALUES ('test.page','{}',?)`, nowUTC()); err != nil {
 			_ = tx.Rollback()
 			t.Fatal(err)

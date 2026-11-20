@@ -41,6 +41,7 @@ const (
 	agentPerMachinePerMinute   = 60
 	uninstallPerIPPerMinute    = 20
 	maxHeartbeatCommandResults = 32
+	maxHeartbeatBodyBytes      = 128 << 10
 	maxCommandResultMessage    = 1024
 )
 
@@ -710,7 +711,7 @@ func (s *Server) handleAdminEvents(w http.ResponseWriter, r *http.Request) {
 		flusher.Flush()
 		return
 	}
-	ch, _, _, replay, reason, cancel, err := s.events.SubscribeSince(r.Context(), requested.ID, requested.Present, eventReplayLimit)
+	ch, _, _, replay, reason, cancel, err := s.events.SubscribeSince(r.Context(), requested.ID, requested.Present, eventReplayMaxEvents)
 	if err != nil {
 		_ = writeSSE(w, ReachEvent{Type: "machine.resync_required", Data: map[string]any{"reason": "replay_failed"}, CreatedAt: nowUTC()})
 		flusher.Flush()
@@ -805,9 +806,11 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "could not store heartbeat")
 		return
 	}
-	_, _ = s.store.db.ExecContext(r.Context(), `INSERT INTO agent_status (machine_id,agent_version,transport,transport_state,local_ssh_state,local_ssh_error,tunnel_state,tunnel_pid,tunnel_error,last_error,raw_json,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(machine_id) DO UPDATE SET agent_version=excluded.agent_version,transport=excluded.transport,transport_state=excluded.transport_state,local_ssh_state=excluded.local_ssh_state,local_ssh_error=excluded.local_ssh_error,tunnel_state=excluded.tunnel_state,tunnel_pid=excluded.tunnel_pid,tunnel_error=excluded.tunnel_error,last_error=excluded.last_error,raw_json=excluded.raw_json,updated_at=excluded.updated_at`, hb.MachineID, hb.AgentVersion, hb.Observed.Tunnel.Transport, "", hb.Observed.LocalSSH.State, nullable(hb.Observed.LocalSSH.Error), hb.Observed.Tunnel.State, pid, nullable(hb.Observed.Tunnel.Error), nullable(hb.LastError), string(raw), now)
+	// agent_status was a write-only duplicate of agent_observations (perf #3).
 	if hb.Observed.Tunnel.State == "connected" || hb.Observed.Tunnel.State == "running" {
-		_, _ = s.store.db.ExecContext(r.Context(), `UPDATE tunnels SET status='online', last_seen_at=? WHERE machine_id=? AND status NOT IN ('disabled','retired','failed')`, now, hb.MachineID)
+		// Only write when the status flips or last_seen_at is getting stale.
+		staleBefore := time.Now().UTC().Add(-tunnelSeenWriteInterval).Format(time.RFC3339)
+		_, _ = s.store.db.ExecContext(r.Context(), `UPDATE tunnels SET status='online', last_seen_at=? WHERE machine_id=? AND status NOT IN ('disabled','retired','failed','cleanup_failed') AND (status<>'online' OR last_seen_at IS NULL OR last_seen_at<?)`, now, hb.MachineID, staleBefore)
 	}
 	old := m.ObservedState
 	_, _, _, err = s.prov.recomputeObserved(r.Context(), hb.MachineID)
@@ -835,8 +838,13 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	resp := HeartbeatResponse{OK: true, ServerTime: now, DesiredGeneration: m.DesiredGeneration, DesiredState: m.DesiredState, Heartbeat: HeartbeatPolicy{NextIntervalSeconds: int(s.cfg.HealthInterval.Seconds()), OfflineAfterSeconds: int(s.cfg.OfflineAfter.Seconds())}, DesiredConfig: s.desiredConfig(r.Context(), m, tunnels), Commands: cmds, Update: agentUpdateHintFor(s.cfg, hb.AgentVersion)}
 	writeJSON(w, 200, resp)
-	s.publishEvent(r.Context(), "agent.heartbeat", m.ID, map[string]any{"machine_id": m.ID, "heartbeat_at": now})
+	// Live-only: never stored or replayed (perf #3, docs/EVENTS.md).
+	if s.events != nil {
+		s.events.PublishLive("agent.heartbeat", m.ID, map[string]any{"machine_id": m.ID, "heartbeat_at": now, "observed_state": m.ObservedState, "status": m.Status})
+	}
 }
+
+const tunnelSeenWriteInterval = 5 * time.Minute
 
 func normalizeHeartbeat(hb AgentHeartbeat) AgentHeartbeat {
 	if hb.Observed.LocalSSH.State == "" && hb.LocalSSH.State != "" {
@@ -858,9 +866,13 @@ func (s *Server) authAgentHeartbeat(w http.ResponseWriter, r *http.Request) (str
 		writeClientAuthErr(w)
 		return "", AgentHeartbeat{}, nil, false
 	}
-	raw, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	raw, err := io.ReadAll(io.LimitReader(r.Body, maxHeartbeatBodyBytes+1))
 	if err != nil {
 		writeErr(w, 400, "invalid body")
+		return "", AgentHeartbeat{}, nil, false
+	}
+	if len(raw) > maxHeartbeatBodyBytes {
+		writeErr(w, http.StatusRequestEntityTooLarge, "heartbeat too large")
 		return "", AgentHeartbeat{}, nil, false
 	}
 	var hb AgentHeartbeat
@@ -912,18 +924,38 @@ func (s *Server) verifyAgentToken(ctx context.Context, machineID, token string, 
 	return nil
 }
 
+// storeCommandResults records agent results. Only a real transition of a
+// command this machine owns (pending/sent -> acked/failed) is stored and
+// published, so a stale or forged token cannot inject events (daybreak P2-5).
 func (s *Server) storeCommandResults(ctx context.Context, hb AgentHeartbeat) {
-	for _, res := range hb.CommandResults {
-		if res.CommandID == "" {
+	for i, res := range hb.CommandResults {
+		if i >= maxHeartbeatCommandResults {
+			break
+		}
+		if res.CommandID == "" || len(res.CommandID) > 64 {
 			continue
 		}
 		status := "acked"
 		if res.Status == "failed" {
 			status = "failed"
 		}
-		_, _ = s.store.db.ExecContext(ctx, `UPDATE agent_commands SET status=?, acked_at=?, last_error=? WHERE id=? AND machine_id=?`, status, nowUTC(), nullable(res.Message), res.CommandID, hb.MachineID)
-		s.publishEvent(ctx, "agent.command_"+status, hb.MachineID, map[string]any{"machine_id": hb.MachineID, "command_id": res.CommandID, "status": status, "message": res.Message})
+		msg := truncateUTF8(res.Message, maxCommandResultMessage)
+		r, err := s.store.db.ExecContext(ctx, `UPDATE agent_commands SET status=?, acked_at=?, last_error=? WHERE id=? AND machine_id=? AND status IN ('pending','sent')`, status, nowUTC(), nullable(msg), res.CommandID, hb.MachineID)
+		if err != nil {
+			continue
+		}
+		if n, _ := r.RowsAffected(); n != 1 {
+			continue
+		}
+		s.publishEvent(ctx, "agent.command_"+status, hb.MachineID, map[string]any{"machine_id": hb.MachineID, "command_id": res.CommandID, "status": status, "message": msg})
 	}
+}
+
+func truncateUTF8(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return truncateProcessTitleUTF8Bytes(s, max)
 }
 
 const commandRetryLease = 30 * time.Second
