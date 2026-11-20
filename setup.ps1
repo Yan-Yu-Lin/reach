@@ -116,9 +116,39 @@ function Get-ReachChecksum([string]$ChecksumsPath, [string]$Asset) {
   Die "No checksum found for $Asset"
 }
 
-function Invoke-ReachDownload([string]$Url, [string]$OutFile) {
+# Streams the download with a byte ceiling and a timeout, refuses redirects,
+# and checks the URL before every request (daybreak P3-4). Invoke-WebRequest
+# -OutFile had no size limit and followed redirects.
+function Invoke-ReachDownload([string]$Url, [string]$OutFile, [long]$MaxBytes = 134217728) {
+  if (-not (Test-ReachApiUrl $Url)) { Die "refusing to download from $Url" }
   Log "Downloading $Url"
-  Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing
+  [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+  $req = [Net.HttpWebRequest]::Create($Url)
+  $req.AllowAutoRedirect = $false
+  $req.Timeout = 60000
+  $req.ReadWriteTimeout = 60000
+  $resp = $null
+  try {
+    $resp = $req.GetResponse()
+    if ([int]$resp.StatusCode -ne 200) { Die "download $Url returned HTTP $([int]$resp.StatusCode)" }
+    if ($resp.ContentLength -gt $MaxBytes) { Die "download $Url is larger than $MaxBytes bytes" }
+    $in = $resp.GetResponseStream()
+    $out = [IO.File]::Open($OutFile, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try {
+      $buf = New-Object byte[] 65536
+      [long]$total = 0
+      while (($n = $in.Read($buf, 0, $buf.Length)) -gt 0) {
+        $total += $n
+        if ($total -gt $MaxBytes) { Die "download $Url exceeded $MaxBytes bytes" }
+        $out.Write($buf, 0, $n)
+      }
+    } finally {
+      $out.Close()
+      $in.Close()
+    }
+  } finally {
+    if ($resp) { $resp.Close() }
+  }
 }
 
 # Test-ReachApiUrl parses the URL and compares the host exactly, so
@@ -161,7 +191,7 @@ function Save-ReachAgentCandidate([string]$Destination) {
   }
   Warn "REACH_ALLOW_UNVERIFIED=1: checking only the same-origin checksums.txt"
   $checksums = Join-Path $dir 'checksums.txt'
-  Invoke-ReachDownload "$baseUrl/checksums.txt" $checksums
+  Invoke-ReachDownload "$baseUrl/checksums.txt" $checksums 65536
   $expected = Get-ReachChecksum $checksums $asset
   if ($actual -ne $expected) { Die "reach-agent checksum mismatch: got $actual expected $expected" }
 }

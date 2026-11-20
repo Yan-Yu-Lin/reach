@@ -230,3 +230,21 @@ func TestAllocatorSkipsDropInPortsAndOtherHubs(t *testing.T) {
 		t.Fatal("port used by another hub row was reallocated")
 	}
 }
+
+// Daybreak P3-8: a row retired only by status (very old schema) loses its
+// agent token on migration too.
+func TestMigrationClearsTokenOfStatusRetiredRows(t *testing.T) {
+	server, store, cfg := newReliabilityTestServer(t)
+	if _, err := store.db.Exec(`INSERT INTO machines (id,slug,original_slug,status,desired_state,observed_state,agent_token_hash,created_at) VALUES ('m_oldret','oldret--retired-x','oldret','retired','active','gone',?,?)`, HashToken("at_old"), nowUTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Migrate(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	var hash *string
+	_ = store.db.QueryRow(`SELECT agent_token_hash FROM machines WHERE id='m_oldret'`).Scan(&hash)
+	if hash != nil {
+		t.Fatal("status=retired row kept its agent token")
+	}
+	_ = server
+}

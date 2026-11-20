@@ -353,7 +353,9 @@ func (s *Store) Migrate(ctx context.Context, cfg Config) error {
 		}
 	}
 	// Retired machines must not keep a working agent token (daybreak P2-5).
-	if _, err := s.db.ExecContext(ctx, `UPDATE machines SET agent_token_hash=NULL WHERE desired_state='retired' AND agent_token_hash IS NOT NULL`); err != nil {
+	// Also by status: very old schemas marked retirement only in status
+	// (daybreak P3-8).
+	if _, err := s.db.ExecContext(ctx, `UPDATE machines SET agent_token_hash=NULL WHERE (desired_state='retired' OR status='retired') AND agent_token_hash IS NOT NULL`); err != nil {
 		return err
 	}
 	if err := s.releaseRetiredSlugs(ctx); err != nil {
