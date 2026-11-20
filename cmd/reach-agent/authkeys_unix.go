@@ -31,6 +31,8 @@ import (
 //   - only inodes created here are chowned (no chown -R).
 const userControlledDepth = 3
 
+const maxAuthorizedKeysBytes = 4 << 20
+
 type keyDir struct {
 	fd      int
 	path    string
@@ -118,7 +120,16 @@ func readAuthorizedKeysFile(authFile string) ([]byte, error) {
 	if !st.Mode().IsRegular() {
 		return nil, fmt.Errorf("refusing %s/%s: not a regular file", dir.path, name)
 	}
-	return io.ReadAll(io.LimitReader(f, 4<<20))
+	// Read one byte past the limit: an oversized file is an error, never a
+	// silently truncated prefix that a caller would write back (astra P2-05).
+	b, err := io.ReadAll(io.LimitReader(f, maxAuthorizedKeysBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(b) > maxAuthorizedKeysBytes {
+		return nil, fmt.Errorf("refusing %s/%s: larger than %d bytes", dir.path, name, maxAuthorizedKeysBytes)
+	}
+	return b, nil
 }
 
 // writeAuthorizedKeysFile atomically replaces authFile. When owner is set

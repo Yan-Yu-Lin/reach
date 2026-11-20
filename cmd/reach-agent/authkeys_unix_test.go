@@ -109,3 +109,35 @@ func TestHeartbeatIntervalIsClampedAndApplied(t *testing.T) {
 		t.Fatalf("interval = %s", d.heartbeatInterval())
 	}
 }
+
+// Astra P2-05: an authorized_keys larger than the read limit must fail and
+// stay untouched, not be truncated and written back.
+func TestOversizeAuthorizedKeysIsRefusedNotTruncated(t *testing.T) {
+	_, auth := fakeHome(t)
+	suffix := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl unrelated-key\n"
+	content := "#" + strings.Repeat("a", maxAuthorizedKeysBytes-2) + "\n" + suffix
+	if err := os.WriteFile(auth, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := defaultConfig()
+	cfg.MachineID = "m_review"
+	cfg.LocalSSH.AuthFile = auth
+	d := NewDaemon(cfg)
+	if err := d.syncKeys(nil, false); err == nil {
+		t.Fatal("syncKeys accepted an oversized authorized_keys")
+	}
+	after, err := os.ReadFile(auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != content {
+		t.Fatalf("oversized file was modified: %d -> %d bytes", len(content), len(after))
+	}
+	// Exactly at the limit is still fine.
+	if err := os.WriteFile(auth, []byte(strings.Repeat("#", maxAuthorizedKeysBytes-1)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readAuthorizedKeysFile(auth); err != nil {
+		t.Fatalf("file at the limit refused: %v", err)
+	}
+}
