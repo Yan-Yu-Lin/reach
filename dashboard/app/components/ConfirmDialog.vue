@@ -34,7 +34,7 @@
           type="button"
           class="btn"
           :class="danger ? 'btn-danger-solid' : 'btn-primary'"
-          :disabled="!canConfirm || busy"
+          :disabled="!canConfirm || busy || confirmDisabled"
           @click="confirm"
         >
           {{ busy ? 'Working...' : confirmLabel }}
@@ -52,6 +52,8 @@ const props = defineProps<{
   /** When set, the confirm button stays disabled until this exact text is typed. */
   typeToConfirm?: string
   busy?: boolean
+  /** Extra condition from the caller (e.g. nothing left to act on). */
+  confirmDisabled?: boolean
 }>()
 const emit = defineEmits<{ confirm: []; cancel: [] }>()
 
@@ -65,7 +67,7 @@ const cancelBtn = ref<HTMLButtonElement | null>(null)
 const canConfirm = computed(() => !props.typeToConfirm || typed.value.trim() === props.typeToConfirm)
 
 function confirm() {
-  if (!canConfirm.value || props.busy) return
+  if (!canConfirm.value || props.busy || props.confirmDisabled) return
   emit('confirm')
 }
 function cancel() {

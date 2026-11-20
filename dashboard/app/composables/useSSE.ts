@@ -1,3 +1,4 @@
+import { currentAppPath, loginLocation } from '~/utils/auth'
 import { createSSEParser, reconnectDelay } from '~/utils/sse'
 
 export type SSEStatus = 'connecting' | 'live' | 'reconnecting' | 'stale'
@@ -117,9 +118,9 @@ function stopSSEConnection() {
 async function handleSSEUnauthorized() {
   stopSSEConnection()
   const api = useReachApi()
-  api.setToken(null)
+  api.signOutLocally()
   if (import.meta.client) {
-    await navigateTo({ path: '/login', query: { reason: 'session-expired' } })
+    await navigateTo(loginLocation(currentAppPath(), 'session-expired'))
   }
 }
 

@@ -242,15 +242,20 @@
     </ConfirmDialog>
     <ConfirmDialog
       v-if="dialog?.kind === 'bulk-disable'"
-      :title="`Disable ${dialog.items.length} dormant machines?`"
-      :confirm-label="`Disable ${dialog.items.length}`"
+      :title="bulkTargets.length ? `Disable ${bulkTargets.length} dormant machine${bulkTargets.length === 1 ? '' : 's'}?` : 'Nothing left to disable'"
+      :confirm-label="`Disable ${bulkTargets.length}`"
       danger
       :busy="dialogBusy"
+      :confirm-disabled="bulkTargets.length === 0"
       @cancel="dialog = null"
-      @confirm="bulkDisable(dialog.items)"
+      @confirm="bulkDisable(dialog.ids)"
     >
       <p>Their tunnel keys stop working, so a stolen copy of an old agent config is useless. Nothing is deleted; you can Enable any of them later.</p>
-      <p class="mono small wrap">{{ dialog.items.map(i => i.machine.slug).join(', ') }}</p>
+      <p v-if="bulkTargets.length" class="mono small wrap bulk-list">{{ bulkTargets.map(i => i.machine.slug).join(', ') }}</p>
+      <p v-if="bulkDropped.length" class="bulk-dropped" role="status">
+        <AppIcon name="alert" :size="16" />
+        No longer dormant, left out: <span class="mono">{{ bulkDropped.join(', ') }}</span>
+      </p>
     </ConfirmDialog>
     <ConfirmDialog
       v-if="dialog?.kind === 'revoke'"
@@ -272,12 +277,14 @@ import { setupCommand, websocketSetupCommand, windowsSetupCommand } from '~/util
 import { requestSlug, requestWarnings } from '~/utils/requests'
 import { STATUS_LABEL, type UiStatus } from '~/utils/status'
 import { mapSettledLimited } from '~/utils/concurrency'
+import { currentAppPath, loginLocation } from '~/utils/auth'
+import { SIGNOUT_KEY } from '~/composables/useReachApi'
 
 type Tab = 'machines' | 'requests' | 'settings'
 type Dialog =
   | { kind: 'approve'; req: RequestRow }
   | { kind: 'deny'; req: RequestRow }
-  | { kind: 'bulk-disable'; items: MachineWithTunnels[] }
+  | { kind: 'bulk-disable'; ids: string[] }
   | { kind: 'revoke' }
 
 const api = useReachApi()
@@ -424,7 +431,26 @@ async function copyText(text: string) {
 
 function askApprove(req: RequestRow) { dialog.value = { kind: 'approve', req } }
 function askDeny(req: RequestRow) { dialog.value = { kind: 'deny', req } }
-function askBulkDisable(items: MachineWithTunnels[]) { if (items.length) dialog.value = { kind: 'bulk-disable', items } }
+// The dialog keeps machine ids, not objects: the list it shows and the list it sends are
+// both recomputed from the live fleet, so a machine that comes back online while the dialog
+// is open drops out instead of being disabled (astra F07).
+function askBulkDisable(items: MachineWithTunnels[]) {
+  if (items.length) dialog.value = { kind: 'bulk-disable', ids: items.map(i => i.machine.id) }
+}
+function stillDormant(id: string) {
+  const item = fleet.byId.get(id)
+  return !!item && item.machine.desired_state === 'active' && statusOf.value.get(id) === 'dormant'
+}
+const bulkTargets = computed(() => {
+  const d = dialog.value
+  if (d?.kind !== 'bulk-disable') return []
+  return d.ids.filter(stillDormant).map(id => fleet.byId.get(id)!)
+})
+const bulkDropped = computed(() => {
+  const d = dialog.value
+  if (d?.kind !== 'bulk-disable') return []
+  return d.ids.filter(id => !stillDormant(id)).map(id => fleet.byId.get(id)?.machine.slug || id)
+})
 
 async function withDialog(fn: () => Promise<void>) {
   dialogBusy.value = true
@@ -460,16 +486,28 @@ function deny(req: RequestRow) {
   })
 }
 
-function bulkDisable(items: MachineWithTunnels[]) {
+function bulkDisable(shownIds: string[]) {
+  // Re-check at the moment of the tap, not when the dialog opened.
+  const ids = shownIds.filter(stillDormant)
+  if (ids.length === 0) return
   return withDialog(async () => {
-    const results = await mapSettledLimited(items, 2, item => api.disable(item.machine.id))
-    const failed = results.filter(r => r.status === 'rejected').length
-    if (failed) toast.error(`${failed} of ${items.length} could not be disabled`)
-    else toast.success(`Disabled ${items.length} dormant machines`)
+    const results = await mapSettledLimited(ids, 2, id => api.disable(id))
+    const failures = results
+      .map((r, i) => ({ r, slug: fleet.byId.get(ids[i]!)?.machine.slug || ids[i]! }))
+      .filter(x => x.r.status === 'rejected')
+    if (failures.length) {
+      const first = failures[0]!
+      const reason = (first.r as PromiseRejectedResult).reason?.message || 'failed'
+      toast.error(`${failures.length} of ${ids.length} not disabled (${failures.map(f => f.slug).join(', ')}): ${reason}`)
+    } else {
+      toast.success(`Disabled ${ids.length} dormant machine${ids.length === 1 ? '' : 's'}`)
+    }
     await fleet.refresh()
   })
 }
 
+// Only a 2xx means the server revoked anything (daybreak P3-5). A 401 means this login was
+// already invalid and the handler never ran: sign in again and confirm again.
 async function revokeAll() {
   await withDialog(async () => {
     try {
@@ -479,14 +517,18 @@ async function revokeAll() {
         toast.error('This hub version cannot do that yet. Update reachd first.')
         return
       }
-      if (e?.status !== 401) {
-        toast.error(e.message || 'Could not sign out everywhere')
+      if (e?.status === 401) {
+        fleet.dispose()
+        api.signOutLocally()
+        await navigateTo({ path: '/login', query: { then: 'revoke-all' } })
         return
       }
+      toast.error(`Sign out everywhere failed: ${e?.message || 'unknown error'}. Nothing was revoked.`)
+      return
     }
     fleet.dispose()
-    api.setToken(null)
-    await navigateTo('/login')
+    api.signOutLocally()
+    await navigateTo({ path: '/login', query: { reason: 'signed-out-everywhere' } })
   })
 }
 
@@ -527,8 +569,16 @@ async function enableNotifications() {
 async function logout() {
   fleet.dispose()
   try { await api.logout() } catch { /* clear locally anyway */ }
-  api.setToken(null)
+  api.signOutLocally()
   navigateTo('/login')
+}
+
+// Another tab of this browser signed out (or revoked everything): leave too.
+function onStorage(e: StorageEvent) {
+  if (e.key !== SIGNOUT_KEY || !e.newValue) return
+  fleet.dispose()
+  api.setToken(null)
+  navigateTo(loginLocation(currentAppPath(), 'session-expired'))
 }
 
 // ---- keyboard (desktop)
@@ -578,10 +628,15 @@ const syncDark = () => { isDark.value = themeCtrl.resolved() === 'dark' }
 watch(() => themeCtrl.theme.value, syncDark)
 
 onMounted(() => {
-  // One snapshot on load, started before the stream so the stream's first hello can skip it.
-  void fleet.refresh().catch(() => {})
-  fleet.setupSSE()
+  // Subscribe first; the stream's hello triggers the snapshot, so nothing falls in between.
+  fleet.start()
   document.addEventListener('keydown', onKeydown)
+  window.addEventListener('storage', onStorage)
+  // Back from the login detour of a revoke-all that hit 401: ask again, do not do it silently.
+  if (route.query.then === 'revoke-all') {
+    dialog.value = { kind: 'revoke' }
+    router.replace({ query: { tab: 'settings' } })
+  }
   mq = window.matchMedia('(prefers-color-scheme: dark)')
   mq.addEventListener('change', syncDark)
   desktopQuery?.addEventListener('change', syncDesktop)
@@ -592,6 +647,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   fleet.dispose()
   document.removeEventListener('keydown', onKeydown)
+  window.removeEventListener('storage', onStorage)
   mq?.removeEventListener('change', syncDark)
   desktopQuery?.removeEventListener('change', syncDesktop)
 })

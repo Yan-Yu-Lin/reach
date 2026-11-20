@@ -701,6 +701,8 @@ kbd {
 .dialog-body { color: var(--text-2); display: flex; flex-direction: column; gap: 8px; }
 .dialog-body strong, .dialog-body .mono { color: var(--text); }
 .dialog-type { display: flex; flex-direction: column; gap: 6px; margin-top: 14px; font-size: 14px; color: var(--text-2); }
+.bulk-dropped { display: flex; align-items: flex-start; gap: 8px; padding: 8px 10px; border-radius: var(--radius-sm); background: var(--warn-soft); color: var(--text); font-size: 14px; }
+.bulk-dropped .icon { color: var(--warn); flex: none; margin-top: 2px; }
 .dialog-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 18px; }
 @keyframes fade-in { from { opacity: 0; } }
 @keyframes sheet-in { from { transform: translateY(24px); opacity: 0; } }
@@ -751,6 +753,7 @@ kbd {
 .login-card .login-remember { flex-direction: row; align-items: center; gap: 10px; min-height: var(--touch); font-weight: 500; }
 .login-remember input { width: 20px; height: 20px; accent-color: var(--accent); }
 .login-card .btn-primary { width: 100%; }
+.login-info { padding: 10px 12px; border-radius: var(--radius-sm); background: var(--accent-soft); color: var(--text); font-size: 14px; }
 .login-error { padding: 10px 12px; border-radius: var(--radius-sm); background: var(--danger-soft); color: var(--danger); font-size: 14px; }
 
 /* ── Desktop ────────────────────────────────────────────────────── */
