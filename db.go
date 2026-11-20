@@ -349,7 +349,7 @@ func (s *Store) Migrate(ctx context.Context, cfg Config) error {
 			return err
 		}
 	}
-		// Retired machines must not keep a working agent token (daybreak P2-5).
+	// Retired machines must not keep a working agent token (daybreak P2-5).
 	if _, err := s.db.ExecContext(ctx, `UPDATE machines SET agent_token_hash=NULL WHERE desired_state='retired' AND agent_token_hash IS NOT NULL`); err != nil {
 		return err
 	}
