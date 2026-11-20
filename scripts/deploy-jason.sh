@@ -181,6 +181,8 @@ ROLLBACK_ARMED=0
 SERVICE_STOPPED=0
 DB_MAY_HAVE_MIGRATED=0
 DB_BACKUP_PATH=""
+DEPLOY_FENCE=""
+PROBE_BIN=""
 REACHD_ROLLBACK=""
 REACHD_EXISTED=0
 CARRIER_ROLLBACK=""
@@ -306,14 +308,22 @@ rollback_reachd() {
     if [ "$LEGACY_WAS_ENABLED" = 1 ]; then sudo systemctl enable reach-wstunnel.service; else sudo systemctl disable reach-wstunnel.service 2>/dev/null || true; fi
     if [ "$LEGACY_WAS_ACTIVE" = 1 ]; then sudo systemctl start reach-wstunnel.service; else sudo systemctl stop reach-wstunnel.service 2>/dev/null || true; fi
   fi
-  if [ -n "${REACHD_UNIT_BACKUP:-}" ] && sudo test -f "$REACHD_UNIT_BACKUP"; then
-    echo "[deploy] restoring previous reachd.service" >&2
-    sudo cp -a "$REACHD_UNIT_BACKUP" /etc/systemd/system/reachd.service
+  if [ "${REACHD_UNIT_MUTATED:-0}" = 1 ]; then
+    if [ -n "${REACHD_UNIT_BACKUP:-}" ] && sudo test -f "$REACHD_UNIT_BACKUP"; then
+      echo "[deploy] restoring previous reachd.service" >&2
+      sudo cp -a "$REACHD_UNIT_BACKUP" /etc/systemd/system/reachd.service
+    elif sudo test -e /etc/systemd/system/reachd.service; then
+      # There was no /etc override before (vendor unit or fresh host):
+      # move ours away instead of leaving it active (astra P2-12).
+      echo "[deploy] removing reachd.service override added by this deploy" >&2
+      sudo mv /etc/systemd/system/reachd.service "/etc/systemd/system/reachd.service.failed.$DEPLOY_TS"
+    fi
     sudo systemctl daemon-reload
   fi
   if [ "$ROLLBACK_ARMED" = 1 ]; then
-    echo "[deploy] ERROR: deployment failed; restoring previous reachd binary" >&2
+    echo "[deploy] ERROR: deployment failed; rolling back reachd (binary + database)" >&2
     sudo systemctl stop reachd
+    db_restore_ok=1
     if [ "$DB_MAY_HAVE_MIGRATED" = 1 ]; then
       failed_db_dir="$(dirname "$DB_PATH")/backups/failed.${DEPLOY_TS}"
       echo "[deploy] preserving failed database files in $failed_db_dir" >&2
@@ -323,6 +333,32 @@ rollback_reachd() {
           sudo cp -a "$db_file" "$failed_db_dir/"
         fi
       done
+      # The old binary cannot read what the new one may have written
+      # (migrated sha256 agent tokens, schema). Restore the pre-deploy
+      # snapshot, but only if nothing durable (provision, approve,
+      # disable/retire, invite, service token, logout, revoke) happened
+      # after the fence; discardable writes (heartbeats, lazy token
+      # migration, observations) are re-created automatically.
+      if [ -n "$DEPLOY_FENCE" ] && sudo /opt/reach/reachd deploy-fence check --config /etc/reach/config.yaml --fence "$DEPLOY_FENCE" >&2; then
+        echo "[deploy] restoring pre-deploy database snapshot $DB_BACKUP_PATH" >&2
+        sudo cp -a "$DB_BACKUP_PATH" "$DB_PATH.rollback-candidate"
+        if [ "$(sudo sqlite3 "$DB_PATH.rollback-candidate" 'PRAGMA quick_check;')" = "ok" ]; then
+          sudo rm -f "$DB_PATH-wal" "$DB_PATH-shm"
+          sudo mv -f "$DB_PATH.rollback-candidate" "$DB_PATH"
+        else
+          echo "[deploy] ERROR: snapshot failed quick_check; not restoring" >&2
+          db_restore_ok=0
+        fi
+      else
+        echo "[deploy] ERROR: durable writes after the deploy fence (or no fence); NOT restoring the database automatically" >&2
+        db_restore_ok=0
+      fi
+    fi
+    if [ "$db_restore_ok" != 1 ]; then
+      echo "[deploy] ERROR: leaving reachd stopped with the new binary in place; operator decision required" >&2
+      echo "[deploy] ERROR: predeploy snapshot: $DB_BACKUP_PATH; failed set: ${failed_db_dir:-none}" >&2
+      echo "[deploy] ERROR: options: start the new binary as is, or restore the snapshot (losing the writes listed above) and the old binary $REACHD_ROLLBACK" >&2
+      exit "$exit_code"
     fi
     if [ "$REACHD_EXISTED" = 1 ] && [ -n "$REACHD_ROLLBACK" ] && sudo test -f "$REACHD_ROLLBACK"; then
       sudo install -m 0755 "$REACHD_ROLLBACK" /opt/reach/reachd.rollback-candidate
@@ -337,8 +373,10 @@ rollback_reachd() {
     rollback_ready="${rollback_ready:-0}"
     if [ "$REACHD_EXISTED" = 1 ]; then
       for attempt in $(seq 1 30); do
+        # TCP plus an authenticated admin request against the restored DB.
         if systemctl is-active --quiet reachd \
-          && "$UV_BIN" run --script scripts/check-local-service.py "$LISTEN_ADDR"; then
+          && "$UV_BIN" run --script scripts/check-local-service.py "$LISTEN_ADDR" \
+          && sudo bash scripts/check-reachd-ready.sh "$PROBE_BIN" /etc/reach/config.yaml "$LISTEN_ADDR"; then
           rollback_ready=1
           break
         fi
@@ -582,12 +620,14 @@ fi
 # it must be tested once with a real provision/disable/retire cycle while the
 # hub can be reached without Reach. REACH_INSTALL_REACHD_UNIT=1 enables it.
 REACHD_UNIT_BACKUP=""
+REACHD_UNIT_MUTATED=0
 if [ "${REACH_INSTALL_REACHD_UNIT:-0}" = 1 ]; then
   echo "[deploy] installing sandboxed reachd.service from deploy/systemd..."
   if sudo test -f /etc/systemd/system/reachd.service; then
     REACHD_UNIT_BACKUP="/var/lib/reach/deploy-backups/reachd.service.${DEPLOY_TS}"
     sudo cp -a /etc/systemd/system/reachd.service "$REACHD_UNIT_BACKUP"
   fi
+  REACHD_UNIT_MUTATED=1
   if command -v systemd-analyze >/dev/null; then
     systemd-analyze verify deploy/systemd/reachd.service
   fi
@@ -619,6 +659,17 @@ if [ "$(sudo sqlite3 "$DB_PATH" 'PRAGMA quick_check;')" != "ok" ]; then
 fi
 echo "[deploy] database backup: $DB_BACKUP_PATH"
 
+# Prove the rollback path on a private copy of the snapshot before the new
+# binary touches the live DB (astra P1-01): old binary on the restored copy
+# must accept a legacy Argon2 agent token heartbeat. Skipped on fresh installs.
+PROBE_BIN=/tmp/reachd-build
+if [ "$REACHD_EXISTED" = 1 ] && [ "${REACH_SKIP_ROLLBACK_REHEARSAL:-0}" != 1 ]; then
+  echo "[deploy] rehearsing rollback on a private copy of the snapshot..."
+  sudo bash scripts/rehearse-rollback.sh /opt/reach/reachd /tmp/reachd-build "$DB_BACKUP_PATH" /etc/reach/config.yaml
+fi
+DEPLOY_FENCE="${DB_BACKUP_DIR}/deploy-fence.${DEPLOY_TS}.json"
+sudo /tmp/reachd-build deploy-fence record --config /etc/reach/config.yaml --fence "$DEPLOY_FENCE"
+
 REACHD_ROLLBACK="/opt/reach/reachd.rollback.${DEPLOY_TS}"
 ROLLBACK_ARMED=1
 if [ "$REACHD_EXISTED" = 1 ]; then
@@ -627,12 +678,14 @@ fi
 sudo install -m 0755 /tmp/reachd-build /opt/reach/reachd.candidate
 sudo mv -f /opt/reach/reachd.candidate /opt/reach/reachd
 rm -f /tmp/reachd-build
+PROBE_BIN=/opt/reach/reachd
 
 DB_MAY_HAVE_MIGRATED=1
 sudo systemctl start reachd
 SERVICE_STOPPED=0
 for attempt in $(seq 1 30); do
-  if systemctl is-active --quiet reachd && "$UV_BIN" run --script scripts/check-local-service.py "$LISTEN_ADDR"; then
+  if systemctl is-active --quiet reachd && "$UV_BIN" run --script scripts/check-local-service.py "$LISTEN_ADDR" \
+    && sudo bash scripts/check-reachd-ready.sh "$PROBE_BIN" /etc/reach/config.yaml "$LISTEN_ADDR"; then
     break
   fi
   if [ "$attempt" -eq 30 ]; then

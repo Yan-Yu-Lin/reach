@@ -37,6 +37,10 @@ func runCLI(ctx context.Context, args []string) error {
 		return cliHealth(ctx, args[1:])
 	case "db-check":
 		return cliDBCheck(ctx, args[1:])
+	case "deploy-fence":
+		return cliDeployFence(ctx, args[1:])
+	case "admin-probe-token":
+		return cliAdminProbeToken(ctx, args[1:])
 	case "hash-secret":
 		return cliHashSecret(args[1:])
 	case "ws-server":
@@ -331,6 +335,8 @@ Usage:
   reachctl ssh-config
   reachctl health
   reachd db-check [--config /etc/reach/config.yaml]
+  reachd deploy-fence record|check --config /etc/reach/config.yaml --fence FILE
+  reachd admin-probe-token [--config /etc/reach/config.yaml]
   printf 'secret' | reachd hash-secret`)
 }
 
