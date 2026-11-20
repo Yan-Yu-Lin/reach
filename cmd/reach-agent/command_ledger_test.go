@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -155,5 +156,46 @@ func TestHeartbeatDoesNotFollowRedirect(t *testing.T) {
 	}
 	if leaked.Load() != 0 {
 		t.Fatal("heartbeat credential sent to the redirect target")
+	}
+}
+
+// Daybreak round 4 P2-03: a download error never carries the response
+// body (it can end up in a command result sent to the hub).
+func TestDownloadErrorHasNoBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(500)
+		_, _ = io.WriteString(w, "INTERNAL-SECRET-BODY")
+	}))
+	defer srv.Close()
+	err := downloadFile(context.Background(), srv.URL+"/x", filepath.Join(t.TempDir(), "f"), 100)
+	if err == nil || strings.Contains(err.Error(), "INTERNAL-SECRET-BODY") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+// The hub may not point an update at another server.
+func TestUpdateCommandRejectsForeignAPIURL(t *testing.T) {
+	var results []string
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		results = append(results, string(b))
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer hub.Close()
+	cfg := defaultConfig()
+	cfg.Heartbeat.Enabled = true
+	cfg.Heartbeat.APIURL = hub.URL
+	cfg.Heartbeat.Token = "t"
+	cfg.Updates.AllowSelfUpdate = true
+	cfg.Install.AgentPath = "/nonexistent/reach-agent"
+	cfg.Install.DataDir = t.TempDir()
+	d := NewDaemon(cfg)
+	d.logger = log.New(io.Discard, "", 0)
+	if !d.canSelfUpdate() {
+		t.Skip("self-update needs Linux (and root for system mode)")
+	}
+	d.applyCommand(context.Background(), AgentCommand{ID: "cmd_upd", Type: "update_agent", Payload: json.RawMessage(`{"version":"9.9.9","api_url":"https://evil.example"}`)})
+	if len(results) == 0 || !strings.Contains(strings.Join(results, ""), "not this agent's configured Reach API") {
+		t.Fatalf("foreign api_url not refused: %v", results)
 	}
 }

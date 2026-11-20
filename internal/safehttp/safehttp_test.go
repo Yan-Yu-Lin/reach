@@ -1,8 +1,10 @@
 package safehttp
 
 import (
+	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -69,6 +71,65 @@ func TestValidateURL(t *testing.T) {
 	}
 	for _, bad := range []string{"http://x.example/a", "http://localhost.evil.example/", "https://u:p@x.example/", "ftp://x/", "file:///etc/passwd"} {
 		if err := ValidateURL(bad); err == nil {
+			t.Errorf("%s accepted", bad)
+		}
+	}
+}
+
+// Daybreak round 4 P2-03: a download may not leave its origin, even by an
+// HTTPS redirect, and never reaches a private address.
+func TestDownloaderStaysOnOrigin(t *testing.T) {
+	marker := "SECRET-INTERNAL-MARKER"
+	other := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(500)
+		_, _ = io.WriteString(w, marker)
+	}))
+	defer other.Close()
+	src := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, other.URL+"/x", http.StatusFound)
+	}))
+	defer src.Close()
+	origin, _ := OriginOf(src.URL)
+	d := Downloader{Origins: []string{origin}}
+	c := d.Client()
+	c.Transport.(*http.Transport).TLSClientConfig = src.Client().Transport.(*http.Transport).TLSClientConfig
+	resp, err := c.Get(src.URL)
+	if err == nil {
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("cross-origin redirect followed: %s", b)
+	}
+	if strings.Contains(err.Error(), marker) {
+		t.Fatal("other origin's body leaked into the error")
+	}
+}
+
+func TestDownloaderRefusesPrivateAddresses(t *testing.T) {
+	for _, ip := range []string{"10.0.0.1", "192.168.1.1", "172.16.0.1", "169.254.169.254", "fe80::1", "0.0.0.0"} {
+		if !disallowedIP(net.ParseIP(ip)) {
+			t.Errorf("%s allowed", ip)
+		}
+	}
+	if disallowedIP(net.ParseIP("1.1.1.1")) {
+		t.Error("public address refused")
+	}
+	d := Downloader{Origins: []string{"https://metadata.internal"}}
+	c := d.Client()
+	tr := c.Transport.(*http.Transport)
+	if _, err := tr.DialContext(context.Background(), "tcp", "10.0.0.1:443"); err == nil || !strings.Contains(err.Error(), "disallowed") {
+		t.Fatalf("dial to a private IP: %v", err)
+	}
+}
+
+func TestDownloaderCheck(t *testing.T) {
+	d := Downloader{Origins: []string{"https://hub.example"}}
+	for _, ok := range []string{"https://hub.example/downloads/x", "https://HUB.example/y"} {
+		if err := d.Check(ok); err != nil {
+			t.Errorf("%s: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"https://evil.example/x", "http://hub.example/x", "https://u@hub.example/x", "https://hub.example:8443/x"} {
+		if err := d.Check(bad); err == nil {
 			t.Errorf("%s accepted", bad)
 		}
 	}

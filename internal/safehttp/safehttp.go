@@ -13,6 +13,7 @@
 package safehttp
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -92,4 +93,97 @@ func ValidateURL(raw string) error {
 		}
 	}
 	return fmt.Errorf("URL must use https (plain http only for loopback): %s", u.Redacted())
+}
+
+// Downloader fetches release artifacts only from allowed origins
+// (daybreak round 4 P2-03). Every hop, including redirects, must be one of
+// Origins (scheme://host[:port], normally the configured Reach API) and
+// must not resolve to a private, link-local, multicast or unspecified
+// address unless that origin is itself loopback (local setups and tests).
+type Downloader struct {
+	Origins []string
+	Timeout time.Duration
+}
+
+// originOf returns scheme://host[:port] in lower case.
+func originOf(u *url.URL) string {
+	return strings.ToLower(u.Scheme + "://" + u.Host)
+}
+
+// OriginOf is originOf for a raw URL.
+func OriginOf(raw string) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", err
+	}
+	return originOf(u), nil
+}
+
+func (d Downloader) allowed(u *url.URL) error {
+	if u.User != nil {
+		return errors.New("URL contains credentials")
+	}
+	o := originOf(u)
+	for _, a := range d.Origins {
+		if strings.EqualFold(strings.TrimRight(a, "/"), o) {
+			if u.Scheme != "https" && !IsLoopbackHost(u.Hostname()) {
+				return fmt.Errorf("plain http download from %s refused", o)
+			}
+			return nil
+		}
+	}
+	return fmt.Errorf("download origin %s is not the configured Reach API", o)
+}
+
+// disallowedIP: addresses an artifact download must never reach.
+func disallowedIP(ip net.IP) bool {
+	return ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() || ip.IsLoopback() || ip.IsInterfaceLocalMulticast()
+}
+
+// Client returns an http.Client enforcing the origin and address rules on
+// every connection and redirect.
+func (d Downloader) Client() *http.Client {
+	dialer := &net.Dialer{Timeout: 15 * time.Second}
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.Proxy = nil
+	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, err
+		}
+		ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+		if err != nil {
+			return nil, err
+		}
+		loopbackOrigin := IsLoopbackHost(host)
+		for _, ip := range ips {
+			if loopbackOrigin && ip.IsLoopback() {
+				continue
+			}
+			if disallowedIP(ip) {
+				return nil, fmt.Errorf("download host %s resolves to disallowed address %s", host, ip)
+			}
+		}
+		// Dial the address we checked, not a second resolution.
+		return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].String(), port))
+	}
+	return &http.Client{
+		Timeout:   d.Timeout,
+		Transport: tr,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return errors.New("too many redirects")
+			}
+			return d.allowed(req.URL)
+		},
+	}
+}
+
+// Check validates an initial download URL.
+func (d Downloader) Check(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return err
+	}
+	return d.allowed(u)
 }

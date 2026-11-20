@@ -609,24 +609,32 @@ func maxDownloadBytes(size int64) int64 {
 	return size
 }
 
+// downloadFile fetches url, which with every redirect must stay on the
+// configured Reach API origin and on public addresses (daybreak round 4
+// P2-03). Error messages never include the response body: they may end up
+// in a command result sent to the hub.
 func downloadFile(ctx context.Context, url, path string, maxBytes int64) error {
 	reqCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	if err := safehttp.ValidateURL(url); err != nil {
+	origin, err := safehttp.OriginOf(url)
+	if err != nil {
+		return err
+	}
+	dl := safehttp.Downloader{Origins: []string{origin}, Timeout: 5 * time.Minute}
+	if err := dl.Check(url); err != nil {
 		return err
 	}
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
 	}
-	resp, err := downloadClient.Do(req)
+	resp, err := downloadClientFor(dl).Do(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("download %s: %w", redactURL(url), err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("download %s returned %d: %s", url, resp.StatusCode, strings.TrimSpace(string(body)))
+		return fmt.Errorf("download %s returned HTTP %d", redactURL(url), resp.StatusCode)
 	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {

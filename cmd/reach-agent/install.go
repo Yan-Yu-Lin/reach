@@ -817,6 +817,9 @@ func installWSTunnel(ctx context.Context, dest string, ws *websocketTunnelConfig
 	if !ok {
 		return fmt.Errorf("no wstunnel binary for %s", key)
 	}
+	if bin.SHA256 == "" {
+		return fmt.Errorf("wstunnel binary for %s has no sha256 pin; refusing to install it", key)
+	}
 	fmt.Printf("[reach] installing wstunnel carrier for %s\n", key)
 	data, err := download(ctx, bin.URL)
 	if err != nil {
@@ -839,21 +842,30 @@ func installWSTunnel(ctx context.Context, dest string, ws *websocketTunnelConfig
 	return nil
 }
 
+// download fetches a carrier binary named by the hub. The URL's own
+// origin is the only one allowed (no cross-origin redirects), it must be
+// https and resolve to public addresses; the caller requires a pinned
+// sha256 (daybreak round 4 P2-03).
 func download(ctx context.Context, url string) ([]byte, error) {
-	if err := safehttp.ValidateURL(url); err != nil {
+	origin, err := safehttp.OriginOf(url)
+	if err != nil {
+		return nil, err
+	}
+	dl := safehttp.Downloader{Origins: []string{origin}, Timeout: 5 * time.Minute}
+	if err := dl.Check(url); err != nil {
 		return nil, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := downloadClient.Do(req)
+	resp, err := downloadClientFor(dl).Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("download %s: %w", redactURL(url), err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
-		return nil, fmt.Errorf("download %s returned %d", url, resp.StatusCode)
+		return nil, fmt.Errorf("download %s returned HTTP %d", redactURL(url), resp.StatusCode)
 	}
 	return io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 }

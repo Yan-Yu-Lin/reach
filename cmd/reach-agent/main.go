@@ -743,6 +743,14 @@ func (d *Daemon) applyCommand(ctx context.Context, cmd AgentCommand) {
 		}
 		payload.Version = strings.TrimSpace(payload.Version)
 		payload.APIURL = strings.TrimSpace(payload.APIURL)
+		// The hub may not point the update at another server: downloads
+		// come only from the API this agent is configured for (daybreak
+		// round 4 P2-03).
+		if payload.APIURL != "" && !sameOrigin(payload.APIURL, d.cfg.Heartbeat.APIURL) {
+			res.Status = "failed"
+			res.Message = "update api_url is not this agent's configured Reach API"
+			break
+		}
 		if payload.Version == "" {
 			res.Status = "failed"
 			res.Message = "update payload missing version"
