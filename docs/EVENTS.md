@@ -71,6 +71,14 @@ data: {"reason":"cursor_out_of_range"}
   `replay_failed`, `subscriber_overflow`, `event_persistence_failed`,
   `event_encode_failed`.
 
+## Timestamps
+
+Durable events can be replayed up to 72 hours later, so the time a client
+receives an event says nothing about how fresh its content is. Events that
+carry observed state include the server's own timestamps (`last_probe_at`,
+`heartbeat_at`, `event_at`). Clients talking to older servers that omit
+them should not treat the receive time as a fresh observation.
+
 ## Durable event types
 
 | type | data | notes |
@@ -81,9 +89,9 @@ data: {"reason":"cursor_out_of_range"}
 | `machine.created` | `machine_id`, `slug` | |
 | `machine.desired_changed` | `machine_id`, `desired_state`, `generation`, optional `reason` | |
 | `machine.enabled` / `machine.disabled` / `machine.retiring` / `machine.retired` | `machine_id`, `slug` (admin) or `machine_id`, `reason` (agent uninstall) | |
-| `machine.observed_changed` | `machine_id`, `observed_state`, `status` | |
+| `machine.observed_changed` | `machine_id`, `observed_state`, `status`, `heartbeat_at`, `event_at` | `heartbeat_at`: the heartbeat that caused the change; `event_at`: when the server emitted it (both RFC 3339 UTC, added 2026-11-21) |
 | `machine.online` / `machine.degraded` / `machine.offline` / `machine.gone` / `machine.unknown` | `machine_id`, `slug` | emitted with `machine.observed_changed` |
-| `machine.health_changed` | `machine_id`, `observed_state`, `status`, `probe_state` | only when the hub probe result changes |
+| `machine.health_changed` | `machine_id`, `observed_state`, `status`, `probe_state`, `last_probe_at`, `event_at` | only when the hub probe result changes. `last_probe_at` is the server's stored probe time for this result (RFC 3339 UTC, may be empty for a machine never probed); use it, not the time the event arrived, for freshness: replayed events can be up to 72 h old. `event_at` is when the server emitted the event. Both added 2026-11-21; older servers omit them |
 | `machine.cleanup_failed` | `machine_id`, `cleanup_state`, `desired_state` | **new.** Hub-side revoke/cleanup failed; see below |
 | `machine.retiring_timed_out` | `machine_id`, `cleanup_state` (`timed_out`) | **new.** Agent never confirmed uninstall |
 | `machine.update_policy_changed` | `machine_id`, `slug`, `update_policy` | |

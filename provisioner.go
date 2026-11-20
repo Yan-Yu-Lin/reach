@@ -1160,7 +1160,12 @@ func (p *Provisioner) RunHealthCheck(ctx context.Context) ([]map[string]any, err
 			refreshAge = dormantRefresh
 		}
 		changed := !po.ok || po.state != state || po.probeErr != probeErr
+		// storedProbeAt is the last_probe_at the DB holds after this round;
+		// events carry it so a replayed event never looks fresher than the
+		// observation behind it (astra dashboard R2-03).
+		storedProbeAt := po.lastProbe
 		if changed || (ok && po.state == "reachable" && detail != "listening (keyscan cached)") || nowT.Sub(lastProbe) >= refreshAge {
+			storedProbeAt = now
 			var lastSuccess any
 			if ok {
 				lastSuccess = now
@@ -1181,7 +1186,7 @@ func (p *Provisioner) RunHealthCheck(ctx context.Context) ([]map[string]any, err
 			return nil, err
 		}
 		if machineChanged || changed || t.Status != nextTunnelStatus {
-			p.publish("machine.health_changed", t.MachineID, map[string]any{"machine_id": t.MachineID, "observed_state": observed, "status": status, "probe_state": state})
+			p.publish("machine.health_changed", t.MachineID, map[string]any{"machine_id": t.MachineID, "observed_state": observed, "status": status, "probe_state": state, "last_probe_at": storedProbeAt, "event_at": now})
 		}
 		report = append(report, map[string]any{"tunnel_id": t.ID, "machine_id": t.MachineID, "port": t.RemotePort, "ok": ok, "probe_state": state, "detail": detail, "checked_at": now})
 	}

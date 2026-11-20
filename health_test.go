@@ -1,9 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -126,4 +131,55 @@ func TestManifestIsCached(t *testing.T) {
 	if rel, ok := readManifestCached(path); !ok || rel.Version != "1.0.0" {
 		t.Fatalf("cached read = %#v %v", rel, ok)
 	}
+}
+
+// Astra dashboard R2-03: health events carry the server's probe time so a
+// replayed event is not mistaken for a fresh probe.
+func TestHealthChangedEventCarriesServerProbeTime(t *testing.T) {
+	server, store, _ := newReliabilityTestServer(t)
+	insertTestMachine(t, store, "m_hp", "hp-box")
+	if _, err := store.db.Exec(`INSERT INTO tunnels (id,machine_id,hub_id,unix_user,remote_port,tunnel_pubkey,status,created_at) VALUES ('t_hp','m_hp','primary','rt-hpbox111',9270,'k','offline',?)`, nowUTC()); err != nil {
+		t.Fatal(err)
+	}
+	server.prov.listListeners = func(context.Context) (map[int]bool, error) { return map[int]bool{}, nil }
+	if _, err := server.prov.RunHealthCheck(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var payload, stored string
+	_ = store.db.QueryRow(`SELECT payload_json FROM events WHERE type='machine.health_changed' ORDER BY id DESC LIMIT 1`).Scan(&payload)
+	_ = store.db.QueryRow(`SELECT last_probe_at FROM hub_observations WHERE tunnel_id='t_hp'`).Scan(&stored)
+	var data map[string]any
+	if err := json.Unmarshal([]byte(payload), &data); err != nil {
+		t.Fatal(err)
+	}
+	if data["last_probe_at"] != stored || stored == "" {
+		t.Fatalf("event last_probe_at=%v, stored=%s", data["last_probe_at"], stored)
+	}
+	for _, k := range []string{"machine_id", "observed_state", "status", "probe_state", "event_at"} {
+		if _, ok := data[k]; !ok {
+			t.Fatalf("event lost field %s: %v", k, data)
+		}
+	}
+	// The same event replayed later still reports the original probe time.
+	ts := httptest.NewServer(server)
+	defer ts.Close()
+	tok, _ := adminTestToken(t, store, server.cfg)
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/admin/events", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Last-Event-ID", "0")
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	sc := bufio.NewScanner(resp.Body)
+	for sc.Scan() {
+		if strings.HasPrefix(sc.Text(), "data:") && strings.Contains(sc.Text(), "probe_state") {
+			if !strings.Contains(sc.Text(), `"last_probe_at":"`+stored+`"`) {
+				t.Fatalf("replayed event lacks probe time: %s", sc.Text())
+			}
+			return
+		}
+	}
+	t.Fatal("health event not replayed")
 }

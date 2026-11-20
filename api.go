@@ -993,7 +993,7 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if old != m.ObservedState {
-		s.publishEvent(r.Context(), "machine.observed_changed", m.ID, map[string]any{"machine_id": m.ID, "observed_state": m.ObservedState, "status": m.Status})
+		s.publishEvent(r.Context(), "machine.observed_changed", m.ID, map[string]any{"machine_id": m.ID, "observed_state": m.ObservedState, "status": m.Status, "heartbeat_at": now, "event_at": now})
 		s.publishEvent(r.Context(), "machine."+m.ObservedState, m.ID, map[string]any{"machine_id": m.ID, "slug": m.Slug})
 	}
 	if previousSSHOptions != sshOptionsSignature(string(raw)) {
