@@ -50,25 +50,102 @@
 |---|---|---|
 | sync_keys 加簽章（daybreak P1-3 的 target 端、Opus P2-6） | 要新增一把離線金鑰、Mac 上的簽章流程，以及每台 target 的遷移計畫，工作量太大 | `docs/design/2026-11-21-signed-sync-keys.md` |
 | reachd 拆成非 root API 加 root helper（方案 B） | 依指示只寫設計。RPC 介面直接沿用這次新增的 `tunnelOS` | `docs/design/2026-11-21-reachd-privilege-split.md` |
-| carrier 改用 per-machine token（daybreak P2-4 的認證部分） | 這次只做了 exact path 和資源上限；共用的 path 仍然只是一個弱 secret | 寫在這張表 |
+| carrier 改用 per-machine token（daybreak P2-4 的認證部分） | 這次只做了 exact path、資源上限、沒 path 不啟動；共用的 path 仍然只是一個弱 secret | `docs/design/2026-11-21-carrier-credentials.md` |
 | god code 改成短效（daybreak P2-7／Opus P2-1） | 不在指定範圍。Arthur 的第 0 批清單裡是直接清空 `god_code_hash` | |
 | 收集 target host key（daybreak P3-2 的 TOFU 部分） | 不在範圍內；這次只做了 ForwardAgent 和 port tombstone，避免冒充 | |
 | 把 `/var/lib/rt-*` 搬到專用目錄 | 要搬家目錄，和方案 B 一起做 | 方案 B 設計 |
 
-## 相容性（本機實測）
+## 相容性（本機實測，2026-11-21 更新）
 
 - 舊 DB（Argon2 agent token）接新 reachd：第一次 heartbeat 回 200，hash 被改寫成 `sha256:`。
-- 舊 JWT（沒有 `sv` claim）接新 reachd：仍然有效，因為 `sv=0` 等於預設值。
+- **舊 JWT（沒有 `sv`）接新 reachd：會失效（401），所有人都要重新登入一次**（daybreak P1-3）。Mac 的 `sat_` service token 不受影響。
 - 新 mac-agent 接舊 reachd 8c74086：退回解析文字，可以正常同步。
-- 舊 mac-agent 接新 reachd：文字 API 保留，可以用。Mac 上現在的 token 是 `sat_` 開頭的 service token，不受影響。
-- 舊 agent：heartbeat、poll、provision 的格式都沒變。新版 agent 在 register 時會多帶 slug、mode、local_port，舊版不帶也能用：沒帶 slug 時，綁定的是正規化後的名稱，跟舊版 agent 自己算出來的一樣。
+- 舊 mac-agent 接新 reachd：文字 API 保留，可以用，但預設不再帶 target 回報的演算法選項（`legacy_ssh_config_options: false`）。
+- 舊 agent：heartbeat、poll、provision 的格式都沒變。部署前就已建立、但還沒 provision 的 request 會收到 410，要重新跑 setup（最多影響 request_ttl 30 分鐘內的請求）。
+- **新安裝、而且機器上沒有 sshd 的 target，會改用 agent 內建的 internal-sshd**（只聽 loopback；沒有 sftp；system 安裝時 session 以 target user 身分跑）。已經裝好的機器不受影響。Windows 系統安裝如果還沒裝 OpenSSH Server，要加 `-InstallOpenSSH` 才會裝。
+- 部署 rollback 在 Ubuntu 24.04 container 裡實測過兩種情境（`scripts/test-rollback-in-container.sh`）。
 
-## 要 Arthur 決定
+## 要 Arthur 決定（2026-11-21 更新）
 
-1. **部署時機**：要在家時部署，或確定 jason 有另一條路可以連（Headscale）時再部署。部署前後都要確認 omarchy 和 jack 的狀態。
-2. **sandbox unit**：預設不裝。要先在 VM 或有退路的時候，帶 `REACH_INSTALL_REACHD_UNIT=1` 實際測一次「新增、停用、退役」。
-3. **nginx 範本、HAProxy 建議 diff**：都要手動套用。HAProxy 是公網唯一的入口，套之前請先看過。營區如果是很多人共用一個 IP（CGNAT），可能需要把數字調高。
-4. **carrier 的 exact path**：要在 jason 建 `/etc/reach/ws-carrier.env`，內容 `REACH_WS_PATH_PREFIX=/ws/tunnel/<secret>/`。不建也能跑，只是靠 nginx 擋路徑。
-5. **9205 重複**：jason 的 DB 裡 `reach-test`（hub jason）和 `gaming-pc`（hub primary）兩台都用 9205，而且都是 active 加 gone。建議退役其中一台（新版會在 log 裡警告）。
-6. **jason 上 9 台 retiring 的機器**：部署 24 小時後會被標成 `timed_out`，dashboard 會顯示，要由你按 retire-now。retire-now 現在會真的驗證是否清乾淨，失敗的話會顯示 `cleanup_failed`。
-7. **revoke-all 會讓 mac-agent 斷線**：如果按「Sign out everywhere」時連 service token 一起撤銷，Mac 上要重新拿 token。
+1. **部署時機**：要在家時部署，或確定 Headscale 這條路可用時再部署。部署前後都要從外面實際 `ssh omarchy`、`ssh jack` 一次，不能只看 DB 狀態。
+2. **分階段，不要同一天全部切換**（見下方「部署順序」）。
+3. **9 台 retiring 的機器會在新版第一次 maintenance 就變成 `timed_out`**，不是 24 小時後，因為它們從 6～7 月就在 retiring 了。這只是標記，不會自動退役。dashboard（`fix/dashboard-2026-11`）已經有 Force retire（retire-now）的按鈕，要一台一台確認後再按。
+4. **port 重複不只 9205**：jason DB 目前 9200～9206 和 9208 都各有兩筆（一筆 hub `jason`、一筆 hub `primary`），大多是舊的 disabled／retiring 那一筆。**不准批次 retire**，要逐筆確認哪一台是真的在用：
+   - 9206：`ntut-vpn-help`（primary）在線；`schoollab29`（jason）是 retiring。
+   - 9208：`omarchy`（primary）在線；`box-vm`（jason）是 disabled。
+   - 9205：`reach-test`（jason，DGX，屬於資策會範圍）和 `gaming-pc`（primary）都 active 但都不在線。
+   - 9200～9204：jason 那筆全是 retiring；primary 那筆有 active 也有 retiring。
+   新版 allocator 不會再分配出重複的 port，啟動時也會把這些重複寫進 log。
+5. **sandbox unit 還是 opt-in**；資源上限 drop-in（MemoryMax 等）現在是預設會裝。兩者都不是 root containment。
+6. **nginx 範本、HAProxy 建議 diff 都要手動套用**。HAProxy 是公網唯一的入口，套之前請先看過。營區如果是 CGNAT，數字可能要調高；nginx `/api/client/` 2r/s burst 20 在 31 台同時重連時可能先回 429，agent 會重試。
+7. **carrier 現在沒有 path 就不啟動**：deploy 會從 config 的 `websocket_tunnel.path_prefix` 自動寫 `/etc/reach/ws-carrier.env`。目前有 2 台用 websocket transport。
+8. **revoke-all 會讓 mac-agent 斷線**：如果勾「連 service token 一起撤銷」，Mac 上要重新拿 token。
+9. **rollback 規則**：部署失敗時，如果新版上線後沒有「不能丟的寫入」（provision、approve、disable、retire、invite、service token、登出、revoke），就自動把 DB snapshot 和舊 binary 一起還原；有的話，reachd 會停著，等人決定。heartbeat、token 遷移、observation 這些可丟的寫入不會擋自動回滾。
+
+## 部署順序（建議，每一步之間至少觀察一天）
+
+1. **reachd + 資源上限 drop-in**（`deploy-from-mac.sh`，不帶 `REACH_INSTALL_REACHD_UNIT`）。會先在 snapshot 副本上演練 rollback。部署後：從外面 `ssh omarchy`、`ssh jack`；dashboard 重新登入；確認 carrier 有起來（2 台 websocket 機器有連上）。
+2. **Mac 上換新的 reach-mac-agent**（結構化 ssh config）。確認 `~/.ssh/reach-tunnels.conf` 內容正確、`ssh -G jack` 正常。
+3. **dashboard 前端**（`fix/dashboard-2026-11`），可以和第 1 步同一天，但在 reachd 之後。
+4. **nginx 範本**：先在 jason 上 `nginx -t`（1.24），再 reload。觀察 429。
+5. **HAProxy 建議 diff**：Arthur 看過後才套；套完從外面測 SSH 和 HTTPS。
+6. **sandbox unit**（`REACH_INSTALL_REACHD_UNIT=1`）：只在有退路的時候，並實際做一次 新增→停用→啟用→退役。
+7. **agent release**：新的 agent（anti-rollback floor、internal-sshd run-as、Windows ACL）透過 update policy 逐台更新，先從可以實體救回的機器開始。
+
+## astra round 1（審 17707dc，2026-11-21）
+
+| 編號 | 發現 | 怎麼修 | 證明（測試／實測；都做過 mutation 驗證） | commit |
+|---|---|---|---|---|
+| P1-01 | rollback 只換回 binary，舊版不認得已遷移的 sha256 token；readiness 只看 TCP | 部署前在 snapshot 的**私有副本**上演練 rollback（canary 只放在副本裡，正式 DB 不新增任何東西）；`deploy-fence` 記錄高水位，失敗時區分可丟／不可丟寫入；沒有不可丟寫入才把 DB snapshot 和舊 binary 一起還原（保留 forensic copy、清 WAL/SHM），否則停著等人；readiness 改成 TCP 加一次有認證的 `/api/admin/health` | `deploy_fence_test.go`（用真 handler 分類每一種寫入）、`scripts/rehearse-rollback.sh`（本機：binary-only 回滾 401、還原後 200）、`scripts/test-rollback-in-container.sh`（Ubuntu 24.04 跑真的 `rollback_reachd`：情境 A 自動還原、舊版 heartbeat 200；情境 B 有 disable 就停著） | 3646d23、8cd316f、ee377d3 |
+| P1-02 | Windows 原子替換丟掉 authorized_keys 的 DACL | `replaceWithACL`：先建空 temp、先套 DACL、再寫內容、再 rename；system 安裝 ACL 失敗就不換檔 | `authkeys_acl_test.go`（順序、strict 失敗不換檔、icacls 參數）。**沒有在 Windows 實測** | c9a3144 |
+| P2-01 | heartbeat 把 disable_failed／cleanup_failed 蓋回 disabled／retiring | `effectiveStatus` 集中推導，失敗狀態優先；recompute 的 UPDATE 加上 desired/cleanup CAS | `TestHeartbeatKeepsCleanupFailureStatus`、`TestEffectiveStatusPrecedence` | eaa0fe6 |
+| P2-02 | 先前 disable 失敗，uninstall-intent 卻回 200 | 只有真的撤銷成功才算冪等；disable_failed 重試 remove、cleanup_failed 重試 retire、查詢錯誤也算錯 | `TestUninstallIntentRetriesPriorDisableFailure` | eaa0fe6 |
+| P2-03 | confirm 吞掉 floor 錯誤卻取消 rollback；watcher 和 confirm 有競態 | confirm 和 watcher 用 rename 原子 claim 同一個 flag；floor 讀寫失敗就把 flag 放回去並回錯 | `TestConfirmKeepsRollbackArmedWhenFloorFails`、`TestConfirmAndRollbackClaimExclusively` | 289fe0d |
+| P2-04 | legacy timestamp floor 和任意 sequence 不在同一個排序空間 | sequence 定義為 Unix 秒（≥1e9）；小數字直接拒絕；deploy 驗證新 sequence 必須大於已發布的 | `TestSequenceSpaceIsUnixSeconds`；`verify-release-artifacts.py --previous-manifest` 實測 | 289fe0d、4776166 |
+| P2-05 | authorized_keys 超過 4 MiB 會被截斷寫回 | 多讀 1 byte，超過就回錯、不動原檔 | `TestOversizeAuthorizedKeysIsRefusedNotTruncated` | 6655055 |
+| P2-06 | CentOS 6 的 curl 不支援 `--proto` | 偵測 curl 支援的參數；舊 curl 不跟隨 redirect，下載後自己檢查大小 | `scripts/test-setup-bootstrap.sh`（模擬 7.19.7 的 stub）。**沒有 CentOS 6 實機** | 518aa41 |
+| P2-07 | nginx 1.24 不支援 `http2 on;` | 改成 `listen ... ssl http2 proxy_protocol;` | 依官方文件；1.24 實機還沒 `nginx -t` | b928e19 |
+| P2-08 | 過期 command 的結果看 maintenance 和 heartbeat 誰先跑 | result 的 UPDATE 加上 `expires_at > now` | `TestExpiredCommandResultIndependentOfMaintenanceOrder` | fcb7a19 |
+| P2-09 | 過期的 setup token 回 503 busy | 過期 410、用過或錯的 401、只有 Argon2 gate 滿才 503、其他錯 500 並記 log | `TestExpiredSetupTokenIsTerminal`、`TestUsedSetupTokenIsUnauthorizedNotBusy` | fcb7a19 |
+| P2-10 | Mac 的保留名稱和 server 不一致；沒擋 Host==ProxyJump | 共用 `internal/reserved`；Mac 擋自我 ProxyJump；可在 mac-agent.yaml 加 `reserved_hosts` | `TestMacRejectsEveryServerReservedAlias`、`internal/reserved` 測試 | 2139d7e |
+| P2-11 | setup 的 localhost 例外只比前綴 | 解析 URL，http 只接受**完全等於** localhost／127.0.0.1／[::1]；拒絕 userinfo；每次下載都再驗 | `scripts/test-setup-bootstrap.sh`（24 案例）；setup.ps1 用 `[Uri]` 解析，**沒有實際跑 PowerShell** | 518aa41 |
+| P2-12 | opt-in unit 原本不存在時 rollback 不會移除 | 記錄 mutated 狀態；原本沒有 override 就把這次裝的移走 | 靜態審查；Linux 故障注入沒做 | 3646d23 |
+| P3-01 | health 不寫入的測試抓不到每輪都寫 | 改用 refresh window 內的 sentinel 時間，並另外測過期一定會 refresh | 「每輪都寫」和「從不 refresh」兩個 mutant 都會讓測試失敗 | 523d6a6 |
+| 部署說明 | 9 台 retiring 立刻 timed_out、port 重複、前端已有 Force retire、分階段 | 見上方「要 Arthur 決定」和「部署順序」 | jason 唯讀查詢 | 本 commit |
+
+## daybreak round 2（審 17707dc，2026-11-21）
+
+| 編號 | 發現 | 怎麼修 | 證明 | commit |
+|---|---|---|---|---|
+| P1-1 | machine 狀態轉移沒有序列化，可能 DB 說 retiring 但 key 還開著 | per-machine lock，lock 內重讀；每個 UPDATE 都對開始時的 generation 做 CAS（RowsAffected=1）；enable 的 OS 成功但 DB 記錄失敗就補償 DisableAuth | `transition_race_test.go`（blocking fake OS：enable vs uninstall、enable vs disable、OS 成功後 DB 失敗）；拿掉 lock／CAS／補償任一項都會失敗 | 3b02f1e |
+| P1-2 | `reach-sync-mac.sh` 把 raw config 原樣寫進 Include | 腳本改成只負責登入，然後呼叫 `reach-mac-agent run --once`；README 不再推薦 raw endpoint；raw endpoint 保留，但預設不帶 target 選項（`legacy_ssh_config_options`） | `scripts/test-reach-sync-mac.sh`（假 API 回 `Match exec`；舊腳本失敗、新腳本通過且 marker 沒被建立）、`TestLegacyTextOmitsTargetOptionsByDefault` | bc936e2 |
+| P1-3 | 升級前一年期的 JWT 仍有效 | migration 加入 `session_version` 欄位時，所有帳號 +1 | `TestMigrationInvalidatesPreUpgradeJWTs`（舊 token 401、`sat_` 200、新登入 200、重跑 migration 不會再登出） | 30edf19 |
+| P1-4 | 一台 target 用假演算法讓整個 Mac fleet 卡住 | server 只收固定的相容 profile（官方 agent 會送的那幾組）；Mac 端 `ssh -G` 失敗就拿掉所有 per-host options 再試，成功就安裝 | `TestBadHostOptionsDoNotFreezeFleet`、`TestSSHConfigClientOptionsRejectMalformedValues` | 820ecb4 |
+| P1-5 | system 安裝會開全介面的 port 22 | 只沿用已存在的 sshd（listen 超出 loopback 時警告）；沒有就用 internal-sshd（loopback），root agent 以 target user 身分跑 session；daemon 只 start 已 enabled 的 sshd；Windows 要 `--install-openssh` 才裝 OpenSSH Server | `sshd_posture_test.go`、`TestRunAsDropsPrivilegesWhenRoot`（Linux container 以 root 實測降權成功）。完整方案見 `docs/design/2026-11-21-loopback-sshd.md` | 187443b |
+| P1-6 | 資源上限 unit 是 opt-in | `reachd.service.d/10-reach-limits.conf`（MemoryMax 1G、TasksMax、LimitNOFILE）每次部署都裝，有備份和回滾；文件寫明這不是 root containment | `systemd-analyze verify`（Ubuntu 24.04 container） | 63767c0 |
+| P2-1 | fresh install 沒有 anti-rollback floor | 部署時決定一個 release sequence，寫進 binary（ldflags）和簽章 manifest；agent 啟動時把 floor 提高到自己的 sequence（等待 confirm 時不提高） | `TestFreshInstallSeedsFloorFromEmbeddedRelease` | 2b0cd89 |
+| P2-2 | `--candidate` 先 hash 後執行同一路徑 | 先 O_NOFOLLOW 複製到 0700 私有目錄，只驗證和執行那份複本 | `TestCandidateIsCopiedPrivately` | d779727 |
+| P2-3 | 核准時沒填的欄位等於萬用字元 | register 時就把預設值（root／system／22）寫進 binding；provision 每欄必須完全相同；舊格式 request 回 410 要重新註冊 | `TestOmittedFieldsAreBoundToDefaults`、`TestLegacyRequestWithoutBindingMustReregister` | 0b26af5 |
+| P2-4 | 過期 request 還能 approve、poll 拿 token | approve 要求 `expires_at>now`；poll 對 approved 也檢查 TTL；consume 再檢查一次；setup token 到期時間不超過 request 到期 | `TestExpiredRequestCannotBeApprovedOrPolled`、`TestSetupTokenExpiryClampedToRequest` | 0b26af5 |
+| P2-5 | 用錯的 secret 就能把真的 installer／agent 鎖在限速外 | 失敗次數改算在 (IP, 物件) bucket；per-request／per-machine 配額只在認證成功後扣；uninstall 有自己的 bucket | `TestWrongSecretsDoNotLockOutLegitimatePoller`、`TestWrongAgentTokensDoNotLockOutAgent` | d2f3797 |
+| P2-6 | 兩筆 live request 可以拿同一個 slug | `requests.slug` + partial unique index（pending／approved／provisioning）；deny／expire 釋放；register 時就回 409 | `TestSlugReservedAcrossLiveRequests` | 1761750 |
+| P2-7 | provision 中途 crash，request 永遠卡在 provisioning | 記錄 `provisioning_started_at` 和建立的 machine；maintenance 對超過 10 分鐘 lease 的 request 設 expired、machine 設 failed（port 保留），invite claim 釋放 | `TestStuckProvisioningIsRecovered` | 58d27e6 |
+| P2-8 | agent 接受多行 admin key | agent 自己 parse 並 canonicalize 每一把（單行、無 options、無第二把 key）；comment 不能偽造 `reach:` marker | `TestAgentRejectsMultiLineAdminKey`（install 和 sync 兩條路） | 526d310 |
+| P2-9 | Windows SYSTEM agent 跟隨 junction | 寫入前和 rename 前都檢查 home／.ssh／authorized_keys 不是 symlink 或 reparse point | `authkeys_reparse_test.go`。**沒有在 Windows 實測**；剩下的 check-to-rename race 和 handle-based 設計見 `docs/design/2026-11-21-windows-keyfile-traversal.md` | 65acab2 |
+| P2-10 | localhost 前綴繞過；agent 本身不驗 URL | 同 astra P2-11，另外 agent binary（install、update、heartbeat）也解析驗證 | `TestValidateAPIURL` | 518aa41、ac9a6a4 |
+| P2-11 | carrier 用全 fleet 共用 path 當認證 | **部分**：path 改成完全相符、沒設 path 就不啟動、deploy 從 config 自動寫 env。per-machine credential 只寫設計 | `TestCarrierEnforcesExactPathBeforeDial`（含 `/secret/attacker-chosen-suffix`）、`TestAgentPathMatchesExactCarrierPath`；設計 `docs/design/2026-11-21-carrier-credentials.md` | 178aad0、f1b2a69 |
+| P2-12 | SSE 沒有連線數和 replay 大小上限 | 全域 64、每 IP 8、每個 admin 憑證 8；mac-agent token 只能有一條（新的取代舊的）；replay 加 4 MiB 上限；nginx 範本加 limit_conn | `TestMacAgentTokenGetsOneStream`、`TestEventStreamsArePerIPCapped`、`TestReplayByteCapForcesResnapshot` | b4dd8b5 |
+| P2-13 | bootstrap script 本身由 jason 提供 | 只寫設計（從 GitHub release 發布 setup 腳本） | `docs/design/2026-11-21-bootstrap-trust-root.md` | f1b2a69 |
+| P3-1 | Mac 保留名稱不一致 | 同 astra P2-10 | 同上 | 2139d7e |
+| P3-2 | 一次 heartbeat 成功就 confirm update；floor 寫失敗仍取消 rollback | active 機器要 tunnel connected 加 local SSH healthy 才 confirm；floor 失敗見 astra P2-03 | 靜態審查加 astra P2-03 的測試 | 519f27c、289fe0d |
+| P3-3 | process title 間隔可設極小值讓 agent 空轉 | agent 端 clamp 到至少 1 秒 | `TestProcessTitleIntervalClamped` | 519f27c |
+| P3-4 | PowerShell 下載沒有大小限制 | HttpWebRequest 串流下載、不自動 redirect、60 秒 timeout、TLS 1.2+、byte 上限、每次都驗 URL | **沒有實際跑 PowerShell**，靜態審查 | ed844fd |
+| P3-8 | 很舊的 schema 中 `status='retired'` 的 row 沒清 token | migration 也比對 `status='retired'` | `TestMigrationClearsTokenOfStatusRetiredRows` | ed844fd |
+| P3-5～P3-7 | dashboard | 交給前端 builder | | |
+| astra dashboard R2-03 | replay 回來的 health 事件沒有時間 | `machine.health_changed` 加 `last_probe_at`、`event_at`；`observed_changed` 加 `heartbeat_at`、`event_at`；只新增欄位 | `TestHealthChangedEventCarriesServerProbeTime`（含 replay） | 52e9395 |
+
+### 平台驗證現況
+
+- 已在 Linux（Ubuntu 24.04 container）實際跑過：rollback 兩種情境、internal-sshd 降權、systemd unit／drop-in verify。
+- 只在 Mac 上跑過：其他所有 Go 測試、`go test -race ./...`、setup.sh 的 offline 測試。
+- **還沒有實測**：Windows（ACL、junction、setup.ps1）、CentOS 6、nginx 1.24 的 `nginx -t`、HAProxy 2.8、sandbox unit 下真的 useradd／sshd reload。
