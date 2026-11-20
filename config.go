@@ -35,6 +35,10 @@ type Config struct {
 	InitialAdmin        InitialAdmin          `yaml:"initial_admin"`
 	DefaultHub          HubConfig             `yaml:"default_hub"`
 	ProvisioningEnabled bool                  `yaml:"provisioning_enabled"`
+	// ReservedSlugs extends the built-in reserved alias patterns (jason*,
+	// *-public, pi, localhost, ...). Use it for hand-written Host entries in
+	// the operator's ~/.ssh/config.
+	ReservedSlugs []string `yaml:"reserved_slugs"`
 }
 
 type InitialAdmin struct {

@@ -316,6 +316,7 @@ func (s *Store) Migrate(ctx context.Context, cfg Config) error {
 		{"tunnels", "original_unix_user", "TEXT"},
 		{"tunnels", "original_remote_port", "INTEGER"},
 		{"requests", "metadata_json", "TEXT"},
+		{"requests", "observed_ip", "TEXT"},
 	} {
 		if err := s.ensureColumn(ctx, col.table, col.name, col.decl); err != nil {
 			return err
@@ -521,6 +522,11 @@ func (s *Store) seed(ctx context.Context, cfg Config) error {
 			if err != nil {
 				return fmt.Errorf("invalid initial admin public key %q: %w", k.Label, err)
 			}
+			canonical, err := CanonicalSSHPublicKey(k.PublicKey)
+			if err != nil {
+				return fmt.Errorf("invalid initial admin public key %q: %w", k.Label, err)
+			}
+			k.PublicKey = canonical
 			kid, err := RandomID("ak")
 			if err != nil {
 				return err

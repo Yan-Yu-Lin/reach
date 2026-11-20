@@ -286,8 +286,31 @@ func (s *Server) handleClientRegister(w http.ResponseWriter, r *http.Request) {
 	status := "pending"
 	var setupToken string
 	var setupHash, setupExpires, approvedAt, inviteHash any
-	meta := map[string]any{"name": name, "target_user": req.TargetUser, "slug": req.Slug, "mode": req.Mode, "local_port": req.LocalPort, "distro": req.Distro, "arch": req.Arch, "transport": req.Transport, "source_ip": ip}
+	// The slug is fixed at registration so the operator approves the alias
+	// that will actually be created (Opus P1-2).
+	slug := strings.TrimSpace(req.Slug)
+	if slug == "" {
+		slug = NormalizeSlug(name)
+	}
+	if err := ValidateSlug(slug); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	if err := s.checkSlugAllowed(slug); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	if err := ValidateTargetUser(strings.TrimSpace(req.TargetUser)); err != nil {
+		writeErr(w, 400, "invalid target_user")
+		return
+	}
+	// Free-form client metadata first; server-derived and bound fields last so
+	// a client cannot forge source_ip or the approved parameters (P2-4/P2-1).
+	meta := map[string]any{}
 	for k, v := range req.Metadata {
+		meta[k] = v
+	}
+	for k, v := range map[string]any{"name": name, "target_user": strings.TrimSpace(req.TargetUser), "slug": slug, "mode": strings.TrimSpace(req.Mode), "local_port": req.LocalPort, "distro": req.Distro, "arch": req.Arch, "transport": req.Transport, "source_ip": ip} {
 		meta[k] = v
 	}
 	metaJSON, _ := json.Marshal(meta)
@@ -317,7 +340,7 @@ func (s *Server) handleClientRegister(w http.ResponseWriter, r *http.Request) {
 			inviteHash = matchedHash
 		}
 	}
-	_, err = s.store.db.ExecContext(r.Context(), `INSERT INTO requests (id,name,client_secret_hash,status,invite_code_hash,setup_token_hash,setup_token_expires_at,metadata_json,created_at,expires_at,approved_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`, requestID, name, clientHash, status, inviteHash, setupHash, setupExpires, string(metaJSON), now.Format(time.RFC3339), expires, approvedAt)
+	_, err = s.store.db.ExecContext(r.Context(), `INSERT INTO requests (id,name,client_secret_hash,status,invite_code_hash,setup_token_hash,setup_token_expires_at,metadata_json,observed_ip,created_at,expires_at,approved_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`, requestID, name, clientHash, status, inviteHash, setupHash, setupExpires, string(metaJSON), ip, now.Format(time.RFC3339), expires, approvedAt)
 	if err != nil {
 		log.Printf("register insert: %v", err)
 		writeErr(w, 500, "registration failed")
@@ -494,22 +517,36 @@ func (s *Server) handleClientProvision(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "request_id, setup_token and pubkey are required")
 		return
 	}
-	if err := s.validateApprovedMetadata(r.Context(), req.RequestID, map[string]any{"target_user": req.TargetUser, "slug": req.Slug, "mode": req.Mode, "local_port": req.LocalPort, "distro": req.Distro, "arch": req.Arch}); err != nil {
-		writeClientAuthErr(w)
-		return
-	}
-	requestID, name, err := s.consumeSetupToken(r.Context(), req.RequestID, req.SetupToken)
+	bound, err := s.approvedBinding(r.Context(), req.RequestID)
 	if err != nil {
 		writeClientAuthErr(w)
 		return
 	}
 	if req.Slug == "" {
-		req.Slug = NormalizeSlug(name)
+		req.Slug = bound.Slug
 	}
-	if err := ValidateSlug(req.Slug); err != nil {
+	if err := bound.check(req.Slug, req.TargetUser, req.Mode, req.LocalPort); err != nil {
+		log.Printf("provision %s rejected: %v", req.RequestID, err)
+		writeErr(w, 403, "provision parameters do not match the approved request")
+		return
+	}
+	if err := s.checkSlugAllowed(req.Slug); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
+	if _, err := ValidateSSHPublicKey(req.Pubkey); err != nil {
+		writeErr(w, 400, "invalid tunnel public key")
+		return
+	}
+	requestID, name, err := s.consumeSetupToken(r.Context(), req.RequestID, req.SetupToken)
+	if err != nil {
+		if !errors.Is(err, errInvalidSetupToken) && writeAuthBackendErr(w, err) {
+			return
+		}
+		writeClientAuthErr(w)
+		return
+	}
+	_ = name
 	owner, err := s.firstAdminID(r.Context())
 	if err != nil {
 		writeErr(w, 500, "no admin user configured")
@@ -518,7 +555,13 @@ func (s *Server) handleClientProvision(w http.ResponseWriter, r *http.Request) {
 	res, err := s.prov.CreateMachine(r.Context(), CreateMachineInput{Slug: req.Slug, DisplayName: firstNonEmpty(req.DisplayName, name), TargetUser: req.TargetUser, Pubkey: req.Pubkey, Mode: req.Mode, LocalPort: req.LocalPort, Persistence: req.Persistence, Distro: req.Distro, Arch: req.Arch, OwnerUserID: owner})
 	if err != nil {
 		_, _ = s.store.db.ExecContext(r.Context(), `UPDATE requests SET status='approved' WHERE id=? AND status='provisioning'`, requestID)
-		writeErr(w, 500, err.Error())
+		// Details (sshd -t output, paths) stay in the server log (Opus P3-3).
+		log.Printf("provision %s failed: %v", requestID, err)
+		if isUniqueSlugErr(err) {
+			writeErr(w, 409, "slug already in use")
+			return
+		}
+		writeErr(w, 500, "provisioning failed; ask the operator to check the reachd log")
 		return
 	}
 	_, _ = s.store.db.ExecContext(r.Context(), `UPDATE requests SET status='provisioned' WHERE id=?`, requestID)
@@ -546,32 +589,73 @@ func (s *Server) handleClientProvision(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, resp)
 }
 
-func (s *Server) validateApprovedMetadata(ctx context.Context, requestID string, got map[string]any) error {
+// approvedBinding is the immutable set of parameters an operator approved.
+type approvedBinding struct {
+	Slug       string
+	TargetUser string
+	Mode       string
+	LocalPort  int
+}
+
+// approvedBinding loads the binding for a request. Any lookup or decode
+// failure is an error: provisioning fails closed (Opus P2-4 / daybreak P2-1).
+func (s *Server) approvedBinding(ctx context.Context, requestID string) (approvedBinding, error) {
+	var name string
 	var raw sql.NullString
-	if err := s.store.db.QueryRowContext(ctx, `SELECT metadata_json FROM requests WHERE id=?`, requestID).Scan(&raw); err != nil {
-		return nil
+	if err := s.store.db.QueryRowContext(ctx, `SELECT name,metadata_json FROM requests WHERE id=?`, requestID).Scan(&name, &raw); err != nil {
+		return approvedBinding{}, err
 	}
-	if !raw.Valid || raw.String == "" {
-		return nil
-	}
-	var want map[string]any
-	if json.Unmarshal([]byte(raw.String), &want) != nil {
-		return nil
-	}
-	for _, key := range []string{"target_user", "slug", "mode", "distro", "arch"} {
-		wv, wok := want[key].(string)
-		gv, _ := got[key].(string)
-		if wok && strings.TrimSpace(wv) != "" && strings.TrimSpace(gv) != "" && strings.TrimSpace(wv) != strings.TrimSpace(gv) {
-			return fmt.Errorf("provision %s does not match approved request", key)
+	want := map[string]any{}
+	if raw.Valid && raw.String != "" {
+		if err := json.Unmarshal([]byte(raw.String), &want); err != nil {
+			return approvedBinding{}, fmt.Errorf("decode approved metadata: %w", err)
 		}
 	}
-	if wv, ok := want["local_port"].(float64); ok && int(wv) != 0 {
-		if gv, _ := got["local_port"].(int); gv != 0 && gv != int(wv) {
-			return fmt.Errorf("provision local_port does not match approved request")
-		}
+	str := func(k string) string { v, _ := want[k].(string); return strings.TrimSpace(v) }
+	b := approvedBinding{Slug: str("slug"), TargetUser: str("target_user"), Mode: str("mode")}
+	if b.Slug == "" {
+		// Requests created before slugs were bound: the alias the dashboard
+		// implied is the normalized request name.
+		b.Slug = NormalizeSlug(name)
+	}
+	if v, ok := want["local_port"].(float64); ok {
+		b.LocalPort = int(v)
+	}
+	return b, nil
+}
+
+// check requires exact equality for every bound value. Values the request
+// never declared (empty) may be chosen at provision time, but a declared
+// value can neither be changed nor cleared.
+func (b approvedBinding) check(slug, targetUser, mode string, localPort int) error {
+	if strings.TrimSpace(slug) != b.Slug {
+		return fmt.Errorf("slug %q differs from approved %q", slug, b.Slug)
+	}
+	if b.TargetUser != "" && strings.TrimSpace(targetUser) != b.TargetUser {
+		return fmt.Errorf("target_user differs from approved value")
+	}
+	if b.Mode != "" && strings.TrimSpace(mode) != b.Mode {
+		return fmt.Errorf("mode differs from approved value")
+	}
+	if b.LocalPort != 0 && localPort != b.LocalPort {
+		return fmt.Errorf("local_port differs from approved value")
 	}
 	return nil
 }
+
+// checkSlugAllowed rejects reserved aliases and the hub's own ProxyJump alias.
+func (s *Server) checkSlugAllowed(slug string) error {
+	if SlugReserved(slug, s.cfg.ReservedSlugs) || strings.EqualFold(slug, s.cfg.DefaultHub.ProxyJumpAlias) {
+		return fmt.Errorf("slug %q is reserved; choose another machine name", slug)
+	}
+	return nil
+}
+
+func isUniqueSlugErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "UNIQUE constraint failed: machines.slug")
+}
+
+var errInvalidSetupToken = errors.New("invalid setup token")
 
 func (s *Server) consumeSetupToken(ctx context.Context, requestID, token string) (string, string, error) {
 	var id, name, status string
@@ -584,14 +668,14 @@ func (s *Server) consumeSetupToken(ctx context.Context, requestID, token string)
 		return "", "", err
 	}
 	if status != "approved" || !hash.Valid {
-		return "", "", errors.New("invalid setup token")
+		return "", "", errInvalidSetupToken
 	}
 	ok, _, verr := s.argon.VerifyStoredToken(ctx, token, hash.String)
 	if verr != nil {
 		return "", "", verr
 	}
 	if !ok {
-		return "", "", errors.New("invalid setup token")
+		return "", "", errInvalidSetupToken
 	}
 	if exp.Valid {
 		if t, err := time.Parse(time.RFC3339, exp.String); err == nil && time.Now().UTC().After(t) {
@@ -1103,22 +1187,42 @@ func (s *Server) handleCreateServiceToken(w http.ResponseWriter, r *http.Request
 }
 
 func (s *Server) handleAdminRequests(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.store.db.QueryContext(r.Context(), `SELECT id,name,status,metadata_json,created_at,expires_at,approved_at,denied_at,setup_token_expires_at FROM requests ORDER BY created_at DESC LIMIT 200`)
+	q := `SELECT id,name,status,metadata_json,observed_ip,created_at,expires_at,approved_at,denied_at,setup_token_expires_at FROM requests`
+	var args []any
+	switch st := r.URL.Query().Get("status"); st {
+	case "pending", "approved", "denied", "expired", "provisioned", "provisioning":
+		q += ` WHERE status=?`
+		args = append(args, st)
+	}
+	q += ` ORDER BY created_at DESC LIMIT 200`
+	rows, err := s.store.db.QueryContext(r.Context(), q, args...)
 	if err != nil {
 		writeErr(w, 500, "query failed")
 		return
 	}
 	defer rows.Close()
-	var out []map[string]any
+	out := []map[string]any{}
 	for rows.Next() {
 		var id, name, status, created, expires string
-		var meta, approved, denied, setupExp sql.NullString
-		_ = rows.Scan(&id, &name, &status, &meta, &created, &expires, &approved, &denied, &setupExp)
-		var mv any
+		var meta, observedIP, approved, denied, setupExp sql.NullString
+		if err := rows.Scan(&id, &name, &status, &meta, &observedIP, &created, &expires, &approved, &denied, &setupExp); err != nil {
+			writeErr(w, 500, "query failed")
+			return
+		}
+		mv := map[string]any{}
 		if meta.Valid {
 			_ = json.Unmarshal([]byte(meta.String), &mv)
 		}
-		out = append(out, map[string]any{"id": id, "name": name, "status": status, "metadata": mv, "created_at": created, "expires_at": expires, "approved_at": approved.String, "denied_at": denied.String, "setup_token_expires_at": setupExp.String})
+		slug, _ := mv["slug"].(string)
+		if slug == "" {
+			slug = NormalizeSlug(name)
+		}
+		item := map[string]any{"id": id, "name": name, "status": status, "metadata": mv, "observed_ip": observedIP.String, "slug": slug, "target_user": mv["target_user"], "mode": mv["mode"], "local_port": mv["local_port"], "created_at": created, "expires_at": expires, "approved_at": approved.String, "denied_at": denied.String, "setup_token_expires_at": setupExp.String}
+		if observedIP.String == "" {
+			// Older rows only have the (forgeable) metadata copy.
+			item["observed_ip"] = nil
+		}
+		out = append(out, item)
 	}
 	writeJSON(w, 200, out)
 }

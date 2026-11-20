@@ -70,9 +70,11 @@ func (p *Provisioner) CreateMachine(ctx context.Context, in CreateMachineInput) 
 	if err := ValidateTargetUser(in.TargetUser); err != nil {
 		return CreateMachineResult{}, err
 	}
-	if _, err := ValidateSSHPublicKey(in.Pubkey); err != nil {
+	canonicalKey, err := CanonicalSSHPublicKey(in.Pubkey)
+	if err != nil {
 		return CreateMachineResult{}, fmt.Errorf("invalid tunnel public key: %w", err)
 	}
+	in.Pubkey = canonicalKey
 	if in.LocalPort == 0 {
 		in.LocalPort = 22
 	}
@@ -227,7 +229,10 @@ func (p *Provisioner) createSystemAccount(ctx context.Context, unixUser string, 
 		return err
 	}
 	ak := filepath.Join(sshDir, "authorized_keys")
-	line := authorizedKeyLine(port, pubkey, expiresAt)
+	line, err := authorizedKeyLine(port, pubkey, expiresAt)
+	if err != nil {
+		return err
+	}
 	if err := os.WriteFile(ak, []byte(line+"\n"), 0o600); err != nil {
 		return err
 	}
@@ -247,14 +252,21 @@ func (p *Provisioner) createSystemAccount(ctx context.Context, unixUser string, 
 	return nil
 }
 
-func authorizedKeyLine(port int, pubkey, expiresAt string) string {
+// authorizedKeyLine builds the hub-side authorized_keys line from a key that
+// is re-canonicalized here, so even a legacy DB row cannot inject a second
+// line or its own options.
+func authorizedKeyLine(port int, pubkey, expiresAt string) (string, error) {
+	canonical, err := CanonicalSSHPublicKey(pubkey)
+	if err != nil {
+		return "", fmt.Errorf("invalid tunnel public key: %w", err)
+	}
 	opts := []string{"restrict", "port-forwarding", fmt.Sprintf("permitlisten=\"127.0.0.1:%d\"", port)}
 	if expiresAt != "" {
 		if t, err := time.Parse(time.RFC3339, expiresAt); err == nil {
 			opts = append(opts, fmt.Sprintf("expiry-time=\"%s\"", t.UTC().Format("20060102150405Z")))
 		}
 	}
-	return strings.Join(opts, ",") + " " + strings.TrimSpace(pubkey)
+	return strings.Join(opts, ",") + " " + canonical, nil
 }
 
 func sshdMatchConfig(unixUser string, port int) string {
@@ -270,6 +282,8 @@ Match User %s
     X11Forwarding no
     PasswordAuthentication no
     KbdInteractiveAuthentication no
+    AllowStreamLocalForwarding no
+    PermitUserRC no
     ForceCommand /bin/false
     ClientAliveInterval 30
     ClientAliveCountMax 3

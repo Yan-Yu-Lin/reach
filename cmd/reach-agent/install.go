@@ -207,7 +207,7 @@ func installCommand(ctx context.Context, args []string) error {
 	}
 
 	fmt.Printf("[reach] registering %s with %s\n", opt.Name, opt.APIURL)
-	reg, err := registerAndWait(ctx, opt)
+	reg, err := registerAndWait(ctx, opt, plan)
 	if err != nil {
 		return err
 	}
@@ -561,8 +561,10 @@ func findFreePort(start, end int) (int, error) {
 	return 0, fmt.Errorf("no free user sshd port in %d-%d", start, end)
 }
 
-func registerAndWait(ctx context.Context, opt installOptions) (registerResponse, error) {
-	payload := map[string]string{"name": opt.Name, "auth_code": opt.Token, "target_user": opt.TargetUser}
+func registerAndWait(ctx context.Context, opt installOptions, plan localSSHPlan) (registerResponse, error) {
+	// Declare the alias and local SSH plan up front: reachd binds provision
+	// to exactly these values, and the operator sees them when approving.
+	payload := map[string]any{"name": opt.Name, "auth_code": opt.Token, "target_user": opt.TargetUser, "slug": normalizeSlug(opt.Name), "mode": plan.Mode, "local_port": plan.LocalPort, "distro": distroString(), "arch": runtime.GOARCH, "transport": opt.Transport}
 	attempt := 0
 	for ctx.Err() == nil {
 		attempt++

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"path"
 	"regexp"
 	"strings"
 	"time"
@@ -161,13 +162,50 @@ func NormalizeSlug(name string) string {
 	return out
 }
 
+// ValidateSSHPublicKey accepts exactly one bare public key line
+// ("<type> <base64> [comment]") and returns its type. Options, extra keys and
+// control characters are rejected (daybreak P2-2, Opus P2-2).
 func ValidateSSHPublicKey(pub string) (kind string, err error) {
-	pub = strings.TrimSpace(pub)
-	key, _, _, _, err := ssh.ParseAuthorizedKey([]byte(pub))
+	key, err := ParseSingleSSHPublicKey(pub)
 	if err != nil {
 		return "", err
 	}
 	return key.Type(), nil
+}
+
+// ParseSingleSSHPublicKey parses one public key line without options.
+func ParseSingleSSHPublicKey(pub string) (ssh.PublicKey, error) {
+	pub = strings.TrimSpace(pub)
+	if pub == "" {
+		return nil, errors.New("empty public key")
+	}
+	if len(pub) > 16*1024 {
+		return nil, errors.New("public key too long")
+	}
+	if strings.ContainsAny(pub, "\r\n\x00") {
+		return nil, errors.New("public key must be a single line")
+	}
+	key, _, options, rest, err := ssh.ParseAuthorizedKey([]byte(pub))
+	if err != nil {
+		return nil, err
+	}
+	if len(options) > 0 {
+		return nil, errors.New("public key must not carry authorized_keys options")
+	}
+	if strings.TrimSpace(string(rest)) != "" {
+		return nil, errors.New("public key must be a single key")
+	}
+	return key, nil
+}
+
+// CanonicalSSHPublicKey re-encodes a validated key so stored and written
+// forms never contain client-controlled bytes beyond the key itself.
+func CanonicalSSHPublicKey(pub string) (string, error) {
+	key, err := ParseSingleSSHPublicKey(pub)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(ssh.MarshalAuthorizedKey(key))), nil
 }
 
 type Claims struct {
@@ -217,4 +255,29 @@ func Fingerprint(s string) string {
 func TokenHash(token string) string {
 	h := sha256.Sum256([]byte(token))
 	return base64.RawURLEncoding.EncodeToString(h[:])
+}
+
+// defaultReservedSlugPatterns are aliases a target may never claim. A Reach
+// alias that shadows a hand-written Host in the operator's ~/.ssh/config can
+// redirect `ssh jason-ts` to an attacker's machine (Opus P1-2). Patterns use
+// path.Match syntax.
+var defaultReservedSlugPatterns = []string{
+	"jason*", "*-public", "pi", "pi-*", "localhost", "localhost-*",
+	"reach", "reach-hub", "hub", "hub-*", "github*", "gitlab*", "bitbucket*",
+}
+
+// SlugReserved reports whether slug matches a reserved pattern.
+func SlugReserved(slug string, extra []string) bool {
+	for _, list := range [][]string{defaultReservedSlugPatterns, extra} {
+		for _, p := range list {
+			p = strings.ToLower(strings.TrimSpace(p))
+			if p == "" {
+				continue
+			}
+			if ok, _ := path.Match(p, slug); ok {
+				return true
+			}
+		}
+	}
+	return false
 }
