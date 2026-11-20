@@ -95,6 +95,15 @@ func manifestCommand(args []string) error {
 	if *version == "" {
 		return fmt.Errorf("--version is required")
 	}
+	// Sequence shares the Unix-seconds space with the created_at fallback of
+	// older manifests (see minReleaseSequence in cmd/reach-agent).
+	seq := *sequence
+	if seq == 0 {
+		seq = time.Now().UTC().Unix()
+	}
+	if seq < 1_000_000_000 {
+		return fmt.Errorf("--sequence must be Unix seconds (>= 1000000000), got %d", seq)
+	}
 	if *outPath == "" {
 		*outPath = filepath.Join(*dir, "manifest.json")
 	}
@@ -112,15 +121,6 @@ func manifestCommand(args []string) error {
 		}
 		sum := sha256.Sum256(b)
 		assets[name] = releaseAsset{SHA256: hex.EncodeToString(sum[:]), Size: st.Size()}
-	}
-	// Sequence shares the Unix-seconds space with the created_at fallback of
-	// older manifests (see minReleaseSequence in cmd/reach-agent).
-	seq := *sequence
-	if seq == 0 {
-		seq = time.Now().UTC().Unix()
-	}
-	if seq < 1_000_000_000 {
-		return fmt.Errorf("--sequence must be Unix seconds (>= 1000000000), got %d", seq)
 	}
 	manifest := releaseManifest{Schema: 1, Project: "reach-agent", Version: *version, Sequence: seq, GitCommit: *commit, CreatedAt: nowUTC(), Assets: assets}
 	b, err := json.MarshalIndent(manifest, "", "  ")
