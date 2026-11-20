@@ -4,13 +4,13 @@
 - 依據：`~/30-39-Research/34-tech-research/2026-11-20-reach-dashboard-frontend.md` 的 A 表和 B 部分、兩份安全報告裡跟前端有關的項目（Opus P2-4、P2-7、P3-5；daybreak P2-1、P3-1），以及後端的 `docs/EVENTS.md`（`fix/hardening-2026-11` 的 41fbbff）。
 - 新截圖：`~/30-39-Research/34-tech-research/2026-11-21-reach-dashboard-v2-shots/`
 - 量測原始資料：同一個資料夾下的 `measurements/`（`before-all.json`、`after-all.json`、`after-oldsrv-all.json`、`summary.md`）
-- 驗證（第 2 輪後）：
+- 驗證（第 3 輪後，HEAD 以 git log 為準）：
   - `npm run build`、`npm run generate` 都通過。
   - `nuxt typecheck` 0 個錯誤。
-  - `vitest` 62/62 通過。
-  - 瀏覽器回歸測試 `test-harness/regress.mjs` 19/19 通過。
-  - 對真實 reachd 的 revoke e2e 通過。
-  - 審查意見的處理見「astra round 1／daybreak」一節。
+  - `vitest` 73/73 通過。
+  - 瀏覽器回歸測試 `test-harness/regress.mjs` 26/26 通過。
+  - 對真實 reachd（hardening `4ac35da`）的 revoke e2e 通過。
+  - 審查意見的處理見「astra round 1／daybreak」和「astra round 2」兩節。
 
 ---
 
@@ -272,6 +272,52 @@ astra 要求補的回歸案例，除了「後端 revoke-all 關掉既有 stream�
 - 「確認之後才發生的網路競態」（F07）要等後端提供帶條件的 bulk API。
 - revoke 的 e2e 用的是本機 reachd 和自己寫的 proxy，不是 jason 上的 nginx。
 - 手機畫面一樣是用 Chromium 調成手機尺寸量的，沒有用真的 iPhone Safari。
+
+---
+
+## astra round 2
+
+- **審查報告：** `~/30-39-Research/34-tech-research/2026-11-21-reach-dashboard-astra-review-r2.md`，審的是 `296eab7`，判定 FIX。結果是 9 項已修，F04、F08、F10 只修了一部分，另外抓到 4 個新缺口（R2-01～R2-04）。
+- **後端配合：** hardening `52e9395` 新增欄位（`health_changed.last_probe_at`、`event_at`，以及 `observed_changed.heartbeat_at`、`event_at`），格式寫在 `docs/EVENTS.md` 的 Timestamps 一節。
+- **commit：**
+  - `a26564e`：R2-01、R2-04
+  - `052b09a`：R2-02
+  - `85a189e`：R2-03 和 patch log 上限
+  - `895e5e2`：回歸測試
+- **每個 commit 都可以單獨 build：** 我在另一個暫時的 worktree 裡逐步套用、逐步檢查，每一步的 `nuxt typecheck` 都是 0 個錯誤，vitest 也全部通過。
+
+### 驗證
+
+- `vitest`：73/73 通過，比上一輪多 11 個。
+- `nuxt typecheck`：0 個錯誤。
+- `npm run build`、`npm run generate`：都通過。
+- **`test-harness/regress.mjs`：26/26 通過**，比上一輪多 7 個案例。
+  - 同一套案例跑 astra 審的 `296eab7` bundle（用 astra 在 `/tmp/reach-astra-r2-20261121/current` build 的版本），**結果是 20/26**。沒過的剛好就是這輪新加的 6 個案例，表示這些案例確實能重現 astra 指出的問題。
+  - 紀錄存在 `measurements/regress-296eab7.txt` 和 `measurements/regress-round3.txt`。
+- **真實 reachd 的 revoke e2e：** 用 hardening `4ac35da` 重跑一次，結果還是通過。被撤銷的分頁 1.6 秒後回到 `/login?next=/?tab=requests`。紀錄存在 `measurements/real-reachd-revoke-round3.json`。
+
+### 逐項處理
+
+| # | 問題 | 怎麼修 | 證明 |
+|---|---|---|---|
+| R2-01 P2 | 晚到的舊 401 會把剛重新登入的 session 清掉，還會波及其他分頁；第二個 401 會蓋掉 `next` | **request、SSE、logout、revoke-all 在送出時都記下自己用的 token。**<br>收到 401、logout 完成、或 revoke-all 回 2xx 時，只有那個 token 還是目前的 session，才會清除登入狀態、廣播登出、導向登入頁。<br>如果使用者已經重新登入，舊的回應就直接丟掉，不影響新 session。<br><br>**SSE：** 被 stop/start 換掉的舊連線，它的 401 也會被忽略。<br><br>**跨分頁廣播：** 現在會帶原因和 token 指紋。指紋是 FNV-1a 雜湊，不是 token 本身。<br>- 主動登出：所有分頁一起登出。<br>- token 被拒絕：只有拿著同一個 token 的分頁會登出，自己重新登入過的分頁不受影響。<br><br>**`goToLoginOnce()`：** 已經在 `/login` 時不會再導一次，所以第一次存好的 `next` 不會被蓋掉。<br><br>**revoke-all 的 2xx 晚到時：**<br>- token 已經換了：不做任何事。<br>- 已經因為 SSE 401 回到登入頁：只把訊息改成「Signed out everywhere」。 | regress 三個案例，都是照 astra 的 `stale401.mjs`、`revoke-delay.mjs` 改寫的：<br>- 「R2-01 a late 401 for the old session…」：A 重新登入、B 自己登入，接著舊 token 發出的兩個請求 5 秒後才回 401，A 和 B 都沒有被登出。<br>- 「…keeps the first saved return path」<br>- 「…late revoke-all success…」：POST 延遲 7 秒才回，這段時間使用者已經重新登入，新 session 仍然保留。 |
+| R2-02 P2 | 15 秒節流只抓第一筆，最後一筆 heartbeat 的診斷不會補抓 | 改成 leading 加 trailing：<br>- 窗口內收到 heartbeat 時，把這台標成 dirty，窗口結束時補抓一次。<br>- 切換機器、關掉詳細頁、dispose 時清掉 timer。<br>- 沒打開的機器仍然是 0 個 GET。 | regress「R2-02 the last heartbeat while a detail is open…」：新、舊兩種 heartbeat 格式都測了，**都是在詳細頁已經打開之後**才送最後一筆。窗口內 GET 數為 0，窗口結束後剛好 1 次，診斷變成 `r2-final-heartbeat / websocket / launchd`。<br>regress「…closing the detail cancels…」：關掉詳細頁後，16 秒內 GET 數為 0。 |
+| R2-03 P2 | 重播的歷史 `health_changed` 把 `last_probe_at` 改成「現在收到的時間」 | **不再用收到事件的時間**，判斷依據改成：<br>- **事件有帶 `last_probe_at`**（新版伺服器）：用這個時間。如果它比 store 裡已經有的 probe 時間還舊，就是重播的歷史資料，不會蓋掉比較新的結果。<br>- **沒帶，或是空字串**（舊版伺服器，或從來沒 probe 過）：probe 狀態照樣套用，但時間保留原本的，所以一天前的 probe 還是顯示 Unknown。同時補一次單台 authoritative 抓取。<br>- **`observed_changed` 帶了 `heartbeat_at` 時**：比目前已知時間還舊的狀態變更會被忽略，跟舊 heartbeat 的處理方式一樣。<br>- **不會用 SSE id 來判斷是不是重播。** | regress「R2-03 a replayed health event (no server time)…」：用舊格式重播一筆沒有時間的 health 事件，同時讓所有 refresh 都回 500，跟 astra 的重現方式一樣。結果仍然顯示 Unknown，而且有發出 authoritative GET。<br>regress「…with the server probe time…」：舊時間的重播不會蓋掉新的結果；新時間的 unreachable 會顯示 Failed。<br>vitest 另有 4 個案例。 |
+| R2-04 P3 | URL 正規化之後產生 `//host` | `safeReturnPath` 在 URL 正規化之後，再檢查一次 pathname 是不是以 `//` 或 `/\` 開頭。 | vitest `auth.test.ts` 加了 astra 給的三種寫法。<br>regress「F10 ?next…」：三種寫法登入後都回到站內單斜線的路徑，有登入狀態，沒有停在 `/login`。 |
+| F04、F08 涵蓋缺口 | 測試沒驗到「詳細頁已打開時的最後一筆 heartbeat」，也沒驗到「歷史重播加上快照失敗」 | 見上面 R2-02、R2-03 的案例。 | |
+| P3-5 涵蓋缺口 | 測試結果跟 F10 混在一起 | 改成直接帶著有效的 session 打開 Settings，不經過登入頁跳轉。 | regress「P3-5 …」 |
+| storage 涵蓋缺口 | 沒測「重新登入之後才收到晚到的 401」 | 見 R2-01 的第一個案例：兩個分頁都已經重新登入，舊 401 才到。 | |
+| 容量 | patch log 沒有硬上限 | `PATCH_LOG_LIMIT = 5000`。<br>超過上限時**不會丟掉任何 patch**。那個時候還沒回來的請求全部作廢（`valid(token) === false`），回應不套用，改排一次全量 authoritative refetch。 | vitest「patch log capacity」：<br>- 上限設 10 時溢位，兩個請求都作廢；溢位之後才開始的請求正常運作。<br>- 一次請求期間收到 20 萬個事件，保留的筆數 ≤ 10,000，該請求被作廢。 |
+
+### mock 的調整
+
+- 設 `V2=1` 時，`flap` 風暴送出的 `observed_changed` 和 `health_changed` 會帶 `heartbeat_at`、`last_probe_at`、`event_at`。不設時是舊格式，不帶時間。
+- 新增 `__config?sse401_delay=ms`，讓被拒絕的 SSE 延遲回 401，用來測晚到 401 的競態。
+
+### 還沒處理的
+
+- Disable all 在「按下確認之後」才發生的網路競態，要等後端提供帶條件的 bulk API。
+- 舊版 reachd 沒有 probe 時間，所以重播事件只能靠補一次 GET 來修正。如果那次 GET 也失敗，畫面會保持 Unknown，而不是 OK，這是刻意選擇保守的做法。
 
 ---
 
