@@ -45,3 +45,20 @@ same functions in Ubuntu 24.04 (scenarios A–G).
    drop-in and an opt-in reachd unit are restored (or removed if new).
 
 Old fence files (without journal fields) never allow an automatic restore.
+
+### Round 4 changes (fence order, writers lock, JWT secret, carrier)
+
+- `deploy-fence record --snapshot` clears retired machines' tokens, then
+  records the fence, then writes the snapshot, all while holding
+  `<dbdir>/locks/writers.lock` exclusively. reachd and every CLI writer
+  hold it shared, so CLI writes during that step fail with "deployment in
+  progress".
+- `fuser` (package `psmisc`) is required.
+- Before the new binary first starts, `reachd rotate-jwt-secret
+  --if-session-migration-pending` replaces `jwt_secret` in config.yaml
+  (backup in `deploy-backups/config.yaml.<ts>`). Rollback does not
+  restore config.yaml, so pre-deploy admin JWTs stay invalid.
+- The carrier must answer a WebSocket upgrade with 101 on its configured
+  path (`scripts/check-carrier-ready.sh`), on deploy and on rollback. Any
+  rollback step that fails is reported as `rollback_incomplete` and the
+  rollback never prints success.
