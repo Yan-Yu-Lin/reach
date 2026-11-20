@@ -42,6 +42,10 @@ type installOptions struct {
 	ConfigDir   string
 	DataDir     string
 	AgentPath   string
+	// InstallOpenSSH (Windows system mode only) allows installing and
+	// enabling the Windows OpenSSH Server, which listens on every
+	// interface. Off by default (daybreak P1-5).
+	InstallOpenSSH bool
 }
 
 type registerResponse struct {
@@ -109,6 +113,9 @@ type localSSHPlan struct {
 	HostKeyPath   string
 	HostKeyType   string
 	ClientOptions []string
+	// RunAs is the account internal-sshd sessions run as when the agent is
+	// root (system install); empty means the agent's own user.
+	RunAs string
 }
 
 func installCommand(ctx context.Context, args []string) error {
@@ -126,6 +133,7 @@ func installCommand(ctx context.Context, args []string) error {
 	fs.StringVar(&opt.ConfigDir, "config-dir", "", "config directory")
 	fs.StringVar(&opt.DataDir, "data-dir", "", "data directory")
 	fs.StringVar(&opt.AgentPath, "agent-path", "", "path to reach-agent binary for service ExecStart")
+	fs.BoolVar(&opt.InstallOpenSSH, "install-openssh", false, "Windows system install: install/enable Windows OpenSSH Server if missing (opens port 22 on all interfaces)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -195,7 +203,7 @@ func installCommand(ctx context.Context, args []string) error {
 		return err
 	}
 	if runtime.GOOS == "windows" && opt.InstallMode == "system" {
-		if err := ensureWindowsOpenSSHServer(ctx); err != nil {
+		if err := ensureWindowsOpenSSHServer(ctx, opt.InstallOpenSSH); err != nil {
 			return err
 		}
 	}
@@ -453,14 +461,16 @@ func prepareLocalSSH(ctx context.Context, opt installOptions, targetHome string,
 		return prepareWindowsLocalSSH(ctx, opt, targetHome, compat)
 	}
 	if opt.InstallMode == "system" {
-		if err := ensureSystemSSHD(ctx); err != nil {
-			return localSSHPlan{}, err
+		// Reuse an sshd that is already running; never install or enable a
+		// host-wide one (daybreak P1-5). Without one, serve SSH from the
+		// agent itself on loopback, as the target user.
+		if err := probeSSH(ctx, "127.0.0.1", 22, 5*time.Second); err == nil {
+			warnIfSSHDWide(ctx)
+			banner := sshServerBanner(ctx, "127.0.0.1", 22, 2*time.Second)
+			return localSSHPlan{Mode: "system-existing", LocalPort: 22, AuthFile: filepath.Join(targetHome, ".ssh", "authorized_keys"), ClientOptions: clientOptionsForServerBanner(banner, "")}, nil
 		}
-		if err := probeSSH(ctx, "127.0.0.1", 22, 5*time.Second); err != nil {
-			return localSSHPlan{}, fmt.Errorf("local sshd did not answer on 127.0.0.1:22 after start/enable: %w", err)
-		}
-		banner := sshServerBanner(ctx, "127.0.0.1", 22, 2*time.Second)
-		return localSSHPlan{Mode: "system-existing", LocalPort: 22, AuthFile: filepath.Join(targetHome, ".ssh", "authorized_keys"), ClientOptions: clientOptionsForServerBanner(banner, "")}, nil
+		fmt.Println("[reach] no sshd answers on 127.0.0.1:22; Reach will not install or enable a host-wide sshd.")
+		return prepareInternalSSHD(ctx, opt, compat)
 	}
 	if err := probeSSH(ctx, "127.0.0.1", 22, 3*time.Second); err == nil {
 		fmt.Println("[reach] using existing system sshd on 127.0.0.1:22 (user-mode install cannot manage it if it stops)")
@@ -534,8 +544,17 @@ func prepareInternalSSHD(_ context.Context, opt installOptions, _ SSHCompatConfi
 	}
 	authFile := filepath.Join(dir, "authorized_keys")
 	logPath := filepath.Join(dir, "sshd.log")
-	fmt.Printf("[reach] no sshd and no sudo; using reach-agent internal ssh server on 127.0.0.1:%d (shell only; no sftp; loopback-only)\n", port)
-	return localSSHPlan{Mode: "internal-sshd", LocalPort: port, AuthFile: authFile, InternalSSHD: true, HostKeyPath: hostKey, SSHDLog: logPath}, nil
+	fmt.Printf("[reach] using reach-agent internal ssh server on 127.0.0.1:%d (shell only; no sftp; loopback-only)\n", port)
+	return localSSHPlan{Mode: "internal-sshd", LocalPort: port, AuthFile: authFile, InternalSSHD: true, HostKeyPath: hostKey, SSHDLog: logPath, RunAs: internalSSHDRunAs(opt)}, nil
+}
+
+// internalSSHDRunAs: a root (system) agent must not hand operators a root
+// shell through internal-sshd; sessions run as the target user instead.
+func internalSSHDRunAs(opt installOptions) string {
+	if opt.InstallMode == "system" && runtime.GOOS != "windows" {
+		return opt.TargetUser
+	}
+	return ""
 }
 
 func findSSHD() string {
@@ -945,6 +964,7 @@ func buildAgentConfig(opt installOptions, prov provisionResponse, keyPath, known
 	cfg.LocalSSH.SSHDLog = plan.SSHDLog
 	cfg.LocalSSH.AuthFile = plan.AuthFile
 	cfg.LocalSSH.HostKeyPath = plan.HostKeyPath
+	cfg.LocalSSH.RunAs = plan.RunAs
 	cfg.LocalSSH.TargetUser = opt.TargetUser
 	cfg.LocalSSH.ClientOptions = plan.ClientOptions
 	cfg.Install.Mode = opt.InstallMode

@@ -64,18 +64,20 @@ type TunnelConfig struct {
 }
 
 type LocalSSHConfig struct {
-	Host          string   `yaml:"host" json:"host"`
-	Port          int      `yaml:"port" json:"port"`
-	Manage        bool     `yaml:"manage" json:"manage"`
-	ServiceNames  []string `yaml:"service_names" json:"service_names"`
-	UserSSHD      bool     `yaml:"user_sshd" json:"user_sshd"`
-	InternalSSHD  bool     `yaml:"internal_sshd" json:"internal_sshd"`
-	SSHDBinary    string   `yaml:"sshd_binary" json:"sshd_binary"`
-	SSHDConfig    string   `yaml:"sshd_config" json:"sshd_config"`
-	SSHDLog       string   `yaml:"sshd_log" json:"sshd_log"`
-	AuthFile      string   `yaml:"auth_file" json:"auth_file"`
-	HostKeyPath   string   `yaml:"host_key_path" json:"host_key_path"`
-	TargetUser    string   `yaml:"target_user" json:"target_user"`
+	Host         string   `yaml:"host" json:"host"`
+	Port         int      `yaml:"port" json:"port"`
+	Manage       bool     `yaml:"manage" json:"manage"`
+	ServiceNames []string `yaml:"service_names" json:"service_names"`
+	UserSSHD     bool     `yaml:"user_sshd" json:"user_sshd"`
+	InternalSSHD bool     `yaml:"internal_sshd" json:"internal_sshd"`
+	SSHDBinary   string   `yaml:"sshd_binary" json:"sshd_binary"`
+	SSHDConfig   string   `yaml:"sshd_config" json:"sshd_config"`
+	SSHDLog      string   `yaml:"sshd_log" json:"sshd_log"`
+	AuthFile     string   `yaml:"auth_file" json:"auth_file"`
+	HostKeyPath  string   `yaml:"host_key_path" json:"host_key_path"`
+	TargetUser   string   `yaml:"target_user" json:"target_user"`
+	// RunAs makes a root agent's internal-sshd run sessions as this user.
+	RunAs         string   `yaml:"run_as,omitempty" json:"run_as,omitempty"`
 	ClientOptions []string `yaml:"client_options,omitempty" json:"client_options,omitempty"`
 	ProbeInterval string   `yaml:"probe_interval" json:"probe_interval"`
 	probeDur      time.Duration
@@ -1090,17 +1092,22 @@ func (d *Daemon) startLocalSSH(ctx context.Context) error {
 	if runtime.GOOS == "darwin" {
 		return startDarwinSystemSSHD(ctx)
 	}
+	// Restart an sshd the host already uses, but never enable one at boot
+	// that the host did not have (daybreak P1-5).
 	if _, err := exec.LookPath("systemctl"); err == nil {
 		for _, svc := range d.cfg.LocalSSH.ServiceNames {
 			if svc == "" {
 				continue
 			}
-			cmd := exec.CommandContext(ctx, "systemctl", "enable", "--now", svc)
+			if exec.CommandContext(ctx, "systemctl", "is-enabled", "--quiet", svc).Run() != nil {
+				continue
+			}
+			cmd := exec.CommandContext(ctx, "systemctl", "start", svc)
 			if out, err := cmd.CombinedOutput(); err == nil {
-				d.logger.Printf("enabled/started ssh service %s", svc)
+				d.logger.Printf("started ssh service %s", svc)
 				return nil
 			} else {
-				d.logger.Printf("systemctl enable --now %s failed: %s", svc, strings.TrimSpace(string(out)))
+				d.logger.Printf("systemctl start %s failed: %s", svc, strings.TrimSpace(string(out)))
 			}
 		}
 	}
@@ -1128,6 +1135,9 @@ func (d *Daemon) startInternalSSHD(ctx context.Context) error {
 		return errors.New("internal-sshd not fully configured")
 	}
 	args := []string{"internal-sshd", "--port", strconv.Itoa(ls.Port), "--auth-file", ls.AuthFile, "--host-key", ls.HostKeyPath}
+	if ls.RunAs != "" {
+		args = append(args, "--run-as", ls.RunAs)
+	}
 	logPath := firstNonEmpty(ls.SSHDLog, d.cfg.Tunnel.LogPath+".internal-sshd.log")
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {

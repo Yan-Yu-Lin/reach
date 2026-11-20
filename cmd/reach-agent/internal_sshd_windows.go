@@ -20,7 +20,7 @@ import (
 // an exec request runs as `"cmd.exe" /c "<command>"`, passed verbatim (no
 // re-escaping), started in the user's profile directory, with the user's full
 // environment. There is no ConPTY support: a pty request runs over plain pipes.
-func handleShellSession(s gliderssh.Session, shellOverride string) {
+func handleShellSession(s gliderssh.Session, shellOverride, _ string) {
 	shell := resolveWindowsShell(shellOverride)
 	cmd := exec.Command(shell)
 	cmdLine := `"` + shell + `"`

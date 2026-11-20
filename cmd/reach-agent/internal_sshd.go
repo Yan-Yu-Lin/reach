@@ -28,6 +28,8 @@ type internalSSHDOptions struct {
 	AuthFile    string
 	HostKeyPath string
 	Shell       string
+	// RunAs: run sessions as this account (requires root).
+	RunAs string
 }
 
 var internalSSHDSupportedKeyTypes = []string{"ssh-ed25519", "ecdsa-sha2-nistp256", "ssh-rsa"}
@@ -38,6 +40,7 @@ func internalSSHDCommand(ctx context.Context, args []string) error {
 	authFile := fs.String("auth-file", "", "authorized_keys path")
 	hostKey := fs.String("host-key", "", "server host private key path")
 	shell := fs.String("shell", "", "login shell to exec")
+	runAs := fs.String("run-as", "", "run sessions as this user (root agent only)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -60,7 +63,7 @@ func internalSSHDCommand(ctx context.Context, args []string) error {
 			return fmt.Errorf("%s is a directory", path)
 		}
 	}
-	return runInternalSSHD(ctx, internalSSHDOptions{Port: *port, AuthFile: *authFile, HostKeyPath: *hostKey, Shell: *shell})
+	return runInternalSSHD(ctx, internalSSHDOptions{Port: *port, AuthFile: *authFile, HostKeyPath: *hostKey, Shell: *shell, RunAs: *runAs})
 }
 
 func runInternalSSHD(ctx context.Context, opt internalSSHDOptions) error {
@@ -95,7 +98,7 @@ func runInternalSSHD(ctx context.Context, opt internalSSHDOptions) error {
 					_ = s.Exit(1)
 				}
 			}()
-			handleShellSession(s, opt.Shell)
+			handleShellSession(s, opt.Shell, opt.RunAs)
 		},
 	}
 	srv.AddHostKey(signer)

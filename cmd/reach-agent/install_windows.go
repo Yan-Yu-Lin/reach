@@ -137,7 +137,7 @@ func prepareWindowsLocalSSH(ctx context.Context, opt installOptions, targetHome 
 	if opt.InstallMode != "system" {
 		return localSSHPlan{}, fmt.Errorf("Windows target support currently requires --mode system")
 	}
-	if err := ensureWindowsOpenSSHServer(ctx); err != nil {
+	if err := ensureWindowsOpenSSHServer(ctx, opt.InstallOpenSSH); err != nil {
 		return localSSHPlan{}, err
 	}
 	if err := probeSSH(ctx, "127.0.0.1", 22, 8*time.Second); err != nil {
@@ -152,7 +152,12 @@ func prepareWindowsLocalSSH(ctx context.Context, opt installOptions, targetHome 
 	return localSSHPlan{Mode: mode, LocalPort: 22, AuthFile: authFile, ClientOptions: clientOptionsForServerBanner(banner, "")}, nil
 }
 
-func ensureWindowsOpenSSHServer(ctx context.Context) error {
+// ensureWindowsOpenSSHServer starts an installed Windows OpenSSH Server.
+// It installs the capability only when allowInstall is set: the Windows
+// sshd listens on every interface, which Reach does not need (daybreak
+// P1-5). Without it, a system install on a machine with no OpenSSH Server
+// stops with instructions instead of silently opening port 22.
+func ensureWindowsOpenSSHServer(ctx context.Context, allowInstall bool) error {
 	ensureWindowsOpenSSHPath()
 	if _, err := exec.LookPath("ssh-keygen.exe"); err != nil {
 		if err := installWindowsCapability(ctx, "OpenSSH.Client~~~~0.0.1.0", "Windows OpenSSH Client"); err != nil {
@@ -160,6 +165,10 @@ func ensureWindowsOpenSSHServer(ctx context.Context) error {
 		}
 	}
 	if _, err := exec.LookPath("sshd.exe"); err != nil {
+		if !allowInstall {
+			return fmt.Errorf("Windows OpenSSH Server is not installed. Installing it opens port 22 on all interfaces; rerun with --install-openssh (setup.ps1 -InstallOpenSSH) if you accept that and firewall port 22, or install without admin rights to use Reach's loopback-only built-in server")
+		}
+		fmt.Printf("[reach warning] installing Windows OpenSSH Server; it listens on all interfaces. Restrict port 22 in Windows Firewall if this PC should not accept SSH from the network.\n")
 		if err := installWindowsCapability(ctx, "OpenSSH.Server~~~~0.0.1.0", "Windows OpenSSH Server"); err != nil {
 			return err
 		}
@@ -329,7 +338,8 @@ Register-ScheduledTask -TaskName 'reach-agent-user' -Action $action -Trigger $tr
 }
 
 func (d *Daemon) startWindowsLocalSSH(ctx context.Context) error {
-	return ensureWindowsOpenSSHServer(ctx)
+	// Restart only; never install from the background daemon.
+	return ensureWindowsOpenSSHServer(ctx, false)
 }
 
 // applyAuthorizedKeysPermissions is a no-op now: writeAuthorizedKeysFile

@@ -20,10 +20,10 @@ func installWindowsScheduledTask(ctx context.Context, opt installOptions, cfgPat
 func installWindowsUserPersistence(ctx context.Context, opt installOptions, cfgPath string) (string, error) {
 	return "", nil
 }
-func ensureWindowsOpenSSHServer(ctx context.Context) error           { return nil }
-func stopWindowsPersistence(ctx context.Context, opt installOptions) {}
-func (d *Daemon) startWindowsLocalSSH(ctx context.Context) error     { return nil }
-func windowsDistroString() string                                    { return "" }
+func ensureWindowsOpenSSHServer(ctx context.Context, allowInstall bool) error { return nil }
+func stopWindowsPersistence(ctx context.Context, opt installOptions)          {}
+func (d *Daemon) startWindowsLocalSSH(ctx context.Context) error              { return nil }
+func windowsDistroString() string                                             { return "" }
 
 // applyAuthorizedKeysPermissions is a no-op on Unix: writeAuthorizedKeysFile
 // sets mode and owner on the exact inodes it creates. The old recursive

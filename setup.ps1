@@ -7,6 +7,9 @@ param(
   [ValidateSet('auto','direct','websocket')][string]$Transport = $(if ($env:REACH_TRANSPORT) { $env:REACH_TRANSPORT } else { "auto" }),
   [string]$Version = $(if ($env:REACH_AGENT_VERSION) { $env:REACH_AGENT_VERSION } else { "0.1.0-alpha" }),
   [switch]$Yes,
+  # Install/enable Windows OpenSSH Server if missing. It listens on all
+  # interfaces; Reach only needs loopback, so this is opt-in (daybreak P1-5).
+  [switch]$InstallOpenSSH,
   [switch]$Repair,
   [switch]$UpdateAgent,
   [switch]$Uninstall,
@@ -79,6 +82,10 @@ function Ensure-ReachOpenSSHServer {
   }
   $svc = Get-Service -Name sshd -ErrorAction SilentlyContinue
   if (-not $svc) {
+    if (-not $InstallOpenSSH) {
+      Die "Windows OpenSSH Server is not installed. Installing it opens port 22 on all interfaces. Rerun with -InstallOpenSSH if you accept that (and firewall port 22), or run setup.ps1 without Administrator to use Reach's loopback-only built-in SSH server."
+    }
+    Warn "Installing Windows OpenSSH Server; it listens on all interfaces. Restrict port 22 in Windows Firewall if this PC should not accept SSH from the network."
     Ensure-ReachWindowsCapability 'OpenSSH.Server~~~~0.0.1.0' 'OpenSSH.Server'
     $svc = Get-Service -Name sshd -ErrorAction SilentlyContinue
   }
@@ -283,6 +290,7 @@ try {
   if ($Name) { $installArgs += @('--name', $Name) }
   if ($Token) { $installArgs += @('--token', $Token) }
   if ($Yes) { $installArgs += '--yes' }
+  if ($InstallOpenSSH) { $installArgs += '--install-openssh' }
 
   Log "Handing off to reach-agent install"
   & $AgentPath @installArgs
