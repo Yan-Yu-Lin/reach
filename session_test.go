@@ -172,3 +172,16 @@ func TestInterruptedSessionMigrationIsRetried(t *testing.T) {
 		t.Fatalf("pre-upgrade JWT after interrupted+retried migration = %d", rec.Code)
 	}
 }
+
+// Daybreak round 4 P3-04: two tokens issued in the same second differ, so
+// logging out one does not log out the other.
+func TestJWTsIssuedTogetherAreDistinct(t *testing.T) {
+	a, err := SignJWTVersion("secret-secret-secret-secret-123456", "u", "n", "owner", 1, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := SignJWTVersion("secret-secret-secret-secret-123456", "u", "n", "owner", 1, time.Hour)
+	if a == b {
+		t.Fatal("identical JWTs for two logins in the same second")
+	}
+}

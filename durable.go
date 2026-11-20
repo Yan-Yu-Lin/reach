@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
+	"time"
 )
 
 // Durable action journal (daybreak round 3 P1-A, astra R2-02).
@@ -62,6 +64,11 @@ func (s *Store) settleDurable(ctx context.Context, id int64, state string) {
 
 // durableTx runs fn and the journal row in one transaction. If fn returns
 // an error nothing is committed and no row is written.
+// errNoChange: fn changed nothing; durableTx commits nothing and writes no
+// journal row, so no-ops cannot fill the journal or block rollbacks
+// (daybreak round 4 P3-01). durableTx returns nil to the caller.
+var errNoChange = errors.New("no change")
+
 func (s *Store) durableTx(ctx context.Context, kind, machineID, actor string, fn func(*sql.Tx) error) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -69,6 +76,9 @@ func (s *Store) durableTx(ctx context.Context, kind, machineID, actor string, fn
 	}
 	defer tx.Rollback()
 	if err := fn(tx); err != nil {
+		if errors.Is(err, errNoChange) {
+			return nil
+		}
 		return err
 	}
 	if _, err := recordDurable(ctx, tx, kind, machineID, actor, durableDone); err != nil {
@@ -88,4 +98,14 @@ func (s *Store) inTx(ctx context.Context, fn func(*sql.Tx) error) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+// journalRetention: rows older than this cannot belong to any deploy
+// fence still in use (a deploy finishes or is rolled back within hours).
+const journalRetention = 90 * 24 * time.Hour
+
+// pruneJournal deletes old journal rows (daybreak round 4 P3-01).
+func (s *Store) pruneJournal(ctx context.Context, now time.Time) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM durable_actions WHERE created_at<?`, now.Add(-journalRetention).UTC().Format(time.RFC3339))
+	return err
 }

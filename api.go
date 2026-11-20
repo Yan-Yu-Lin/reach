@@ -844,10 +844,37 @@ func (b approvedBinding) check(slug, targetUser, mode string, localPort int) err
 
 // checkSlugAllowed rejects reserved aliases and the hub's own ProxyJump alias.
 func (s *Server) checkSlugAllowed(slug string) error {
-	if SlugReserved(slug, s.cfg.ReservedSlugs) || strings.EqualFold(slug, s.cfg.DefaultHub.ProxyJumpAlias) {
+	if SlugReserved(slug, s.reservedAliases(context.Background())) {
 		return fmt.Errorf("slug %q is reserved; choose another machine name", slug)
 	}
 	return nil
+}
+
+// reservedAliases: reserved_slugs plus the ProxyJump alias of every hub
+// (not only the default one), so no target can claim a hub's SSH alias
+// (daybreak round 4 P3-02).
+func (s *Server) reservedAliases(ctx context.Context) []string {
+	out := append([]string{}, s.cfg.ReservedSlugs...)
+	seen := map[string]bool{}
+	add := func(a string) {
+		a = strings.ToLower(strings.TrimSpace(a))
+		if a != "" && !seen[a] {
+			seen[a] = true
+			out = append(out, a)
+		}
+	}
+	add(s.cfg.DefaultHub.ProxyJumpAlias)
+	rows, err := s.store.db.QueryContext(ctx, `SELECT proxyjump_alias FROM hubs`)
+	if err == nil {
+		for rows.Next() {
+			var a sql.NullString
+			if rows.Scan(&a) == nil {
+				add(a.String)
+			}
+		}
+		_ = rows.Close()
+	}
+	return out
 }
 
 // slugInUse reports whether a non-retired machine already holds slug.
@@ -2043,8 +2070,14 @@ func (s *Server) parseServiceToken(ctx context.Context, token string) (*Claims, 
 
 func (s *Server) revokeServiceToken(ctx context.Context, token string) error {
 	return s.store.durableTx(ctx, "service_token.revoke", "", "", func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `UPDATE service_tokens SET revoked_at=? WHERE token_hash=? AND revoked_at IS NULL`, nowUTC(), TokenHash(token))
-		return err
+		res, err := tx.ExecContext(ctx, `UPDATE service_tokens SET revoked_at=? WHERE token_hash=? AND revoked_at IS NULL`, nowUTC(), TokenHash(token))
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return errNoChange
+		}
+		return nil
 	})
 }
 

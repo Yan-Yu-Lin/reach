@@ -17,3 +17,17 @@ func TestMatch(t *testing.T) {
 		t.Fatal("extra pattern ignored")
 	}
 }
+
+// Daybreak round 4 P3-02: malformed patterns are reported, and a malformed
+// pattern that slipped through matches everything (fail closed).
+func TestValidateAndFailClosed(t *testing.T) {
+	if err := Validate([]string{"office-*", "lab-[ab]"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := Validate([]string{"office-["}); err == nil {
+		t.Fatal("malformed pattern accepted")
+	}
+	if !Match("anything", []string{"office-["}) {
+		t.Fatal("malformed pattern failed open")
+	}
+}

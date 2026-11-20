@@ -334,3 +334,41 @@ func TestOnlyOneOpenUpdatePerMachine(t *testing.T) {
 		t.Fatalf("%d open update commands", n)
 	}
 }
+
+// Daybreak round 4 P3-01: no-op changes write no journal row, and old rows
+// are pruned by maintenance.
+func TestJournalSkipsNoOpsAndIsPruned(t *testing.T) {
+	server, store, cfg := newReliabilityTestServer(t)
+	insertRetireFixture(t, server, "m_n", "n-box", "rt-nbox1111", 9256)
+	admin, _ := adminTestToken(t, store, cfg)
+	count := func() int {
+		var n int
+		_ = store.db.QueryRow(`SELECT COUNT(*) FROM durable_actions`).Scan(&n)
+		return n
+	}
+	doJSON(t, server, http.MethodPost, "/api/admin/machines/m_n/update-policy", `{"update_policy":"auto"}`, admin)
+	before := count()
+	for i := 0; i < 5; i++ {
+		if rec := doJSON(t, server, http.MethodPost, "/api/admin/machines/m_n/update-policy", `{"update_policy":"auto"}`, admin); rec.Code != 200 {
+			t.Fatalf("repeat policy = %d", rec.Code)
+		}
+	}
+	if count() != before {
+		t.Fatalf("no-op policy updates wrote %d journal rows", count()-before)
+	}
+	if err := server.revokeServiceToken(context.Background(), "sat_does_not_exist"); err != nil {
+		t.Fatal(err)
+	}
+	if count() != before {
+		t.Fatal("revoking an unknown token wrote a journal row")
+	}
+	if _, err := store.db.Exec(`UPDATE durable_actions SET created_at='2020-01-01T00:00:00Z'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.prov.ExpireOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if count() != 0 {
+		t.Fatalf("%d old journal rows left", count())
+	}
+}

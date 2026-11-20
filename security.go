@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math/big"
@@ -230,9 +231,17 @@ func SignJWTVersion(secret, userID, username, role string, sessionVersion int64,
 		return "", errors.New("jwt ttl must be positive")
 	}
 	now := time.Now()
+	jtiRaw := make([]byte, 16)
+	if _, err := rand.Read(jtiRaw); err != nil {
+		return "", err
+	}
+	jti := hex.EncodeToString(jtiRaw)
 	claims := Claims{
 		UserID: userID, Username: username, Role: role, SessionVersion: sessionVersion,
-		RegisteredClaims: jwt.RegisteredClaims{IssuedAt: jwt.NewNumericDate(now), ExpiresAt: jwt.NewNumericDate(now.Add(ttl))},
+		// A random jti makes every token unique, so logging out one session
+		// never blacklists another issued in the same second (daybreak
+		// round 4 P3-04).
+		RegisteredClaims: jwt.RegisteredClaims{ID: jti, IssuedAt: jwt.NewNumericDate(now), ExpiresAt: jwt.NewNumericDate(now.Add(ttl))},
 	}
 	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(secret))
 }

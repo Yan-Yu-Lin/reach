@@ -152,17 +152,36 @@ func renderSSHConfig(hosts []sshHost) string {
 	return b.String()
 }
 
+// parseSSHConfigJSON decodes schema 1. Unknown top-level fields are
+// ignored so the hub can add document-level metadata without breaking
+// older agents (astra round 3 P3); host entries stay strict, because they
+// are rendered into the SSH config.
 func parseSSHConfigJSON(body []byte) ([]sshHost, []string, error) {
-	var doc sshConfigDocument
-	dec := json.NewDecoder(strings.NewReader(string(body)))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&doc); err != nil {
+	var top struct {
+		Schema        int               `json:"schema"`
+		Hosts         []json.RawMessage `json:"hosts"`
+		ReservedHosts []string          `json:"reserved_hosts"`
+	}
+	if err := json.Unmarshal(body, &top); err != nil {
 		return nil, nil, fmt.Errorf("parse ssh-config.json: %w", err)
 	}
-	if doc.Schema != 1 {
-		return nil, nil, fmt.Errorf("unsupported ssh-config schema %d", doc.Schema)
+	if top.Schema != 1 {
+		return nil, nil, fmt.Errorf("unsupported ssh-config schema %d", top.Schema)
 	}
-	return doc.Hosts, doc.ReservedHosts, nil
+	hosts := make([]sshHost, 0, len(top.Hosts))
+	for i, raw := range top.Hosts {
+		var h sshHost
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&h); err != nil {
+			return nil, nil, fmt.Errorf("parse ssh-config.json host %d: %w", i, err)
+		}
+		hosts = append(hosts, h)
+	}
+	if err := reserved.Validate(top.ReservedHosts); err != nil {
+		return nil, nil, fmt.Errorf("server reserved_hosts: %w", err)
+	}
+	return hosts, top.ReservedHosts, nil
 }
 
 var errLegacyDirective = errors.New("legacy ssh-config contains a directive outside the allowlist")

@@ -249,9 +249,6 @@ func (s *Server) handleSSHConfigJSON(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	doc := SSHConfigDocument{Schema: sshConfigSchema, Hosts: hosts}
-	doc.ReservedHosts = append(doc.ReservedHosts, s.cfg.ReservedSlugs...)
-	if a := strings.TrimSpace(s.cfg.DefaultHub.ProxyJumpAlias); a != "" {
-		doc.ReservedHosts = append(doc.ReservedHosts, a)
-	}
+	doc.ReservedHosts = s.reservedAliases(r.Context())
 	writeJSON(w, 200, doc)
 }

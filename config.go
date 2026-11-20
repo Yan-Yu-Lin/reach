@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reach/internal/reserved"
 	"strings"
 	"time"
 
@@ -246,6 +247,9 @@ func LoadConfig(path string) (Config, error) {
 	}
 	if !strings.HasPrefix(cfg.ListenAddr, "127.0.0.1:") && !strings.HasPrefix(cfg.ListenAddr, "localhost:") {
 		return cfg, fmt.Errorf("listen_addr must bind localhost only, got %q", cfg.ListenAddr)
+	}
+	if err := reserved.Validate(cfg.ReservedSlugs); err != nil {
+		return cfg, fmt.Errorf("reserved_slugs: %w", err)
 	}
 	return cfg, nil
 }

@@ -733,8 +733,14 @@ func (p *Provisioner) SetUpdatePolicy(ctx context.Context, idOrSlug, policy, act
 	}
 	now := nowUTC()
 	if err := p.store.durableTx(ctx, "machine.update_policy", m.ID, actor, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `UPDATE machines SET update_policy=?, updated_at=? WHERE id=?`, policy, now, m.ID)
-		return err
+		res, err := tx.ExecContext(ctx, `UPDATE machines SET update_policy=?, updated_at=? WHERE id=? AND COALESCE(update_policy,'')<>?`, policy, now, m.ID, policy)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return errNoChange
+		}
+		return nil
 	}); err != nil {
 		return Machine{}, err
 	}
@@ -1615,6 +1621,9 @@ func (p *Provisioner) ExpireOnce(ctx context.Context) error {
 		return err
 	}
 	if _, err := p.store.db.ExecContext(ctx, `DELETE FROM rate_limits WHERE reset_at<=?`, now); err != nil {
+		return err
+	}
+	if err := p.store.pruneJournal(ctx, nowTime); err != nil {
 		return err
 	}
 	if _, err := p.store.db.ExecContext(ctx, `UPDATE requests SET status='expired' WHERE status IN ('pending','approved') AND expires_at < ?`, now); err != nil {

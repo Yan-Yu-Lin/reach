@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -149,5 +151,22 @@ func TestSSHConfigJSONIncludesReservedHosts(t *testing.T) {
 	got := strings.Join(doc.ReservedHosts, ",")
 	if !strings.Contains(got, "office-*") || !strings.Contains(got, "my-hub") {
 		t.Fatalf("reserved_hosts = %v", doc.ReservedHosts)
+	}
+}
+
+// Daybreak round 4 P3-02: every hub's ProxyJump alias is reserved, not only
+// the default hub's; malformed reserved_slugs are refused at config load.
+func TestAllHubAliasesAreReserved(t *testing.T) {
+	server, store, _ := newReliabilityTestServer(t)
+	if _, err := store.db.Exec(`INSERT INTO hubs (id,name,public_host,ssh_port,proxyjump_alias,api_url,port_range_start,port_range_end,status,created_at) VALUES ('second','Second','h2',22,'second-hub','https://x',9500,9600,'active',?)`, nowUTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.checkSlugAllowed("second-hub"); err == nil {
+		t.Fatal("second hub's alias accepted as a machine slug")
+	}
+	path := filepath.Join(t.TempDir(), "c.yaml")
+	_ = os.WriteFile(path, []byte("reserved_slugs: [\"office-[\"]\n"), 0o600)
+	if _, err := LoadConfig(path); err == nil {
+		t.Fatal("malformed reserved_slugs accepted")
 	}
 }

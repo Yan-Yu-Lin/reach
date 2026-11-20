@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"reach/internal/reserved"
 	"reach/internal/safehttp"
 	"strings"
 	"syscall"
@@ -557,6 +558,9 @@ func loadConfig(path string) (Config, error) {
 	}
 	if cfg.OutFile == "" || cfg.SSHConfigFile == "" {
 		return cfg, fmt.Errorf("out_file and ssh_config_file are required")
+	}
+	if err := reserved.Validate(cfg.ReservedHosts); err != nil {
+		return cfg, fmt.Errorf("reserved_hosts: %w", err)
 	}
 	if cfg.Token == "" && cfg.TokenFile == "" {
 		return cfg, fmt.Errorf("token or token_file is required")

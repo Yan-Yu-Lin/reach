@@ -273,3 +273,18 @@ func TestSyncHonoursServerReservedHosts(t *testing.T) {
 		t.Fatalf("server-reserved alias written:\n%s", b)
 	}
 }
+
+// Astra round 3 P3: unknown top-level fields from a newer hub are ignored;
+// host entries stay strict; malformed server patterns are refused.
+func TestSSHConfigJSONForwardCompatible(t *testing.T) {
+	hosts, reservedHosts, err := parseSSHConfigJSON([]byte(`{"schema":1,"future_field":{"x":1},"reserved_hosts":["office-*"],"hosts":[{"host":"jack","hostname":"localhost","port":9210,"user":"arthur","proxy_jump":"jason-public","host_key_alias":"reach-m_abc123","machine_id":"m_abc123"}]}`))
+	if err != nil || len(hosts) != 1 || len(reservedHosts) != 1 {
+		t.Fatalf("hosts=%v reserved=%v err=%v", hosts, reservedHosts, err)
+	}
+	if _, _, err := parseSSHConfigJSON([]byte(`{"schema":1,"hosts":[{"host":"jack","proxy_command":"x"}]}`)); err == nil {
+		t.Fatal("unknown host field accepted")
+	}
+	if _, _, err := parseSSHConfigJSON([]byte(`{"schema":1,"reserved_hosts":["office-["],"hosts":[]}`)); err == nil {
+		t.Fatal("malformed server pattern accepted")
+	}
+}
