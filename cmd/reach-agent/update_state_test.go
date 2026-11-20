@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -33,7 +36,7 @@ func pendingUpdateFixture(t *testing.T) (dir, agent string) {
 	if err := os.WriteFile(agent, []byte("candidate"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	st := &updateState{State: updPending, Backup: backup, AgentPath: agent, CandidateVersion: "0.2.0", CandidateSequence: 1_790_000_000, WasActive: true, Deadline: time.Now().Add(-time.Second).UTC().Format(time.RFC3339)}
+	st := &updateState{State: updPending, Attempt: "a1", Backup: backup, BackupSHA256: sha256Hex("old"), AgentPath: agent, CandidateVersion: "0.2.0", CandidateSHA256: sha256Hex("candidate"), CandidateSequence: 1_790_000_000, WasActive: true, Deadline: time.Now().Add(-time.Second).UTC().Format(time.RFC3339)}
 	if err := writeUpdateState(dir, st); err != nil {
 		t.Fatal(err)
 	}
@@ -145,11 +148,17 @@ func TestCrashedConfirmIsRolledBack(t *testing.T) {
 	if err != nil || !restored || agentBytes(t, agent) != "old" {
 		t.Fatalf("crashed confirm not rolled back: restored=%v err=%v", restored, err)
 	}
-	if st, _ := readUpdateState(dir); st.State != updRolledBack {
+	if st, _ := readUpdateState(dir); st.State != updRestartPending {
 		t.Fatalf("state = %s", st.State)
 	}
 	if err := confirmUpdate(reachInstallState{DataDir: dir}); err == nil {
-		t.Fatal("confirm after rollback succeeded")
+		t.Fatal("confirm during rollback succeeded")
+	}
+	if err := markRestarted(dir); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := readUpdateState(dir); st.State != updRolledBack {
+		t.Fatalf("state after restart = %s", st.State)
 	}
 	if f, _ := readReleaseFloor(dir); f != 0 {
 		t.Fatalf("floor raised for a rolled-back update: %d", f)
@@ -162,5 +171,155 @@ func TestStartupRollsBackOrphanedUpdate(t *testing.T) {
 	resumeInterruptedUpdate(context.Background(), reachInstallState{DataDir: dir, AgentPath: agent}, t.Logf)
 	if agentBytes(t, agent) != "old" {
 		t.Fatal("orphaned update not rolled back at startup")
+	}
+}
+
+func sha256Hex(s string) string {
+	h := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(h[:])
+}
+
+// Astra R3-06: the floor reached disk, then the process died before the
+// confirmed state. Recovery finishes the confirm instead of restoring the
+// old binary under a raised floor.
+func TestCrashAfterFloorWriteFinishesConfirm(t *testing.T) {
+	dir, agent := pendingUpdateFixture(t)
+	st, _ := readUpdateState(dir)
+	st.State = updConfirming
+	if err := writeUpdateState(dir, st); err != nil {
+		t.Fatal(err)
+	}
+	if err := raiseReleaseFloor(dir, st.CandidateSequence); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := rollbackIfUnconfirmed(dir)
+	if err != nil || restored || agentBytes(t, agent) != "candidate" {
+		t.Fatalf("rolled back past a durable floor: restored=%v err=%v", restored, err)
+	}
+	if st, _ := readUpdateState(dir); st.State != updConfirmed {
+		t.Fatalf("state = %s", st.State)
+	}
+}
+
+// Astra R3-07 A: a leftover terminal state must not hide a legacy flag.
+func TestLegacyFlagWinsOverTerminalState(t *testing.T) {
+	dir := t.TempDir()
+	if err := writeUpdateState(dir, &updateState{State: updConfirmed, CandidateVersion: "prior"}); err != nil {
+		t.Fatal(err)
+	}
+	flag := filepath.Join(dir, "update-confirm-required")
+	if err := os.WriteFile(flag, []byte("candidate_sequence=1799000004\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := confirmUpdate(reachInstallState{DataDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(flag); err == nil {
+		t.Fatal("legacy flag still pending after confirm")
+	}
+	if f, _ := readReleaseFloor(dir); f != 1799000004 {
+		t.Fatalf("floor = %d", f)
+	}
+}
+
+// Astra R3-07 B: a stale rolling_back state from an earlier attempt must
+// not undo a later update (the binary at AgentPath is neither the recorded
+// candidate nor the backup).
+func TestStaleRollingBackDoesNotUndoLaterUpdate(t *testing.T) {
+	dir, agent := pendingUpdateFixture(t)
+	st, _ := readUpdateState(dir)
+	st.State = updRollingBack
+	if err := writeUpdateState(dir, st); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(agent, []byte("future-candidate"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	resumeInterruptedUpdate(context.Background(), reachInstallState{DataDir: dir, AgentPath: agent}, t.Logf)
+	if agentBytes(t, agent) != "future-candidate" {
+		t.Fatal("stale rollback state undid a later update")
+	}
+	if st, _ := readUpdateState(dir); st.State != updRolledBack {
+		t.Fatalf("stale state not retired: %s", st.State)
+	}
+}
+
+// The restore completed but the state still says rolling_back: finish as
+// restart_pending without restoring again.
+func TestCompletedRestoreIsNotReplayed(t *testing.T) {
+	dir, agent := pendingUpdateFixture(t)
+	st, _ := readUpdateState(dir)
+	st.State = updRollingBack
+	if err := writeUpdateState(dir, st); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(agent, []byte("old"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(st.Backup, []byte("old"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	need, err := rollbackIfUnconfirmed(dir)
+	if err != nil || !need {
+		t.Fatalf("need restart=%v err=%v", need, err)
+	}
+	if st, _ := readUpdateState(dir); st.State != updRestartPending {
+		t.Fatalf("state = %s", st.State)
+	}
+}
+
+// Daybreak round 4 P2-04: a symlinked state file is refused, and a
+// group-writable DataDir is refused.
+func TestUpdateStateRefusesSymlinksAndLooseDataDir(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(t.TempDir(), "elsewhere.json")
+	if err := os.WriteFile(target, []byte(`{"state":"pending","agent_path":"/etc/passwd"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(dir, updateStateFile)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readUpdateState(dir); err == nil {
+		t.Fatal("symlinked update state was read")
+	}
+	loose := t.TempDir()
+	if err := os.Chmod(loose, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := withUpdateLock(loose, func() error { return nil }); err == nil {
+		t.Fatal("world-writable DataDir accepted")
+	}
+}
+
+// Daybreak round 4 P2-04: two update workers cannot both start an update.
+func TestUpdateStartIsSingleFlight(t *testing.T) {
+	dir := t.TempDir()
+	if err := writeUpdateState(dir, &updateState{State: updConfirmed}); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	started := 0
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := withUpdateLock(dir, func() error {
+				prev, err := readUpdateState(dir)
+				if err != nil || !prev.terminal() {
+					return os.ErrExist
+				}
+				return writeUpdateState(dir, &updateState{State: updPending})
+			})
+			if err == nil {
+				mu.Lock()
+				started++
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	if started != 1 {
+		t.Fatalf("%d workers started an update", started)
 	}
 }

@@ -125,3 +125,54 @@ func TestLocalSSHLoginProbe(t *testing.T) {
 		t.Fatal("one-time key left behind after a failed probe")
 	}
 }
+
+// Daybreak round 4 P2-04: RSA-only targets (OpenSSH 5.3) get an RSA probe
+// key; everyone else Ed25519.
+func TestProbeSignerFollowsTargetKeyTypes(t *testing.T) {
+	d := NewDaemon(defaultConfig())
+	d.cfg.Tunnel.SSHCompat.SupportedAuthorizedKeyTypes = []string{"ssh-rsa"}
+	s, err := d.probeSigner()
+	if err != nil || s.PublicKey().Type() != "ssh-rsa" {
+		t.Fatalf("RSA-only target: %v %v", s, err)
+	}
+	d.cfg.Tunnel.SSHCompat.SupportedAuthorizedKeyTypes = []string{"ssh-ed25519", "ssh-rsa"}
+	if s, err := d.probeSigner(); err != nil || s.PublicKey().Type() != "ssh-ed25519" {
+		t.Fatalf("modern target: %v %v", s, err)
+	}
+}
+
+// Daybreak round 4 P2-04 / astra's RMW PoC: the probe's key edit and a
+// concurrent sync_keys must not overwrite each other.
+func TestProbeEditAndSyncKeysAreSerialised(t *testing.T) {
+	d, auth := syncKeysFixture(t)
+	inEdit := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- d.editAuthorizedKeys(func(lines []string) []string {
+			close(inEdit)
+			<-release
+			return append(lines, syncGoodKey+" reach:m_review:update-confirm")
+		})
+	}()
+	<-inEdit
+	syncDone := make(chan error, 1)
+	replacement := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGmrfHxnzBv2X2b9gKv2+EuQ9ZOXZbXZT2RlJp0h8Wsx"
+	go func() { syncDone <- d.syncKeys([]DesiredPubkey{{PublicKey: replacement}}, true) }()
+	select {
+	case err := <-syncDone:
+		t.Fatalf("sync_keys ran during the probe edit (err=%v)", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-syncDone; err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(auth)
+	if !strings.Contains(string(b), replacement) {
+		t.Fatalf("sync_keys result lost:\n%s", b)
+	}
+}

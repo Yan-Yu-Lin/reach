@@ -4,56 +4,77 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
 	"time"
 )
 
-// Durable self-update state machine (astra R2-09, daybreak round 3 P2-E).
+// Durable self-update state machine (astra R2-09, R3-06, R3-07; daybreak
+// round 3 P2-E, round 4 P2-04).
 //
-// The earlier design renamed a flag file to "claim" it; a watcher that found
-// the flag missing assumed the update was confirmed, although a confirmer
-// might only be holding it and about to fail. Now one JSON state file,
-// written atomically and fsynced, says exactly where the update is, and
-// every transition happens under an exclusive lock:
+// One JSON state file, written atomically and fsynced, says where the
+// update is; every check and transition happens under one OS file lock:
 //
-//	pending      new binary installed, waiting for proof of health
-//	confirming   confirm started (floor being raised)
-//	confirmed    floor durable; rollback cancelled
-//	rolling_back watcher started restoring the backup
-//	rolled_back  backup restored
+//	pending         new binary installed, waiting for proof of health
+//	confirming      confirm started (floor being raised)
+//	confirmed       floor durable; rollback cancelled
+//	rolling_back    watcher started restoring the backup
+//	restart_pending backup restored, agent not yet restarted on it
+//	rolled_back     backup restored and the agent restarted
 //
-// Only "confirmed" cancels a rollback. A crash in "confirming" or
-// "rolling_back" is resumed: the watcher (or a re-armed one) rolls back.
-// WasActive records whether the machine was meant to be online before the
-// update, so the hub cannot lower the confirm gate afterwards.
+// Each update has an Attempt ID and records the sha256 of the candidate
+// and of the backup. Recovery acts only on the attempt that matches what
+// is on disk:
+//
+//   - confirming with the floor already at CandidateSequence: the confirm
+//     commit was done, finish it as confirmed (never roll back past a
+//     durable floor) (R3-06)
+//   - rolling_back with AgentPath already equal to the backup: finish as
+//     restart_pending; with AgentPath equal to neither the candidate nor
+//     the backup: a later update replaced it, the stale state is retired
+//     without touching the binary (R3-07)
+//   - a legacy flag file (older agent) always takes precedence over an
+//     old terminal state (R3-07)
+//
+// The state file and lock live in DataDir, which must be a real directory
+// owned by this user and not writable by group/others; the state file is
+// opened without following symlinks (daybreak P2-04).
 
 const (
 	updateStateFile = "update-state.json"
 	updateLockFile  = "update.lock"
 
-	updPending     = "pending"
-	updConfirming  = "confirming"
-	updConfirmed   = "confirmed"
-	updRollingBack = "rolling_back"
-	updRolledBack  = "rolled_back"
+	updPending        = "pending"
+	updConfirming     = "confirming"
+	updConfirmed      = "confirmed"
+	updRollingBack    = "rolling_back"
+	updRestartPending = "restart_pending"
+	updRolledBack     = "rolled_back"
 )
 
 type updateState struct {
 	State             string `json:"state"`
+	Attempt           string `json:"attempt,omitempty"`
 	Backup            string `json:"backup"`
+	BackupSHA256      string `json:"backup_sha256,omitempty"`
 	AgentPath         string `json:"agent_path"`
 	InstallMode       string `json:"install_mode,omitempty"`
 	ConfigPath        string `json:"config_path,omitempty"`
 	CandidateVersion  string `json:"candidate_version"`
+	CandidateSHA256   string `json:"candidate_sha256,omitempty"`
 	CandidateSequence int64  `json:"candidate_sequence"`
-	WasActive         bool   `json:"was_active"`
-	InstalledAt       string `json:"installed_at"`
-	Deadline          string `json:"deadline"`
-	UpdatedAt         string `json:"updated_at"`
+	// FloorBefore is the anti-rollback floor when the update started.
+	FloorBefore int64  `json:"floor_before"`
+	WasActive   bool   `json:"was_active"`
+	InstalledAt string `json:"installed_at"`
+	Deadline    string `json:"deadline"`
+	UpdatedAt   string `json:"updated_at"`
 }
 
+// terminal: nothing left to do for this attempt. restart_pending is not
+// terminal: the agent still has to be restarted on the restored binary.
 func (s *updateState) terminal() bool {
 	return s == nil || s.State == updConfirmed || s.State == updRolledBack
 }
@@ -63,11 +84,36 @@ func (s *updateState) deadline() time.Time {
 	return t
 }
 
+// checkDataDir refuses a DataDir that another user could have prepared:
+// it must be a real directory (not a symlink), owned by us, and not
+// group/other-writable (daybreak round 4 P2-04).
+func checkDataDir(dataDir string) error {
+	st, err := os.Lstat(dataDir)
+	if err != nil {
+		return err
+	}
+	if st.Mode()&os.ModeSymlink != 0 || !st.IsDir() {
+		return fmt.Errorf("%s is not a real directory", dataDir)
+	}
+	if st.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("%s is writable by group or others (mode %o)", dataDir, st.Mode().Perm())
+	}
+	return checkOwnedByMe(st)
+}
+
 func readUpdateState(dataDir string) (*updateState, error) {
-	b, err := os.ReadFile(filepath.Join(dataDir, updateStateFile))
+	f, err := openNoFollow(filepath.Join(dataDir, updateStateFile))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	if fi, err := f.Stat(); err != nil || !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s is not a regular file", updateStateFile)
+	}
+	b, err := io.ReadAll(io.LimitReader(f, 64<<10))
 	if err != nil {
 		return nil, err
 	}
@@ -113,13 +159,16 @@ func writeUpdateState(dataDir string, st *updateState) error {
 	return syncDir(dataDir)
 }
 
-// withUpdateLock runs fn holding the exclusive update lock. The lock is an
-// OS file lock, released automatically if the holder dies.
+// withUpdateLock runs fn holding the exclusive update lock, after checking
+// DataDir. The lock is an OS file lock, released if the holder dies.
 func withUpdateLock(dataDir string, fn func() error) error {
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(filepath.Join(dataDir, updateLockFile), os.O_CREATE|os.O_RDWR, 0o600)
+	if err := checkDataDir(dataDir); err != nil {
+		return fmt.Errorf("update data dir: %w", err)
+	}
+	f, err := openLockNoFollow(filepath.Join(dataDir, updateLockFile))
 	if err != nil {
 		return err
 	}
@@ -131,25 +180,34 @@ func withUpdateLock(dataDir string, fn func() error) error {
 	return fn()
 }
 
+func fileMatches(path, sha string) bool {
+	if sha == "" {
+		return false
+	}
+	got, err := fileSHA256Hex(path)
+	return err == nil && got == sha
+}
+
 // confirmUpdateState: pending/confirming -> confirming -> (floor) ->
 // confirmed. If the floor cannot be made durable the state goes back to
 // pending and the rollback stays armed. handled=false means there is no
-// state file (legacy flag or nothing pending).
+// active state for this protocol (no file, or a terminal one).
 func confirmUpdateState(dataDir string) (handled bool, err error) {
 	err = withUpdateLock(dataDir, func() error {
 		st, err := readUpdateState(dataDir)
 		if err != nil {
 			return err
 		}
-		if st == nil {
+		if st.terminal() {
 			return nil
 		}
 		handled = true
 		switch st.State {
-		case updConfirmed:
-			return nil
-		case updRollingBack, updRolledBack:
-			return fmt.Errorf("update to %s is being or was rolled back; not confirming", st.CandidateVersion)
+		case updRollingBack, updRestartPending:
+			return fmt.Errorf("update to %s is being rolled back; not confirming", st.CandidateVersion)
+		}
+		if st.CandidateSHA256 != "" && !fileMatches(st.AgentPath, st.CandidateSHA256) {
+			return fmt.Errorf("installed binary is not the %s candidate; not confirming", st.CandidateVersion)
 		}
 		st.State = updConfirming
 		if err := writeUpdateState(dataDir, st); err != nil {
@@ -170,12 +228,11 @@ func confirmUpdateState(dataDir string) (handled bool, err error) {
 	return handled, err
 }
 
-// rollbackIfUnconfirmed is the watcher's decision, under the lock: unless
-// the state is confirmed, restore the backup. It returns true when it
-// restored (the caller then restarts the agent). A crashed confirmer
-// ("confirming") or rollback ("rolling_back") is rolled back.
+// rollbackIfUnconfirmed is the watcher's decision, under the lock. It
+// returns true when the agent must be restarted on the restored binary
+// (the caller restarts it and then calls markRestarted).
 func rollbackIfUnconfirmed(dataDir string) (bool, error) {
-	restored := false
+	needRestart := false
 	err := withUpdateLock(dataDir, func() error {
 		st, err := readUpdateState(dataDir)
 		if err != nil {
@@ -184,6 +241,35 @@ func rollbackIfUnconfirmed(dataDir string) (bool, error) {
 		if st.terminal() {
 			return nil
 		}
+		switch st.State {
+		case updRestartPending:
+			needRestart = true
+			return nil
+		case updConfirming:
+			// A crash after the floor became durable: the confirm commit
+			// happened, finish it instead of rolling back (R3-06).
+			if floor, err := readReleaseFloor(dataDir); err == nil && st.CandidateSequence > 0 && floor >= st.CandidateSequence && floor > st.FloorBefore {
+				st.State = updConfirmed
+				return writeUpdateState(dataDir, st)
+			}
+		case updRollingBack:
+			if fileMatches(st.AgentPath, st.BackupSHA256) {
+				// The restore completed before a crash.
+				st.State = updRestartPending
+				needRestart = true
+				return writeUpdateState(dataDir, st)
+			}
+		}
+		// Only restore over the binary this attempt installed. If the path
+		// now holds something else (a later update by an older agent), this
+		// state is stale: retire it, leave the binary alone (R3-07).
+		if st.CandidateSHA256 != "" && !fileMatches(st.AgentPath, st.CandidateSHA256) {
+			st.State = updRolledBack
+			return writeUpdateState(dataDir, st)
+		}
+		if st.BackupSHA256 != "" && !fileMatches(st.Backup, st.BackupSHA256) {
+			return fmt.Errorf("backup %s does not match the recorded hash; not restoring", st.Backup)
+		}
 		st.State = updRollingBack
 		if err := writeUpdateState(dataDir, st); err != nil {
 			return err
@@ -191,14 +277,26 @@ func rollbackIfUnconfirmed(dataDir string) (bool, error) {
 		if err := restoreBinary(st.Backup, st.AgentPath); err != nil {
 			return fmt.Errorf("restore %s: %w", st.Backup, err)
 		}
-		st.State = updRolledBack
+		st.State = updRestartPending
 		if err := writeUpdateState(dataDir, st); err != nil {
 			return err
 		}
-		restored = true
+		needRestart = true
 		return nil
 	})
-	return restored, err
+	return needRestart, err
+}
+
+// markRestarted ends a rollback once the agent runs the restored binary.
+func markRestarted(dataDir string) error {
+	return withUpdateLock(dataDir, func() error {
+		st, err := readUpdateState(dataDir)
+		if err != nil || st == nil || st.State != updRestartPending {
+			return err
+		}
+		st.State = updRolledBack
+		return writeUpdateState(dataDir, st)
+	})
 }
 
 // updatePending reports an update that still awaits confirmation (state

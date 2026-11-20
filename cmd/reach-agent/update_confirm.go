@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/rsa"
 	"fmt"
 	"net"
 	"os"
@@ -50,18 +51,19 @@ func (d *Daemon) confirmPendingUpdate(ctx context.Context, st reachInstallState)
 		return
 	}
 	needProof := true
+	_, flagErr := os.Stat(filepath.Join(st.DataDir, "update-confirm-required"))
 	switch {
+	case flagErr == nil:
+		// Legacy flag from an older agent: it wins over any leftover
+		// state (astra R3-07); the pre-update state was not recorded, so
+		// require the full proof.
 	case ust != nil && !ust.terminal():
-		needProof = ust.WasActive
-	case ust == nil:
-		if _, err := os.Stat(filepath.Join(st.DataDir, "update-confirm-required")); err != nil {
-			d.updateConfirmed = true // nothing pending
-			return
+		if ust.State == updRollingBack || ust.State == updRestartPending {
+			return // being rolled back; never confirm
 		}
-		// Legacy flag from an older agent: the pre-update state was not
-		// recorded, so require the full proof.
+		needProof = ust.WasActive
 	default:
-		d.updateConfirmed = true
+		d.updateConfirmed = true // nothing pending
 		return
 	}
 	if needProof {
@@ -98,11 +100,7 @@ func (d *Daemon) localSSHLoginProbe(ctx context.Context) error {
 	if auth == "" {
 		return fmt.Errorf("no authorized_keys path configured; cannot prove SSH login")
 	}
-	_, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		return err
-	}
-	signer, err := ssh.NewSignerFromKey(priv)
+	signer, err := d.probeSigner()
 	if err != nil {
 		return err
 	}
@@ -185,6 +183,8 @@ func (d *Daemon) localSSHLoginProbe(ctx context.Context) error {
 // editAuthorizedKeys rewrites authorized_keys through the same safe writer
 // sync_keys uses.
 func (d *Daemon) editAuthorizedKeys(fn func([]string) []string) error {
+	d.keysMu.Lock()
+	defer d.keysMu.Unlock()
 	auth := d.cfg.LocalSSH.AuthFile
 	b, err := readAuthorizedKeysFile(auth)
 	if err != nil {
@@ -198,4 +198,29 @@ func (d *Daemon) editAuthorizedKeys(fn func([]string) []string) error {
 	}
 	lines = fn(lines)
 	return writeAuthorizedKeysFile(auth, d.authKeysAccount(), []byte(strings.Join(lines, "\n")+"\n"))
+}
+
+// probeSigner picks a one-time key type the local sshd accepts: Ed25519
+// unless the target's supported key types exclude it (OpenSSH 5.3 /
+// RSA-only), then RSA (daybreak round 4 P2-04).
+func (d *Daemon) probeSigner() (ssh.Signer, error) {
+	supported := d.cfg.Tunnel.SSHCompat.SupportedAuthorizedKeyTypes
+	if d.cfg.LocalSSH.InternalSSHD {
+		supported = internalSSHDSupportedKeyTypes
+	}
+	if len(supported) == 0 || keyTypeSupported("ssh-ed25519", supported) {
+		_, priv, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			return nil, err
+		}
+		return ssh.NewSignerFromKey(priv)
+	}
+	if !keyTypeSupported("ssh-rsa", supported) {
+		return nil, fmt.Errorf("local sshd accepts neither ed25519 nor RSA keys (%v)", supported)
+	}
+	priv, err := rsa.GenerateKey(rand.Reader, 3072)
+	if err != nil {
+		return nil, err
+	}
+	return ssh.NewSignerFromKey(priv)
 }

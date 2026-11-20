@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -327,30 +328,61 @@ func performBinaryUpdate(ctx context.Context, st reachInstallState, opt updateBi
 	}
 	fmt.Printf("[reach] backed up current binary to %s\n", backupPath)
 
-	if prev, err := readUpdateState(st.DataDir); err != nil {
+	candidateSHA, err := fileSHA256Hex(candidatePath)
+	if err != nil {
 		return err
-	} else if !prev.terminal() {
-		return fmt.Errorf("an update to %s is still %s; confirm it or let it roll back first", prev.CandidateVersion, prev.State)
+	}
+	backupSHA, err := fileSHA256Hex(backupPath)
+	if err != nil {
+		return err
+	}
+	attempt, err := randomAttemptID()
+	if err != nil {
+		return err
 	}
 	now := time.Now().UTC()
-	ust := &updateState{State: updPending, Backup: backupPath, AgentPath: st.AgentPath, InstallMode: st.InstallMode, ConfigPath: st.ConfigPath, CandidateVersion: candidateVersion, CandidateSequence: manifestSequence(manifest), WasActive: opt.WasActive, InstalledAt: now.Format(time.RFC3339), Deadline: now.Add(opt.RollbackAfter).Format(time.RFC3339)}
-	if err := withUpdateLock(st.DataDir, func() error { return writeUpdateState(st.DataDir, ust) }); err != nil {
-		return fmt.Errorf("record update state: %w", err)
-	}
-
-	if err := atomicInstallBinary(candidatePath, st.AgentPath); err != nil {
-		ust.State = updRolledBack
-		_ = withUpdateLock(st.DataDir, func() error { return writeUpdateState(st.DataDir, ust) })
-		return err
-	}
-	fmt.Printf("[reach] installed candidate at %s\n", st.AgentPath)
-
+	ust := &updateState{State: updPending, Attempt: attempt, Backup: backupPath, BackupSHA256: backupSHA, AgentPath: st.AgentPath, InstallMode: st.InstallMode, ConfigPath: st.ConfigPath, CandidateVersion: candidateVersion, CandidateSHA256: candidateSHA, CandidateSequence: manifestSequence(manifest), WasActive: opt.WasActive, InstalledAt: now.Format(time.RFC3339), Deadline: now.Add(opt.RollbackAfter).Format(time.RFC3339)}
 	rollbackLog := filepath.Join(st.DataDir, "update-rollback-"+id+".log")
-	if err := startRollbackWatcher(st, rollbackLog, opt.RollbackAfter); err != nil {
-		if _, rerr := rollbackIfUnconfirmed(st.DataDir); rerr != nil {
-			return fmt.Errorf("start rollback watcher failed (%v) and restoring the backup failed: %w", err, rerr)
+	// Check, record, install and arm the watcher under one lock, so two
+	// workers cannot both pass the "nothing pending" check (daybreak
+	// round 4 P2-04).
+	err = withUpdateLock(st.DataDir, func() error {
+		if prev, err := readUpdateState(st.DataDir); err != nil {
+			return err
+		} else if !prev.terminal() {
+			return fmt.Errorf("an update to %s is still %s; confirm it or let it roll back first", prev.CandidateVersion, prev.State)
 		}
-		return fmt.Errorf("start rollback watcher failed; restored backup: %w", err)
+		if _, err := os.Stat(filepath.Join(st.DataDir, "update-confirm-required")); err == nil {
+			return fmt.Errorf("an update started by an older agent is still pending; confirm it or let it roll back first")
+		}
+		floor, err := readReleaseFloor(st.DataDir)
+		if err != nil {
+			return err
+		}
+		ust.FloorBefore = floor
+		if err := writeUpdateState(st.DataDir, ust); err != nil {
+			return fmt.Errorf("record update state: %w", err)
+		}
+		if err := atomicInstallBinary(candidatePath, st.AgentPath); err != nil {
+			ust.State = updRolledBack
+			_ = writeUpdateState(st.DataDir, ust)
+			return err
+		}
+		fmt.Printf("[reach] installed candidate at %s\n", st.AgentPath)
+		if err := startRollbackWatcher(st, rollbackLog, opt.RollbackAfter); err != nil {
+			ust.State = updRollingBack
+			_ = writeUpdateState(st.DataDir, ust)
+			if rerr := restoreBinary(backupPath, st.AgentPath); rerr != nil {
+				return fmt.Errorf("start rollback watcher failed (%v) and restoring the backup failed: %w", err, rerr)
+			}
+			ust.State = updRolledBack
+			_ = writeUpdateState(st.DataDir, ust)
+			return fmt.Errorf("start rollback watcher failed; restored backup: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
 	}
 	fmt.Printf("[reach] rollback watcher armed: %s (timeout %s)\n", rollbackLog, opt.RollbackAfter)
 
@@ -793,8 +825,13 @@ func runUpdateRollbackWatcher(ctx context.Context, opt updateBinaryOptions) erro
 		return nil
 	}
 	st := reachInstallState{AgentPath: opt.agentPath, InstallMode: opt.installMode, ConfigPath: opt.configPath, DataDir: opt.dataDir, PIDFile: filepath.Join(opt.dataDir, "reach-agent.pid"), LogPath: filepath.Join(opt.dataDir, "agent.log")}
+	// restart_pending until the restart succeeds: a crash here leaves the
+	// candidate process running, and the next start finishes the job.
 	if err := restartReachAgent(ctx, st); err != nil {
-		return fmt.Errorf("rollback restored binary but restart failed: %w", err)
+		return fmt.Errorf("rollback restored binary but restart failed (state restart_pending): %w", err)
+	}
+	if err := markRestarted(opt.dataDir); err != nil {
+		return err
 	}
 	fmt.Printf("[reach] update was not confirmed; rollback complete\n")
 	return nil
@@ -811,6 +848,20 @@ func resumeInterruptedUpdate(ctx context.Context, st reachInstallState, logf fun
 		return
 	}
 	if ust.terminal() {
+		return
+	}
+	if ust.State == updRestartPending {
+		// The binary was restored but the agent never restarted on it. If
+		// we are that restored binary, the rollback is complete.
+		if fileMatches(ust.AgentPath, ust.BackupSHA256) && embeddedVersionIsNot(ust.CandidateVersion) {
+			if err := markRestarted(st.DataDir); err != nil {
+				logf("could not finish rollback: %v", err)
+			}
+			return
+		}
+		if err := restartReachAgent(ctx, st); err != nil {
+			logf("restart after rollback failed: %v", err)
+		}
 		return
 	}
 	remaining := time.Until(ust.deadline())
@@ -832,6 +883,19 @@ func resumeInterruptedUpdate(ctx context.Context, st reachInstallState, logf fun
 			logf("restart after rollback failed: %v", err)
 		}
 	}
+}
+
+// embeddedVersionIsNot: this running binary is not the given candidate.
+func embeddedVersionIsNot(candidate string) bool {
+	return candidate == "" || version != candidate
+}
+
+func randomAttemptID() (string, error) {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }
 
 // runLegacyRollbackWatcher handles a watcher started by an older agent
@@ -871,6 +935,11 @@ func restoreBinary(backupPath, agentPath string) error {
 // floor, through the durable state machine (update_state.go). If the floor
 // cannot be recorded the update stays pending and the rollback armed.
 func confirmUpdate(st reachInstallState) error {
+	// A flag file means an older agent started the update in progress; it
+	// wins over a leftover terminal state from an earlier update (R3-07).
+	if _, err := os.Stat(filepath.Join(st.DataDir, "update-confirm-required")); err == nil {
+		return confirmLegacyFlag(st)
+	}
 	handled, err := confirmUpdateState(st.DataDir)
 	if err != nil {
 		return err

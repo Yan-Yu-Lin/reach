@@ -251,6 +251,9 @@ type UpdateHint struct {
 }
 
 type Daemon struct {
+	// keysMu serialises every read-modify-write of authorized_keys
+	// (sync_keys and the update-confirm probe key; daybreak round 4 P2-04).
+	keysMu            sync.Mutex
 	cfg               Config
 	logger            *log.Logger
 	mu                sync.Mutex
@@ -1250,6 +1253,8 @@ func (d *Daemon) syncKeys(keys []DesiredPubkey, enabled bool) error {
 	if auth == "" {
 		return nil
 	}
+	d.keysMu.Lock()
+	defer d.keysMu.Unlock()
 	var candidates []string
 	desired := 0
 	if enabled {
