@@ -30,6 +30,14 @@ data: {"machine_id":"m_abc123","heartbeat_at":"2026-11-21T03:04:05Z","observed_s
   A revoked or expired session's stream is closed without further data; the
   next reconnect gets 401, and the client should go to login.
 
+## Stream limits
+
+reachd allows at most 64 open streams, 8 per client IP and 8 per admin
+login. A `mac-agent` service token holds one stream: opening a new one
+closes the previous one. Over a limit the request gets HTTP 429. A replay
+larger than 5000 events or 4 MiB returns `machine.resync_required`
+(`replay_overflow`).
+
 ## Two kinds of events
 
 ### Durable events (have `id:`)

@@ -42,6 +42,7 @@ type Server struct {
 	// revocations wakes open SSE streams so they re-authenticate at once
 	// after logout, revoke-all or service-token revocation (astra F01).
 	revocations *revocationNotifier
+	streams     *streamLimiter
 }
 
 const (
@@ -51,6 +52,9 @@ const (
 	agentPerMachinePerMinute     = 60
 	uninstallPerIPPerMinute      = 20
 	maxHeartbeatCommandResults   = 32
+	maxEventStreams              = 64
+	maxEventStreamsPerIP         = 8
+	maxEventStreamsPerCred       = 8
 	badAuthPerIPObjectPerMinute  = 10
 	uninstallPerMachinePerMinute = 10
 	maxHeartbeatBodyBytes        = 128 << 10
@@ -70,6 +74,7 @@ func NewServer(cfg Config, store *Store, prov *Provisioner) *Server {
 		uninstallMach: newRateLimiter(uninstallPerMachinePerMinute, time.Minute),
 		argon:         defaultArgonGate,
 		revocations:   newRevocationNotifier(),
+		streams:       newStreamLimiter(maxEventStreams, maxEventStreamsPerIP, maxEventStreamsPerCred),
 	}
 	if prov != nil {
 		prov.argon = s.argon
@@ -859,6 +864,22 @@ func (s *Server) handleAdminEvents(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "streaming unsupported")
 		return
 	}
+	// Bound open streams globally, per client IP and per credential
+	// (daybreak P2-12). A mac-agent service token gets one stream: a new
+	// connection replaces the old one instead of piling up.
+	claims := claimsFrom(r.Context())
+	credKey := ""
+	if claims != nil {
+		credKey = authKindFrom(r.Context()) + "|" + claims.UserID
+	}
+	single := claims != nil && claims.Role == "mac-agent"
+	streamCtx, release, ok := s.streams.acquire(r.Context(), clientIP(r), credKey, single)
+	if !ok {
+		writeErr(w, http.StatusTooManyRequests, "too many event streams")
+		return
+	}
+	defer release()
+	r = r.WithContext(streamCtx)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache, no-transform")
 	w.Header().Set("Connection", "keep-alive")

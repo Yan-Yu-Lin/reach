@@ -21,6 +21,9 @@ const (
 	// eventReplayMaxEvents bounds memory for one replay; exceeding it still
 	// forces a resnapshot.
 	eventReplayMaxEvents = 5000
+	// eventReplayMaxBytes bounds the encoded payload held for one replay
+	// (daybreak P2-12); exceeding it forces a resnapshot like the count cap.
+	eventReplayMaxBytes = 4 << 20
 	eventPublishTimeout  = 3 * time.Second
 )
 
@@ -201,12 +204,17 @@ func (b *eventBroker) replayRange(ctx context.Context, lastID, throughID int64, 
 	}
 	defer rows.Close()
 	var out []ReachEvent
+	total := 0
 	for rows.Next() {
 		var id int64
 		var typ, payload, created string
 		var machineID sql.NullString
 		if err := rows.Scan(&id, &typ, &machineID, &payload, &created); err != nil {
 			return nil, false, err
+		}
+		total += len(payload) + len(typ) + 32
+		if total > eventReplayMaxBytes {
+			return nil, true, nil
 		}
 		data := map[string]any{}
 		_ = json.Unmarshal([]byte(payload), &data)

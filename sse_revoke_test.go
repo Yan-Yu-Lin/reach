@@ -154,3 +154,69 @@ func TestLogoutClosesOwnStreamButNotOthers(t *testing.T) {
 		}
 	}
 }
+
+// Daybreak P2-12: one mac-agent token holds at most one stream; a new
+// connection replaces the old one.
+func TestMacAgentTokenGetsOneStream(t *testing.T) {
+	server, store, _ := newReliabilityTestServer(t)
+	ts := httptest.NewServer(server)
+	t.Cleanup(ts.Close)
+	if _, err := store.db.Exec(`INSERT INTO service_tokens (id,label,token_hash,role,created_at) VALUES ('stkn_one','mac',?,'mac-agent',?)`, TokenHash("sat_one"), nowUTC()); err != nil {
+		t.Fatal(err)
+	}
+	_, firstDone := openStream(t, ts, "sat_one")
+	secondLines, _ := openStream(t, ts, "sat_one")
+	select {
+	case <-firstDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("older mac-agent stream was not replaced")
+	}
+	server.events.PublishLive("agent.heartbeat", "m_x", map[string]any{"machine_id": "m_x"})
+	timeout := time.After(2 * time.Second)
+	for {
+		select {
+		case l := <-secondLines:
+			if l == "event: agent.heartbeat" {
+				return
+			}
+		case <-timeout:
+			t.Fatal("replacement stream did not receive events")
+		}
+	}
+}
+
+func TestEventStreamsArePerIPCapped(t *testing.T) {
+	server, store, cfg := newReliabilityTestServer(t)
+	server.streams = newStreamLimiter(64, 2, 64)
+	ts := httptest.NewServer(server)
+	t.Cleanup(ts.Close)
+	tok, _ := adminTestToken(t, store, cfg)
+	openStream(t, ts, tok)
+	openStream(t, ts, tok)
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/admin/events", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("third stream from one IP = %d", resp.StatusCode)
+	}
+}
+
+func TestReplayByteCapForcesResnapshot(t *testing.T) {
+	server, store, _ := newReliabilityTestServer(t)
+	big := `{"x":"` + strings.Repeat("a", 64*1024) + `"}`
+	tx, _ := store.db.Begin()
+	for i := 0; i < (eventReplayMaxBytes/(64*1024))+5; i++ {
+		if _, err := tx.Exec(`INSERT INTO events (type,payload_json,created_at) VALUES ('big',?,?)`, big, nowUTC()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = tx.Commit()
+	_, overflow, err := server.events.ReplayRange(context.Background(), 0, 1<<40, eventReplayMaxEvents)
+	if err != nil || !overflow {
+		t.Fatalf("byte cap not enforced: overflow=%v err=%v", overflow, err)
+	}
+}
