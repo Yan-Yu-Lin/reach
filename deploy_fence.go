@@ -289,6 +289,11 @@ func recordFenceAndSnapshot(ctx context.Context, dbPath, fencePath, snapshotPath
 		return err
 	}
 	defer lock.Close()
+	return recordFenceAndSnapshotLocked(ctx, dbPath, fencePath, snapshotPath)
+}
+
+// recordFenceAndSnapshotLocked: the caller holds the writers lock.
+func recordFenceAndSnapshotLocked(ctx context.Context, dbPath, fencePath, snapshotPath string) error {
 	store, err := OpenStore(dbPath)
 	if err != nil {
 		return err
@@ -319,15 +324,8 @@ func recordFenceAndSnapshot(ctx context.Context, dbPath, fencePath, snapshotPath
 	if err := os.Chmod(snapshotPath, 0o600); err != nil {
 		return err
 	}
-	// Plain open: no WAL pragma, so the snapshot file stays self-contained.
-	snap, err := sql.Open("sqlite", snapshotPath)
-	if err != nil {
-		return err
-	}
-	defer snap.Close()
-	var res string
-	if err := snap.QueryRowContext(ctx, `PRAGMA quick_check`).Scan(&res); err != nil || res != "ok" {
-		return fmt.Errorf("snapshot quick_check: %q %v", res, err)
+	if err := quickCheck(ctx, snapshotPath); err != nil {
+		return fmt.Errorf("snapshot quick_check: %v", err)
 	}
 	return nil
 }
@@ -347,3 +345,7 @@ func writeSyncedFile(path string, data []byte, mode os.FileMode) error {
 	}
 	return f.Close()
 }
+
+// openPlainSQLite opens a file without the WAL pragma (snapshots stay
+// self-contained).
+func openPlainSQLite(path string) (*sql.DB, error) { return sql.Open("sqlite", path) }

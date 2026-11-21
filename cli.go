@@ -39,6 +39,10 @@ func runCLI(ctx context.Context, args []string) error {
 		return cliDBCheck(ctx, args[1:])
 	case "deploy-fence":
 		return cliDeployFence(ctx, args[1:])
+	case "deploy-prepare":
+		return cliDeployPrepare(ctx, args[1:])
+	case "deploy-restore":
+		return cliDeployRestore(ctx, args[1:])
 	case "rotate-jwt-secret":
 		return cliRotateJWTSecret(ctx, args[1:])
 	case "admin-probe-token":
@@ -344,6 +348,8 @@ Usage:
   reachd db-check [--config /etc/reach/config.yaml]
   reachd deploy-fence record|check --config /etc/reach/config.yaml --fence FILE
   reachd admin-probe-token [--config /etc/reach/config.yaml]
+  reachd deploy-prepare --config C --fence F --snapshot S
+  reachd deploy-restore --config C --fence F --snapshot S --forensic DIR
   reachd rotate-jwt-secret [--config /etc/reach/config.yaml] [--if-session-migration-pending]
   printf 'secret' | reachd hash-secret`)
 }

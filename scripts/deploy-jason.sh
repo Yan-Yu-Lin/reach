@@ -308,48 +308,8 @@ install_new_reachd() {
   rm -f /tmp/reachd-build
 }
 
-# preserve_failed_database DIR: copy the failed main DB, WAL and SHM into a
-# staging directory, verify every copy, then publish it as DIR. Any failure
-# returns non-zero and the caller must not overwrite the live database
-# (astra R2-05).
-preserve_failed_database() {
-  local dir="$1" stage="$1.staging" f
-  echo "[deploy] preserving failed database files in $dir" >&2
-  if sudo test -e "$dir" || sudo test -e "$stage"; then
-    echo "[deploy] ERROR: forensic directory $dir already exists" >&2
-    return 1
-  fi
-  sudo install -d -m 0700 "$stage" || return 1
-  for f in "$DB_PATH" "$DB_PATH-wal" "$DB_PATH-shm"; do
-    if sudo test -e "$f"; then
-      sudo cp -a "$f" "$stage/" || { echo "[deploy] ERROR: could not copy $f" >&2; return 1; }
-      sudo cmp -s "$f" "$stage/$(basename "$f")" || { echo "[deploy] ERROR: copy of $f does not match" >&2; return 1; }
-    fi
-  done
-  sudo test -s "$stage/$(basename "$DB_PATH")" || { echo "[deploy] ERROR: failed main database was not preserved" >&2; return 1; }
-  sudo mv "$stage" "$dir" || return 1
-  sudo test -d "$dir"
-}
-
-# restore_database_snapshot: replace the live DB with the pre-deploy
-# snapshot. Only called with reachd verifiably stopped and the failed set
-# preserved. Every step is checked; set -e is off inside rollback.
-restore_database_snapshot() {
-  echo "[deploy] restoring pre-deploy database snapshot $DB_BACKUP_PATH" >&2
-  sudo cp -a "$DB_BACKUP_PATH" "$DB_PATH.rollback-candidate" || return 1
-  if [ "$(sudo sqlite3 "$DB_PATH.rollback-candidate" 'PRAGMA quick_check;')" != "ok" ]; then
-    echo "[deploy] ERROR: snapshot failed quick_check; not restoring" >&2
-    return 1
-  fi
-  # A stale WAL would be replayed onto the snapshot; it is in the failed set.
-  sudo rm -f "$DB_PATH-wal" "$DB_PATH-shm" || return 1
-  if sudo test -e "$DB_PATH-wal" || sudo test -e "$DB_PATH-shm"; then
-    echo "[deploy] ERROR: could not remove the live WAL/SHM" >&2
-    return 1
-  fi
-  sudo mv -f "$DB_PATH.rollback-candidate" "$DB_PATH" || return 1
-  sudo cmp -s "$DB_BACKUP_PATH" "$DB_PATH"
-}
+# The forensic copy, fence check and snapshot restore are done by
+# "reachd deploy-restore" under the writers lock (deploy_txn.go).
 
 # restore_previous_reachd_binary: copy (never move) the rollback backup back
 # to /opt/reach/reachd and verify it.
@@ -592,17 +552,14 @@ rollback_reachd() {
       # the durable action journal shows no durable action or open
       # OS intent since the fence (daybreak P1-A). The check runs with the
       # private probe copy of the new binary, which knows the journal.
-      if ! preserve_failed_database "$failed_db_dir"; then
-        echo "[deploy] ERROR: failed database set could not be preserved; NOT restoring the database automatically" >&2
-        db_restore_ok=0
-      elif [ -z "$DEPLOY_FENCE" ] || [ -z "$PROBE_BIN" ] || ! sudo test -x "$PROBE_BIN"; then
+      # One process, holding the writers lock exclusively, does the
+      # forensic copy, the fence check and the restore: no CLI writer can
+      # commit between the check and the restore (astra R4-01).
+      if [ -z "$DEPLOY_FENCE" ] || [ -z "$PROBE_BIN" ] || ! sudo test -x "$PROBE_BIN"; then
         echo "[deploy] ERROR: no deploy fence or fence checker; NOT restoring the database automatically" >&2
         db_restore_ok=0
-      elif ! sudo "$PROBE_BIN" deploy-fence check --config /etc/reach/config.yaml --fence "$DEPLOY_FENCE" >&2; then
-        echo "[deploy] ERROR: durable actions after the deploy fence (or the check failed); NOT restoring the database automatically" >&2
-        db_restore_ok=0
-      elif ! restore_database_snapshot; then
-        echo "[deploy] ERROR: snapshot restore failed" >&2
+      elif ! sudo "$PROBE_BIN" deploy-restore --config /etc/reach/config.yaml --fence "$DEPLOY_FENCE" --snapshot "$DB_BACKUP_PATH" --forensic "$failed_db_dir" >&2; then
+        echo "[deploy] ERROR: database NOT restored automatically (durable actions after the fence, a writer holds the lock, or a restore step failed)" >&2
         db_restore_ok=0
       fi
     fi
@@ -973,7 +930,11 @@ fi
 # P1-02, astra R3-03). A write slipping in between would be in the snapshot
 # AND above the fence, so a rollback would refuse to restore: never lost.
 DEPLOY_FENCE="${DB_BACKUP_DIR}/deploy-fence.${DEPLOY_TS}.json"
-sudo /tmp/reachd-build deploy-fence record --config /etc/reach/config.yaml --fence "$DEPLOY_FENCE" --snapshot "$DB_BACKUP_PATH"
+sudo cp -a /etc/reach/config.yaml "/var/lib/reach/deploy-backups/config.yaml.${DEPLOY_TS}"
+# One locked process: clear retired tokens, fence, snapshot, and rotate
+# jwt_secret if the session migration is still pending, all under the
+# exclusive writers lock (astra R4-01, daybreak round 5 N6).
+sudo /tmp/reachd-build deploy-prepare --config /etc/reach/config.yaml --fence "$DEPLOY_FENCE" --snapshot "$DB_BACKUP_PATH"
 if [ "$(sudo sqlite3 "$DB_BACKUP_PATH" 'PRAGMA quick_check;')" != "ok" ]; then
   echo "[deploy] ERROR: backup database failed PRAGMA quick_check" >&2
   false
@@ -990,13 +951,9 @@ fi
 
 install_new_reachd
 
-# The new binary's first start invalidates pre-upgrade admin JWTs through a
-# DB migration, which a snapshot restore would undo. Rotate jwt_secret
-# instead (only while that migration is still pending): config.yaml is not
-# part of the rollback, so the restored old binary keeps the new secret and
-# old JWTs stay invalid (daybreak round 4 P1-03). Everyone logs in again.
-sudo cp -a /etc/reach/config.yaml "/var/lib/reach/deploy-backups/config.yaml.${DEPLOY_TS}"
-sudo "$PROBE_BIN" rotate-jwt-secret --config /etc/reach/config.yaml --if-session-migration-pending
+# jwt_secret was rotated by deploy-prepare (when the session migration is
+# still pending): config.yaml is not part of the rollback, so pre-upgrade
+# JWTs stay invalid even after a snapshot restore (daybreak round 4 P1-03).
 
 DB_MAY_HAVE_MIGRATED=1
 sudo systemctl start reachd

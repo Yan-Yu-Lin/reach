@@ -29,7 +29,32 @@ import (
 
 var lockNameRE = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,80}$`)
 
+// canonicalDBPath resolves dbPath to the absolute path of the real file
+// (symlinks resolved), so every process that opens the same database uses
+// the same SQLite file AND the same lock directory (astra R4-03). A path
+// whose final component is a symlink is refused: it is an alias that one
+// process could resolve and another not.
+func canonicalDBPath(dbPath string) (string, error) {
+	abs, err := filepath.Abs(dbPath)
+	if err != nil {
+		return "", err
+	}
+	if st, err := os.Lstat(abs); err == nil && st.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("database path %s is a symlink; configure the real file path", abs)
+	} else if err != nil && !os.IsNotExist(err) {
+		return "", err
+	}
+	dir, err := filepath.EvalSymlinks(filepath.Dir(abs))
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, filepath.Base(abs)), nil
+}
+
 func lockDir(dbPath string) string {
+	if c, err := canonicalDBPath(dbPath); err == nil {
+		dbPath = c
+	}
 	return filepath.Join(filepath.Dir(dbPath), "locks")
 }
 
@@ -37,11 +62,10 @@ func openLockFile(dbPath, name string) (*os.File, error) {
 	if !lockNameRE.MatchString(name) {
 		return nil, fmt.Errorf("invalid lock name %q", name)
 	}
-	dir := lockDir(dbPath)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if _, err := canonicalDBPath(dbPath); err != nil {
 		return nil, err
 	}
-	return os.OpenFile(filepath.Join(dir, name+".lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	return openLockFileSafe(lockDir(dbPath), name+".lock")
 }
 
 // errWritersLocked: a deployment holds the writers lock.

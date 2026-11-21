@@ -26,6 +26,16 @@ func OpenStore(path string) (*Store, error) {
 	if strings.Contains(path, "?") {
 		return nil, fmt.Errorf("sqlite database path must not contain '?'")
 	}
+	// The same canonical path for SQLite and for the lock files (astra
+	// R4-03).
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+		return nil, err
+	}
+	canon, err := canonicalDBPath(path)
+	if err != nil {
+		return nil, err
+	}
+	path = canon
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return nil, err
 	}

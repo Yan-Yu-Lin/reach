@@ -150,6 +150,9 @@ func TestMachineLockAcrossProcesses(t *testing.T) {
 		t.Fatal(err)
 	}
 	lf := filepath.Join(lockDir(db), "machine-m_x.lock")
+	if err := os.WriteFile(lf, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	cmd := exec.Command("flock", "-x", lf, "sleep", "1")
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)

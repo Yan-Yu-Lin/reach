@@ -36,6 +36,11 @@ var jwtSecretLineRE = regexp.MustCompile(`(?m)^jwt_secret:[^\n]*$`)
 // atomically, keeping mode and owner. The file must contain exactly one
 // top-level jwt_secret line.
 func rotateJWTSecret(path string) error {
+	// Only a private regular file with one link (not a symlink, not a
+	// hard-linked or group-writable file) is rewritten (daybreak N7).
+	if _, err := checkPrivateRegularFile(path); err != nil {
+		return fmt.Errorf("refusing to rewrite config: %w", err)
+	}
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return err
@@ -81,11 +86,7 @@ func rotateJWTSecret(path string) error {
 		cleanup()
 		return err
 	}
-	if d, err := os.Open(filepath.Dir(path)); err == nil {
-		_ = d.Sync()
-		_ = d.Close()
-	}
-	return nil
+	return syncDirPath(filepath.Dir(path))
 }
 
 func sessionMigrationApplied(ctx context.Context, db *sql.DB) (bool, error) {

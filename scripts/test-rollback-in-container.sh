@@ -24,6 +24,9 @@
 #   H. the restored carrier fails to start -> rollback_incomplete, never
 #      reported as success (daybreak round 4 P1-04); H2: the env file
 #      cannot be restored -> carrier stays stopped (astra R3-04).
+#   L. a CLI writer runs while the rollback restores the DB: it is refused
+#      (writers lock held by deploy-restore), nothing it wrote is lost
+#      (astra R4-01).
 #   I. fuser is missing -> cannot prove nobody holds the DB -> stopped,
 #      DB untouched (astra R3-03).
 #   J. another SQLite client holds the DB -> stopped, DB untouched.
@@ -44,7 +47,7 @@ cp -R "$repo/scripts" "$work/scripts"
 cat > "$work/run.sh" <<'EOS'
 #!/usr/bin/env bash
 set -Eeuo pipefail
-apt-get -qq update >/dev/null && apt-get -qq install -y sqlite3 curl python3 sudo procps psmisc >/dev/null
+apt-get -qq update >/dev/null && apt-get -qq install -y sqlite3 curl python3 sudo procps psmisc util-linux >/dev/null
 # Work on the container's own filesystem: SQLite locking is unreliable on
 # the bind-mounted host volume.
 cp -R /w /work
@@ -77,8 +80,9 @@ printf '#!/bin/bash\nexit 0\n' > /usr/local/bin/journalctl; chmod +x /usr/local/
 # sudo wrapper: fails copies into the forensic set when asked (scenario E).
 cat > /usr/local/bin/sudo <<'EOF'
 #!/bin/bash
-if [ -e /tmp/fail-forensic ] && [ "$1" = cp ]; then
-  case "$*" in */backups/failed.*) echo forced-forensic-copy-failure >&2; exit 70 ;; esac
+if [ -e /tmp/pause-restore ] && [ "$2" = deploy-restore ]; then
+  # Hold the real deploy-restore still while it owns the writers lock.
+  exec /usr/bin/sudo REACH_TEST_LOCK_PAUSE=/tmp/lockpause "$@"
 fi
 if [ -e /tmp/fail-env-restore ] && [ "$1" = install ]; then
   case "$*" in *ws-carrier.env.rollback-candidate*) echo forced-env-restore-failure >&2; exit 70 ;; esac
@@ -129,18 +133,16 @@ scenario() { # name kind
   stop_reachd_verified || fail "$1: initial stop"
   DB_BACKUP_DIR=/var/lib/reach/backups; DB_BACKUP_PATH=$DB_BACKUP_DIR/reach.db.$DEPLOY_TS
   cp $W/reachd-new /tmp/reachd-build
-  # As deploy-jason.sh: fence first, then the snapshot, under the writers lock.
-  DEPLOY_FENCE=$DB_BACKUP_DIR/deploy-fence.$DEPLOY_TS.json
-  /tmp/reachd-build deploy-fence record --config /etc/reach/config.yaml --fence $DEPLOY_FENCE --snapshot "$DB_BACKUP_PATH"
-  bash scripts/rehearse-rollback.sh /opt/reach/reachd /tmp/reachd-build "$DB_BACKUP_PATH" /etc/reach/config.yaml | tail -1
-  # A pre-deploy admin JWT, signed by the old binary with the old secret.
-  # (8c74086 has no admin-probe-token; the new binary signs with the same
-  # still-unrotated secret.)
+  # A pre-deploy admin JWT, signed with the old secret. (8c74086 has no
+  # admin-probe-token; the new binary signs with the same, still
+  # unrotated, secret.)
   pre_jwt="$($W/reachd-new admin-probe-token --config /etc/reach/config.yaml)"
+  # As deploy-jason.sh: one locked process does fence, snapshot and the
+  # jwt_secret rotation (astra R4-01, daybreak round 5 N6).
+  DEPLOY_FENCE=$DB_BACKUP_DIR/deploy-fence.$DEPLOY_TS.json
+  /tmp/reachd-build deploy-prepare --config /etc/reach/config.yaml --fence $DEPLOY_FENCE --snapshot "$DB_BACKUP_PATH" >/dev/null
+  bash scripts/rehearse-rollback.sh /opt/reach/reachd /tmp/reachd-build "$DB_BACKUP_PATH" /etc/reach/config.yaml | tail -1
   install_new_reachd
-  # As deploy-jason.sh: rotate jwt_secret while the session migration is
-  # still pending (daybreak round 4 P1-03).
-  "$PROBE_BIN" rotate-jwt-secret --config /etc/reach/config.yaml --if-session-migration-pending >/dev/null
   [ "$PROBE_BIN" = /var/lib/reach/deploy-backups/reachd-probe.$DEPLOY_TS ] || fail "$1: unexpected PROBE_BIN $PROBE_BIN"
   [ ! -e /tmp/reachd-build ] || fail "$1: build binary not consumed"
   DB_MAY_HAVE_MIGRATED=1
@@ -154,7 +156,12 @@ scenario() { # name kind
       echo "operator disable on new version: $(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:9300/api/admin/machines/m_legacy/disable -H "Authorization: Bearer $adm")" ;;
     noprobe) /usr/bin/rm -f "$PROBE_BIN" ;;
     stopfail) touch /tmp/fail-stop ;;
-    forensic) touch /tmp/fail-forensic ;;
+    forensic) mkdir -p "$DB_BACKUP_DIR/failed.$DEPLOY_TS.staging" ;;   # the forensic copy cannot be staged
+    latecli)
+      # L (astra R4-01): a CLI writer tries to commit while the rollback
+      # holds the writers lock. A sudo wrapper pauses deploy-restore
+      # right after it started (it holds the lock from its first step).
+      mkdir -p /tmp/lockpause; /usr/bin/rm -f /tmp/lockpause/*; touch /tmp/pause-restore ;;
     nofuser) mv /usr/bin/fuser /usr/bin/fuser.off ;;
     holder)
       # Another SQLite client keeps the DB open (a CLI, a backup script).
@@ -168,7 +175,22 @@ scenario() { # name kind
 
   # --- a later deploy step fails: run the real rollback --------------------
   set +e
-  out="$( ( ROLLBACK_EXIT_CODE=1 rollback_reachd ) 2>&1 )"
+  if [ "$2" = latecli ]; then
+    ( ROLLBACK_EXIT_CODE=1 rollback_reachd ) > /tmp/rollback.out 2>&1 &
+    rbpid=$!
+    for _ in $(seq 1 300); do [ -e /tmp/lockpause/holding ] && break; sleep 0.05; done
+    [ -e /tmp/lockpause/holding ] || { cat /tmp/rollback.out; fail "L: deploy-restore never took the lock"; }
+    printf '%s\n' 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl late' > /tmp/late.pub
+    $W/reachd-new create --config /etc/reach/config.yaml --no-provision --slug late-cli --pubkey /tmp/late.pub >/tmp/late.out 2>&1
+    late_rc=$?
+    touch /tmp/lockpause/release
+    wait $rbpid
+    out="$(cat /tmp/rollback.out)"
+    late_count="$(sqlite3 $DB_PATH "SELECT COUNT(*) FROM machines WHERE slug='late-cli'")"
+    /usr/bin/rm -f /tmp/pause-restore /tmp/lockpause/*
+  else
+    out="$( ( ROLLBACK_EXIT_CODE=1 rollback_reachd ) 2>&1 )"
+  fi
   set -e
   printf '%s\n' "$out" | grep -E 'restoring|NOT|operator|durable|could not|ready|missing|ERROR: (systemctl|reachd)' | head -6 || true
   if systemctl is-active --quiet reachd; then result="running/$(heartbeat)"; else result="stopped"; fi
@@ -186,6 +208,11 @@ scenario() { # name kind
       [ -f /opt/reach/reachd.rollback.$DEPLOY_TS ] || fail "A: rollback backup was consumed"
       [ "$claimed" = 1 ] || fail "A: success not reported"
       [ -s $DB_BACKUP_DIR/failed.$DEPLOY_TS/reach.db ] || fail "A: forensic set missing" ;;
+    latecli)
+      [ "$late_rc" != 0 ] || { cat /tmp/rollback.out /tmp/late.out; fail "L: CLI write succeeded during the locked restore"; }
+      [ "$late_count" = 0 ] || fail "L: CLI write landed during the locked restore"
+      [ "$result" = running/200 ] || fail "L: expected the restored old reachd running"
+      echo "L: CLI during locked restore: rc=$late_rc (refused), machine rows=$late_count" ;;
     durable|auditfail|noprobe|forensic|nofuser|holder)
       [ "$result" = stopped ] || fail "$1: expected reachd left stopped"
       [ "$claimed" = 0 ] || fail "$1: rollback claimed success"
@@ -261,12 +288,13 @@ echo "== C: probe/fence binary missing ==";          scenario C noprobe
 echo "== D: systemctl stop fails ==";                scenario D stopfail
 echo "== E: forensic copy fails ==";                 scenario E forensic
 echo "== F: revoke-all while audit inserts fail =="; scenario F auditfail
+echo "== L: CLI write during the locked restore ==";  scenario L latecli
 echo "== I: fuser missing ==";                       scenario I nofuser
 echo "== J: another process holds the DB ==";        scenario J holder
 echo "== G: carrier rollback ==";                   carrier_case G 1 none; carrier_case G0 0 none
 echo "== H: previous carrier fails to start ==";      carrier_case H 1 start
 echo "== H2: carrier env restore fails ==";          carrier_case H2 1 env
-echo "PASS: rollback scenarios A-K"
+echo "PASS: rollback scenarios A-L"
 EOS
 chmod +x "$work/run.sh"
 docker run --rm -v "$work:/w" ubuntu:24.04 bash /w/run.sh
