@@ -256,7 +256,23 @@ func (s *Server) publishEvent(ctx context.Context, typ, machineID string, data m
 	}
 }
 
+// enrollmentFrozenMsg is returned by every enrollment step while
+// enrollment_frozen is set (daybreak round 6 R6-P1-02).
+const enrollmentFrozenMsg = "enrollment is frozen on this hub; no machines can be added right now"
+
+func (s *Server) refuseIfFrozen(w http.ResponseWriter) bool {
+	if !s.cfg.EnrollmentFrozen {
+		return false
+	}
+	w.Header().Set("Retry-After", "86400")
+	writeErr(w, http.StatusServiceUnavailable, enrollmentFrozenMsg)
+	return true
+}
+
 func (s *Server) handleClientRegister(w http.ResponseWriter, r *http.Request) {
+	if s.refuseIfFrozen(w) {
+		return
+	}
 	ip := clientIP(r)
 	if !s.registerL.allow(ip) {
 		writeErr(w, 429, "rate limit exceeded")
@@ -619,6 +635,9 @@ func (s *Server) handleClientPoll(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleClientProvision(w http.ResponseWriter, r *http.Request) {
+	if s.refuseIfFrozen(w) {
+		return
+	}
 	var req struct {
 		SetupToken  string `json:"setup_token"`
 		RequestID   string `json:"request_id"`
@@ -1702,6 +1721,9 @@ func (s *Server) handleAdminRequestAction(w http.ResponseWriter, r *http.Request
 	now := nowUTC()
 	switch action {
 	case "approve":
+		if s.refuseIfFrozen(w) {
+			return
+		}
 		// An expired request cannot be approved even before maintenance
 		// marks it (daybreak P2-4).
 		err := s.store.durableTx(r.Context(), "request.approve", "", claims.Username, func(tx *sql.Tx) error {

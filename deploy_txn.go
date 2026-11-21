@@ -54,8 +54,18 @@ func cliDeployPrepare(ctx context.Context, args []string) error {
 		return err
 	}
 	defer lock.Close()
+	// Re-verify the provisioning freeze now that reachd is stopped and the
+	// lock is held, before fence and snapshot (daybreak round 6 R6-P1-02).
+	if err := checkFrozenAt(ctx, cfg.DBPath); err != nil {
+		return err
+	}
 	if err := recordFenceAndSnapshotLocked(ctx, cfg.DBPath, *fencePath, *snapshotPath); err != nil {
 		return err
+	}
+	// And the snapshot itself, so nothing that slipped in through a writer
+	// that does not take the lock (an older CLI) ends up in it unnoticed.
+	if err := checkFrozenAt(ctx, *snapshotPath); err != nil {
+		return fmt.Errorf("snapshot: %w", err)
 	}
 	// Rotate jwt_secret on every deploy, unconditionally, while reachd is
 	// stopped and the lock is held (daybreak round 6 R6-P1-03). Whether
@@ -70,6 +80,15 @@ func cliDeployPrepare(ctx context.Context, args []string) error {
 	}
 	fmt.Println("deploy-prepare: fence and snapshot written; jwt_secret rotated (every admin must log in again)")
 	return nil
+}
+
+func checkFrozenAt(ctx context.Context, path string) error {
+	db, err := openPlainSQLite(path)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	return checkProvisioningFrozen(ctx, db)
 }
 
 // errRestoreRefused: the restore was not done; the live DB is untouched.

@@ -86,7 +86,13 @@ func (p *Provisioner) ops() tunnelOS {
 	return p.osOps
 }
 
+// errEnrollmentFrozen: enrollment_frozen is set (daybreak round 6 R6-P1-02).
+var errEnrollmentFrozen = errors.New("enrollment is frozen (enrollment_frozen: true)")
+
 func (p *Provisioner) CreateMachine(ctx context.Context, in CreateMachineInput) (CreateMachineResult, error) {
+	if p.cfg.EnrollmentFrozen {
+		return CreateMachineResult{}, errEnrollmentFrozen
+	}
 	if err := ValidateSlug(in.Slug); err != nil {
 		return CreateMachineResult{}, err
 	}
