@@ -232,19 +232,60 @@ func (p *Provisioner) CreateMachine(ctx context.Context, in CreateMachineInput) 
 	return res, nil
 }
 
-// compensateProvision removes the hub account a provision created after its
-// final DB update lost, and records the outcome. The tunnel row stays
-// non-retired, so the allocator keeps its port.
+// compensateProvision runs when a provision's final update lost to a
+// writer that did not take the machine lock. It removes the hub account
+// this provision created and checks for residue. If the hub is not
+// provably clean, the database must say so whatever the other writer
+// recorded (astra R4-02): in one transaction the machine becomes
+// retiring/cleanup_failed with its token revoked, and the tunnel row gets
+// its original user and port back as a cleanup_failed tombstone (so the
+// allocator keeps the port) with cleanup_verified_at cleared. If the port
+// was handed to another machine meanwhile, the conflict is recorded for
+// an operator instead of overwriting the new owner.
 func (p *Provisioner) compensateProvision(ctx context.Context, machineID, tunnelID, unixUser string) {
+	clean := true
 	msg := "provision lost a concurrent change; hub account removed"
 	if err := p.ops().Remove(ctx, unixUser); err != nil {
+		clean = false
 		msg = "provision lost a concurrent change; removing the hub account failed: " + err.Error()
 	} else if residue, err := p.ops().Residue(ctx, unixUser); err != nil || len(residue) > 0 {
+		clean = false
 		msg = fmt.Sprintf("provision lost a concurrent change; hub residue remains: %v %v", residue, err)
 	}
-	_, _ = p.store.db.ExecContext(ctx, `UPDATE tunnels SET status='cleanup_failed' WHERE id=? AND status<>'retired'`, tunnelID)
-	_, _ = p.store.db.ExecContext(ctx, `UPDATE machines SET provision_error=?, updated_at=? WHERE id=?`, msg, nowUTC(), machineID)
-	p.store.Audit(ctx, "machine.provision_compensated", "system", machineID, msg)
+	if clean {
+		if _, err := p.store.db.ExecContext(ctx, `UPDATE machines SET provision_error=?, updated_at=? WHERE id=?`, msg, nowUTC(), machineID); err != nil {
+			log.Printf("record provision compensation for %s: %v", machineID, err)
+		}
+		p.store.Audit(ctx, "machine.provision_compensated", "system", machineID, msg)
+		return
+	}
+	err := p.inTx(ctx, func(tx *sql.Tx) error {
+		var hubID, origUser string
+		var origPort int
+		if err := tx.QueryRowContext(ctx, `SELECT hub_id,COALESCE(original_unix_user,unix_user),COALESCE(NULLIF(original_remote_port,0),remote_port) FROM tunnels WHERE id=?`, tunnelID).Scan(&hubID, &origUser, &origPort); err != nil {
+			return err
+		}
+		var other int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM tunnels WHERE id<>? AND status<>'retired' AND remote_port=?`, tunnelID, origPort).Scan(&other); err != nil {
+			return err
+		}
+		if other > 0 {
+			msg += fmt.Sprintf("; port %d now belongs to another machine: resolve by hand", origPort)
+			if _, err := tx.ExecContext(ctx, `UPDATE tunnels SET status='cleanup_failed', cleanup_verified_at=NULL WHERE id=?`, tunnelID); err != nil {
+				return err
+			}
+		} else if _, err := tx.ExecContext(ctx, `UPDATE tunnels SET status='cleanup_failed', unix_user=?, remote_port=?, cleanup_verified_at=NULL WHERE id=?`, origUser, origPort, tunnelID); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, `UPDATE machines SET desired_state=?, desired_generation=desired_generation+1, status=?, cleanup_state=?, provision_error=?, agent_token_hash=NULL, updated_at=? WHERE id=?`, DesiredRetiring, CleanupFailed, CleanupFailed, msg, nowUTC(), machineID)
+		return err
+	})
+	if err != nil {
+		// Nothing else can record it; make it loud.
+		log.Printf("CRITICAL: provision %s left hub residue (%s) and the tombstone could not be recorded: %v", machineID, msg, err)
+	}
+	p.store.Audit(ctx, "machine.cleanup_failed", "system", machineID, msg)
+	p.publish("machine.cleanup_failed", machineID, map[string]any{"machine_id": machineID, "cleanup_state": CleanupFailed})
 }
 
 func getHubTx(ctx context.Context, tx *sql.Tx, id string) (Hub, error) {

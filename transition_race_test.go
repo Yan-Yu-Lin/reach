@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -296,5 +297,89 @@ func TestFailedCompensationIsRecorded(t *testing.T) {
 	_ = store.db.QueryRow(`SELECT status FROM machines WHERE id='m_c'`).Scan(&status)
 	if status != DisableFailed {
 		t.Fatalf("status after failed compensation = %s", status)
+	}
+}
+
+type failingRemoveOS struct {
+	fakeTunnelOS
+	mu      sync.Mutex
+	present bool
+}
+
+func (o *failingRemoveOS) Remove(context.Context, string) error {
+	return errors.New("injected remove failure")
+}
+func (o *failingRemoveOS) Residue(context.Context, string) ([]string, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.present {
+		return []string{"authorized_keys"}, nil
+	}
+	return nil, nil
+}
+
+// Astra R4-02: a writer that ignores the lock retired the machine while a
+// provision was in its OS phase, and the provision's cleanup fails. The DB
+// must not say retired/complete with the port released: it becomes a
+// retiring/cleanup_failed tombstone holding its original port, token
+// revoked.
+func TestFailedProvisionCompensationKeepsTombstone(t *testing.T) {
+	for _, portTaken := range []bool{false, true} {
+		server, store, _ := newReliabilityTestServer(t)
+		fos := &failingRemoveOS{}
+		server.prov.osOps = fos
+		entered := make(chan struct{})
+		proceed := make(chan struct{})
+		server.prov.createAccount = func(context.Context, string, int, string, string) error {
+			close(entered)
+			<-proceed
+			fos.mu.Lock()
+			fos.present = true
+			fos.mu.Unlock()
+			return nil
+		}
+		result := make(chan error, 1)
+		go func() {
+			_, err := server.prov.CreateMachine(context.Background(), CreateMachineInput{Slug: "cas-loser-box", Pubkey: testPubkey})
+			result <- err
+		}()
+		<-entered
+		var machineID string
+		var port int
+		_ = store.db.QueryRow(`SELECT m.id,t.remote_port FROM machines m JOIN tunnels t ON t.machine_id=m.id WHERE m.slug='cas-loser-box'`).Scan(&machineID, &port)
+		// A lock-ignoring writer retires it and frees the port.
+		if _, err := store.db.Exec(`UPDATE machines SET desired_state='retired',desired_generation=desired_generation+1,status='retired',cleanup_state='complete',agent_token_hash=NULL WHERE id=?`, machineID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.db.Exec(`UPDATE tunnels SET status='retired',remote_port=-1,cleanup_verified_at=? WHERE machine_id=?`, nowUTC(), machineID); err != nil {
+			t.Fatal(err)
+		}
+		if portTaken {
+			insertRetireFixture(t, server, "m_new_owner", "new-owner", "rt-newowner", port)
+		}
+		close(proceed)
+		if err := <-result; !errors.Is(err, errProvisioningLeaseLost) {
+			t.Fatalf("CreateMachine error = %v", err)
+		}
+		var desired, mstatus, cleanup, perr string
+		var token sql.NullString
+		_ = store.db.QueryRow(`SELECT desired_state,status,COALESCE(cleanup_state,''),COALESCE(provision_error,''),agent_token_hash FROM machines WHERE id=?`, machineID).Scan(&desired, &mstatus, &cleanup, &perr, &token)
+		var tstatus string
+		var tport int
+		var verified sql.NullString
+		_ = store.db.QueryRow(`SELECT status,remote_port,cleanup_verified_at FROM tunnels WHERE machine_id=?`, machineID).Scan(&tstatus, &tport, &verified)
+		if desired != DesiredRetiring || mstatus != CleanupFailed || cleanup != CleanupFailed || token.Valid || tstatus != "cleanup_failed" || verified.Valid {
+			t.Fatalf("taken=%v: desired=%s status=%s cleanup=%s token=%v tunnel=%s verified=%v", portTaken, desired, mstatus, cleanup, token.Valid, tstatus, verified.Valid)
+		}
+		if !portTaken && tport != port {
+			t.Fatalf("original port %d not kept: %d", port, tport)
+		}
+		if portTaken {
+			var owner string
+			_ = store.db.QueryRow(`SELECT machine_id FROM tunnels WHERE remote_port=? AND machine_id<>?`, port, machineID).Scan(&owner)
+			if owner != "m_new_owner" || !strings.Contains(perr, "resolve by hand") {
+				t.Fatalf("port conflict not recorded: owner=%s err=%s", owner, perr)
+			}
+		}
 	}
 }
