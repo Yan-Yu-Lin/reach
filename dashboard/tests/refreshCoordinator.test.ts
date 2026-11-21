@@ -15,7 +15,7 @@ describe('createRefreshCoordinator', () => {
     await vi.advanceTimersByTimeAsync(50)
     await Promise.all([first, second, third])
 
-    expect(batches).toEqual([{ full: false, machineIds: ['m-1', 'm-2'] }])
+    expect(batches).toEqual([{ full: false, machineIds: ['m-1', 'm-2'], requests: false }])
   })
 
   it('lets a full refresh supersede queued machine refreshes', async () => {
@@ -27,7 +27,7 @@ describe('createRefreshCoordinator', () => {
     await vi.advanceTimersByTimeAsync(50)
     await Promise.all([machine, full])
 
-    expect(batches).toEqual([{ full: true, machineIds: [] }])
+    expect(batches).toEqual([{ full: true, machineIds: [], requests: false }])
   })
 
   it('keeps one refresh in flight and performs one trailing rerun', async () => {
@@ -43,14 +43,14 @@ describe('createRefreshCoordinator', () => {
     const trailingOne = coordinator.requestMachine('m-2')
     const trailingTwo = coordinator.requestMachine('m-3')
     await vi.advanceTimersByTimeAsync(500)
-    expect(batches).toEqual([{ full: false, machineIds: ['m-1'] }])
+    expect(batches).toEqual([{ full: false, machineIds: ['m-1'], requests: false }])
 
     release?.()
     await first
     await vi.advanceTimersByTimeAsync(50)
     expect(batches).toEqual([
-      { full: false, machineIds: ['m-1'] },
-      { full: false, machineIds: ['m-2', 'm-3'] },
+      { full: false, machineIds: ['m-1'], requests: false },
+      { full: false, machineIds: ['m-2', 'm-3'], requests: false },
     ])
 
     release?.()
@@ -71,11 +71,36 @@ describe('createRefreshCoordinator', () => {
     await vi.advanceTimersByTimeAsync(50)
 
     expect(batches).toEqual([
-      { full: false, machineIds: ['m-1'] },
-      { full: true, machineIds: [] },
+      { full: false, machineIds: ['m-1'], requests: false },
+      { full: true, machineIds: [], requests: false },
     ])
     await vi.advanceTimersByTimeAsync(200)
     expect(batches).toHaveLength(2)
+  })
+
+  it('batches a request-list refresh with machine refreshes', async () => {
+    const batches: RefreshBatch[] = []
+    const coordinator = createRefreshCoordinator(async batch => { batches.push(batch) }, 50)
+
+    const a = coordinator.requestRequests()
+    const b = coordinator.requestMachine('m-1')
+    await vi.advanceTimersByTimeAsync(50)
+    await Promise.all([a, b])
+
+    expect(batches).toEqual([{ full: false, machineIds: ['m-1'], requests: true }])
+  })
+
+  it('lets a full refresh absorb a queued request-list refresh', async () => {
+    const batches: RefreshBatch[] = []
+    const coordinator = createRefreshCoordinator(async batch => { batches.push(batch) }, 50)
+
+    const a = coordinator.requestRequests()
+    const b = coordinator.requestFull()
+    const c = coordinator.requestRequests()
+    await vi.advanceTimersByTimeAsync(50)
+    await Promise.all([a, b, c])
+
+    expect(batches).toEqual([{ full: true, machineIds: [], requests: false }])
   })
 
   it('cancels queued work when disposed', async () => {

@@ -1,6 +1,10 @@
 export type RefreshBatch = {
+  /** Full snapshot: all machines and the pending request list. */
   full: boolean
+  /** Machines to re-fetch one by one (empty when full). */
   machineIds: string[]
+  /** Re-fetch the pending request list only (false when full, which already includes it). */
+  requests: boolean
 }
 
 export function createRefreshCoordinator(
@@ -8,6 +12,7 @@ export function createRefreshCoordinator(
   delayMs = 75,
 ) {
   let pendingFull = false
+  let pendingRequests = false
   const pendingMachineIds = new Set<string>()
   let timer: ReturnType<typeof setTimeout> | null = null
   let running = false
@@ -15,7 +20,7 @@ export function createRefreshCoordinator(
   let waiters: Array<{ resolve: () => void; reject: (error: unknown) => void }> = []
 
   function hasPending() {
-    return pendingFull || pendingMachineIds.size > 0
+    return pendingFull || pendingRequests || pendingMachineIds.size > 0
   }
 
   function schedule(immediate: boolean) {
@@ -32,8 +37,10 @@ export function createRefreshCoordinator(
     const batch: RefreshBatch = {
       full: pendingFull,
       machineIds: pendingFull ? [] : [...pendingMachineIds],
+      requests: pendingFull ? false : pendingRequests,
     }
     pendingFull = false
+    pendingRequests = false
     pendingMachineIds.clear()
     const batchWaiters = waiters
     waiters = []
@@ -59,6 +66,7 @@ export function createRefreshCoordinator(
   return {
     requestFull(immediate = false) {
       pendingFull = true
+      pendingRequests = false
       pendingMachineIds.clear()
       return queued(immediate)
     },
@@ -66,11 +74,20 @@ export function createRefreshCoordinator(
       if (!pendingFull) pendingMachineIds.add(id)
       return queued(false)
     },
+    requestRequests() {
+      if (!pendingFull) pendingRequests = true
+      return queued(false)
+    },
+    /** True while a refresh runs or one is queued. */
+    busy() {
+      return running || timer !== null || hasPending()
+    },
     dispose() {
       disposed = true
       if (timer) clearTimeout(timer)
       timer = null
       pendingFull = false
+      pendingRequests = false
       pendingMachineIds.clear()
       waiters.forEach(waiter => waiter.resolve())
       waiters = []

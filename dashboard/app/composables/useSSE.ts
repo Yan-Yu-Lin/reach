@@ -1,7 +1,13 @@
+import { goToLoginOnce } from '~/composables/useReachApi'
 import { createSSEParser, reconnectDelay } from '~/utils/sse'
 
 export type SSEStatus = 'connecting' | 'live' | 'reconnecting' | 'stale'
-export type SSEHandler = (event: string, data: unknown, id: string) => void
+/**
+ * `beforeHello`: the event arrived on this connection before its `hello`, i.e. it is durable
+ * history replayed for our Last-Event-ID (docs/EVENTS.md: hello marks the end of replay).
+ * This is about the position in the stream, not the event id: live events have ids too.
+ */
+export type SSEHandler = (event: string, data: unknown, id: string, ctx: { beforeHello: boolean }) => void
 
 const sseStatus = ref<SSEStatus>('connecting')
 const handlers = new Set<SSEHandler>()
@@ -11,6 +17,8 @@ let timer: ReturnType<typeof setTimeout> | null = null
 let generation = 0
 let reconnectAttempt = 0
 let lastEventId = ''
+/** True when the live connection was opened with a Last-Event-ID (the server replayed what we missed). */
+let resumed = false
 const staleAfterMs = 60_000
 
 export function useSSE() {
@@ -32,7 +40,7 @@ export function useSSE() {
     return () => handlers.delete(handler)
   }
 
-  return { status: sseStatus, start, stop, onEvent }
+  return { status: sseStatus, start, stop, onEvent, wasResumed: () => resumed }
 }
 
 async function connect(token: string, apiBase: string, connectionGeneration: number) {
@@ -45,13 +53,14 @@ async function connect(token: string, apiBase: string, connectionGeneration: num
   try {
     const headers = new Headers({ Authorization: `Bearer ${token}` })
     if (lastEventId) headers.set('Last-Event-ID', lastEventId)
+    resumed = !!lastEventId
     const res = await fetch(`${apiBase}/admin/events`, {
       headers,
       signal: activeController.signal,
     })
 
     if (res.status === 401) {
-      await handleSSEUnauthorized()
+      await handleSSEUnauthorized(token, connectionGeneration)
       return
     }
     if (!res.ok || !res.body) throw new Error(`Event stream failed (${res.status})`)
@@ -61,10 +70,13 @@ async function connect(token: string, apiBase: string, connectionGeneration: num
     markActive(connectionGeneration)
     const reader = res.body.getReader()
     const decoder = new TextDecoder()
+    let helloSeen = false
     const parser = createSSEParser((message) => {
       try {
         const parsed: unknown = JSON.parse(message.data)
-        handlers.forEach(handler => handler(message.event, parsed, message.id))
+        const ctx = { beforeHello: !helloSeen }
+        if (message.event === 'hello') helloSeen = true
+        handlers.forEach(handler => handler(message.event, parsed, message.id, ctx))
       } catch {
         // Ignore malformed application payloads without losing stream framing.
       }
@@ -111,13 +123,13 @@ function stopSSEConnection() {
   clearTimer()
 }
 
-async function handleSSEUnauthorized() {
+async function handleSSEUnauthorized(sentWith: string, connectionGeneration: number) {
+  // A stream that was already replaced (stop/start since) has nothing to say any more.
+  if (connectionGeneration !== generation) return
   stopSSEConnection()
   const api = useReachApi()
-  api.setToken(null)
-  if (import.meta.client) {
-    await navigateTo({ path: '/login', query: { reason: 'session-expired' } })
-  }
+  // Only end the session this stream was opened with (astra R2-01).
+  if (api.signOutLocally(sentWith, 'expired') && import.meta.client) await goToLoginOnce()
 }
 
 function scheduleReconnect(token: string, apiBase: string, connectionGeneration: number) {

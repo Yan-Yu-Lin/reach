@@ -1,526 +1,672 @@
 <template>
-  <div class="app-shell" :data-tick="timeTick">
-    <!-- Topbar -->
+  <div class="shell" :class="{ 'has-detail': !!selectedId && tab === 'machines' }">
+    <!-- Top bar: brand, live state, desktop nav, settings -->
     <header class="topbar">
-      <div class="topbar-left">
-        <span class="brand">Reach</span>
-        <div class="sse-badge">
-          <span class="sse-dot" :class="sseStatusClass" />
-          <span>{{ sseLabel }}</span>
-        </div>
-      </div>
-      <div class="topbar-right">
-        <button class="btn btn-ghost btn-sm" @click="toggleTheme" :title="`Switch to ${isDark ? 'light' : 'dark'} mode`">
-          {{ isDark ? 'Light' : 'Dark' }}
+      <button type="button" class="brand" @click="goHome">Reach</button>
+      <span class="live" :class="`live-${sse.status.value}`" role="status">
+        <span class="live-dot" aria-hidden="true" />
+        <span>{{ sseLabel }}</span>
+      </span>
+      <nav class="topnav" aria-label="Sections">
+        <button type="button" class="topnav-item" :aria-current="tab === 'machines' ? 'page' : undefined" @click="setTab('machines')">Machines</button>
+        <button type="button" class="topnav-item" :aria-current="tab === 'requests' ? 'page' : undefined" @click="setTab('requests')">
+          Requests<span v-if="pendingCount" class="count-badge">{{ pendingCount }}</span>
         </button>
-        <button class="btn btn-ghost btn-sm" @click="showShortcuts = true" title="Keyboard shortcuts (?)">?</button>
-        <button class="btn btn-ghost btn-sm" @click="logout">Logout</button>
-      </div>
+        <button type="button" class="topnav-item" :aria-current="tab === 'settings' ? 'page' : undefined" @click="setTab('settings')">Settings &amp; setup</button>
+      </nav>
+      <button type="button" class="btn btn-icon topbar-theme" :aria-label="isDark ? 'Switch to light theme' : 'Switch to dark theme'" @click="themeCtrl.toggle()">
+        <AppIcon :name="isDark ? 'sun' : 'moon'" :size="18" />
+      </button>
     </header>
 
-    <!-- Fleet strip -->
-    <aside class="fleet-strip" ref="stripRef">
-      <div class="fleet-filter" v-if="!isMobile">
-        <input
-          ref="filterInput"
-          v-model="filter"
-          placeholder="Filter machines..."
-          @keydown.escape="filter = ''; ($event.target as HTMLInputElement).blur()"
-        />
-      </div>
-
-      <template v-for="(group, gi) in filteredGroups" :key="group.label">
-        <div class="fleet-group-label">{{ group.label }}</div>
-
-        <template v-if="group.collapsed && !expandedGroups.has(group.label)">
-          <div class="fleet-collapsed-group" @click="expandedGroups.add(group.label)">
-            {{ group.machines.length }} {{ group.label.toLowerCase() }}
-          </div>
-        </template>
-        <template v-else>
-          <div
-            v-for="(item, i) in group.machines"
-            :key="item.machine.id"
-            class="fleet-item"
-            :class="{
-              active: selectedId === item.machine.id,
-              focused: focusedIndex === flatIndex(gi, i),
-            }"
-            @click="selectMachine(item.machine.id)"
-          >
-            <span class="fleet-dot" :class="dotClass(item)" />
-            <span class="fleet-name">{{ item.machine.slug }}</span>
-            <span class="fleet-time">{{ rt.relative(item.agent_observation?.heartbeat_at) }}</span>
-            <button
-              class="fleet-copy-btn"
-              @click.stop="copySSH(item.machine.slug)"
-              title="Copy SSH command"
-            >cp</button>
-          </div>
-        </template>
-      </template>
-
-      <div v-if="filteredGroups.length === 0 && machines.length > 0" class="empty-state" style="padding: 16px;">
-        <div class="muted">No matches</div>
-      </div>
+    <!-- Desktop sidebar: the fleet is always visible -->
+    <aside v-if="isDesktop" class="sidebar" aria-label="Machines">
+      <FleetList
+        ref="sidebarList"
+        :groups="groups"
+        :status-of="statusOf"
+        :selected-id="selectedId"
+        :focused-id="focusedId"
+        @select="openMachine"
+        @copy="copyText"
+        @bulk-disable="askBulkDisable"
+      />
     </aside>
 
-    <!-- Stage -->
-    <main class="stage" ref="stageRef">
-      <div v-if="loading && machines.length === 0" class="load-state" role="status">
-        Loading dashboard data...
-      </div>
-      <div v-if="fleetError" class="load-state error" role="alert">
+    <main ref="mainEl" class="main" tabindex="-1">
+      <div v-if="!loaded && loading" class="notice" role="status">Loading machines...</div>
+      <div v-if="fleetError" class="notice notice-error" role="alert">
         <span>{{ fleetError }}</span>
-        <button class="btn btn-sm" :disabled="loading" @click="fleet.refresh">
-          {{ loading ? 'Retrying...' : 'Retry' }}
-        </button>
+        <button type="button" class="btn" :disabled="loading" @click="fleet.refresh">{{ loading ? 'Retrying...' : 'Retry' }}</button>
       </div>
 
-      <!-- Summary (no selection, not settings) -->
-      <template v-if="!selectedId && !showSettings">
-        <div class="summary-stats">
-          <div class="stat-card accent">
-            <div class="stat-value">{{ onlineCount }}</div>
-            <div class="stat-label">Reachable</div>
-          </div>
-          <div class="stat-card" :class="degradedCount > 0 ? 'warn' : ''">
-            <div class="stat-value">{{ degradedCount }}</div>
-            <div class="stat-label">Degraded</div>
-          </div>
-          <div class="stat-card" :class="offlineCount > 0 ? 'danger' : ''">
-            <div class="stat-value">{{ offlineCount }}</div>
-            <div class="stat-label">Offline</div>
-          </div>
-          <div class="stat-card" :class="pendingCount > 0 ? 'warn' : ''">
-            <div class="stat-value">{{ pendingCount }}</div>
-            <div class="stat-label">Pending</div>
-          </div>
-        </div>
+      <!-- MACHINES -->
+      <template v-if="tab === 'machines'">
+        <MachineDetail
+          v-if="selectedId"
+          :item="selectedMachine"
+          :base-url="reachBaseUrl"
+          @back="closeMachine"
+          @action="handleMachineAction"
+          @copy="copyText"
+          @refresh="fleet.refreshMachine"
+        />
+        <template v-else>
+          <!-- What needs me right now -->
+          <section v-if="loaded" class="todo" :class="todoItems.length ? 'todo-busy' : 'todo-calm'" aria-labelledby="todo-title">
+            <h1 id="todo-title" class="todo-title">
+              <AppIcon :name="todoItems.length ? 'alert' : 'check'" :size="20" />
+              {{ todoItems.length ? 'Needs you' : 'All good' }}
+            </h1>
+            <p v-if="!todoItems.length" class="todo-calm-text">
+              {{ counts.online }} online{{ counts.dormant ? `, ${counts.dormant} dormant` : '' }}. Nothing to approve, nothing recently dropped.
+            </p>
+            <ul v-else class="todo-list">
+              <li v-for="t in todoItems" :key="t.key">
+                <button type="button" class="todo-item" :class="`st-${t.status}`" @click="t.go()">
+                  <StatusIcon :status="t.status" :size="16" />
+                  <span>{{ t.text }}</span>
+                  <AppIcon name="chevron" :size="18" class="todo-chevron" />
+                </button>
+              </li>
+            </ul>
+          </section>
 
-        <!-- Pending approvals -->
-        <section class="section" v-if="pendingReqs.length > 0">
-          <div class="section-title">Pending approvals</div>
-          <div
-            v-for="req in pendingReqs"
-            :key="req.id"
-            class="approval-card"
-          >
-            <div class="approval-header">
-              <span class="approval-name">{{ req.name }}</span>
-              <span class="approval-time">{{ rt.relative(req.created_at) }}</span>
+          <!-- Desktop-only overview cards; the sidebar already lists the fleet -->
+          <section v-if="loaded" class="stats" aria-label="Fleet summary">
+            <div v-for="s in statCards" :key="s.status" class="stat" :class="`st-${s.status}`">
+              <StatusIcon :status="s.status" :size="16" />
+              <span class="stat-num">{{ s.count }}</span>
+              <span class="stat-label">{{ s.label }}</span>
             </div>
-            <div class="approval-meta">
-              <div class="approval-meta-item" v-if="req.metadata?.target_user">
-                <div class="approval-meta-label">Target user</div>
-                <div>{{ req.metadata.target_user }}</div>
-              </div>
-              <div class="approval-meta-item" v-if="req.metadata?.distro">
-                <div class="approval-meta-label">Distro / arch</div>
-                <div>{{ req.metadata.distro }} {{ req.metadata.arch ? '/ ' + req.metadata.arch : '' }}</div>
-              </div>
-              <div class="approval-meta-item" v-if="req.metadata?.source_ip">
-                <div class="approval-meta-label">Source IP</div>
-                <div class="mono">{{ req.metadata.source_ip }}</div>
-              </div>
-              <div class="approval-meta-item" v-if="req.metadata?.mode">
-                <div class="approval-meta-label">Mode</div>
-                <div>{{ req.metadata.mode }}</div>
-              </div>
-            </div>
-            <div class="approval-warnings" v-if="getWarnings(req).length > 0">
-              <span class="warning-badge" v-for="w in getWarnings(req)" :key="w">{{ w }}</span>
-            </div>
-            <div class="approval-actions">
-              <button class="btn btn-approve" @click="approveRequest(req.id)">Approve</button>
-              <button class="btn" @click="approveAs(req)">Approve as...</button>
-              <button class="btn btn-danger" @click="denyRequest(req.id)">Deny</button>
-            </div>
-          </div>
-        </section>
+          </section>
 
-        <!-- Recently changed -->
-        <section class="section" v-if="recentlyChanged.length > 0">
-          <div class="section-title">Recently changed</div>
-          <div class="recent-list">
-            <div
-              v-for="item in recentlyChanged"
-              :key="item.machine.id"
-              class="recent-item"
-              @click="selectMachine(item.machine.id)"
-            >
-              <span class="fleet-dot" :class="dotClass(item)" />
-              <span class="fleet-name">{{ item.machine.slug }}</span>
-              <span class="pill" :class="item.machine.observed_state">{{ item.machine.observed_state }}</span>
-              <span class="fleet-time" style="margin-left:auto">{{ rt.relative(item.machine.updated_at || item.machine.created_at) }}</span>
-            </div>
-          </div>
-        </section>
+          <section v-if="loaded && pending.length" class="desk-only" aria-labelledby="desk-req">
+            <h2 id="desk-req" class="section-title">Waiting for approval</h2>
+            <RequestCard
+              v-for="req in pending"
+              :key="req.id"
+              :req="req"
+              :existing-slugs="existingSlugs"
+              @approve="askApprove"
+              @deny="askDeny"
+            />
+          </section>
 
-        <div v-if="machines.length === 0 && !loading" class="empty-state">
-          <div class="empty-state-icon">~</div>
-          <div>No machines yet. Run the setup script on a target to get started.</div>
-        </div>
+          <!-- Phone: the fleet list is the home screen -->
+          <div v-if="!isDesktop" class="mobile-only">
+            <FleetList
+              :groups="groups"
+              :status-of="statusOf"
+              :selected-id="selectedId"
+              @select="openMachine"
+              @copy="copyText"
+              @bulk-disable="askBulkDisable"
+            />
+          </div>
+
+          <p v-if="loaded && machines.length === 0" class="empty">No machines yet. Open Settings &amp; setup to copy the install command.</p>
+        </template>
       </template>
 
-      <!-- Machine detail -->
-      <MachineDetail
-        v-if="selectedId && !showSettings"
-        :item="selectedMachine"
-        :events="machineEvents"
-        @back="selectedId = null"
-        @action="handleMachineAction"
-        @copy="copyText"
-        @refresh="fleet.refreshMachine"
-      />
+      <!-- REQUESTS -->
+      <template v-else-if="tab === 'requests'">
+        <h1 class="page-title">Requests</h1>
+        <p class="page-lede">Someone ran the setup command and is asking to join. Check that it is really them before approving.</p>
+        <RequestCard
+          v-for="req in pending"
+          :key="req.id"
+          :req="req"
+          :existing-slugs="existingSlugs"
+          @approve="askApprove"
+          @deny="askDeny"
+        />
+        <p v-if="loaded && pending.length === 0" class="empty">No requests waiting.</p>
+      </template>
 
-      <!-- Settings (mobile tab or could be linked from topbar) -->
-      <template v-if="showSettings">
-        <div class="section">
-          <div class="section-title">Setup</div>
-          <div class="detail-card" style="margin-bottom:16px">
-            <div class="detail-card-title">Setup one-liner</div>
-            <div class="ssh-block" style="margin-bottom:0">
-              <code class="ssh-cmd" style="font-size:13px;word-break:break-all">{{ setupCommand }}</code>
-              <button class="btn btn-sm" @click="copyText(setupCommand)">Copy</button>
+      <!-- SETTINGS -->
+      <template v-else>
+        <h1 class="page-title">Settings &amp; setup</h1>
+
+        <section class="card" aria-labelledby="setup-title">
+          <h2 id="setup-title" class="card-title">Add a machine</h2>
+          <p class="muted small">Run one of these on the new machine. It finds sudo on its own and falls back to a user-only install when there is none. Then approve the request here.</p>
+          <div v-for="c in setupCommands" :key="c.label" class="cmd-copy">
+            <span class="cmd-copy-label">{{ c.label }}</span>
+            <span v-if="c.hint" class="muted small">{{ c.hint }}</span>
+            <div class="cmd-copy-row">
+              <code class="mono">{{ c.cmd }}</code>
+              <button type="button" class="btn btn-icon" :aria-label="`Copy: ${c.label}`" @click="copyText(c.cmd)"><AppIcon name="copy" :size="18" /></button>
             </div>
           </div>
-          <div class="detail-card" style="margin-bottom:16px">
-            <div class="detail-card-title">Setup (no sudo)</div>
-            <div class="ssh-block" style="margin-bottom:0">
-              <code class="ssh-cmd" style="font-size:13px;word-break:break-all">{{ websocketSetupCommand }}</code>
-              <button class="btn btn-sm" @click="copyText(websocketSetupCommand)">Copy</button>
-            </div>
+        </section>
+
+        <section class="card" aria-labelledby="notif-title">
+          <h2 id="notif-title" class="card-title">Notifications</h2>
+          <p class="muted small">Get a browser notification when a new request arrives while this page is open.</p>
+          <div class="field-row">
+            <button v-if="notifState === 'default'" type="button" class="btn" @click="enableNotifications"><AppIcon name="bell" :size="18" /> Turn on notifications</button>
+            <span v-else-if="notifState === 'granted'" class="tag tag-ok">On for this browser</span>
+            <span v-else-if="notifState === 'denied'" class="tag tag-warn">Blocked. Allow it in the browser's site settings.</span>
+            <span v-else class="tag tag-muted">Not supported here. On iPhone, add the page to the Home Screen first.</span>
           </div>
-        </div>
-        <div class="section">
-          <div class="section-title">Hub</div>
-          <div class="detail-card" style="margin-bottom:16px">
-            <dl>
-              <div class="detail-row"><dt>Host</dt><dd>{{ reachHostLabel }}</dd></div>
-              <div class="detail-row"><dt>Machines</dt><dd>{{ machines.length }}</dd></div>
-              <div class="detail-row">
-                <dt>SSE</dt>
-                <dd>
-                  <span class="sse-dot" :class="sseStatusClass" style="display:inline-block;vertical-align:middle" />
-                  {{ sseLabel }}
-                </dd>
-              </div>
-            </dl>
+        </section>
+
+        <section class="card" aria-labelledby="look-title">
+          <h2 id="look-title" class="card-title">Appearance</h2>
+          <div class="segmented" role="radiogroup" aria-label="Theme">
+            <button v-for="t in themes" :key="t.value" type="button" role="radio" :aria-checked="themeCtrl.theme.value === t.value" class="segmented-item" @click="themeCtrl.setTheme(t.value)">{{ t.label }}</button>
           </div>
-        </div>
-        <div class="section">
-          <button class="btn btn-danger" @click="logout" style="width:100%">Logout</button>
-        </div>
+        </section>
+
+        <section class="card" aria-labelledby="hub-title">
+          <h2 id="hub-title" class="card-title">Hub</h2>
+          <dl class="kv">
+            <div><dt>Host</dt><dd class="mono">{{ reachHostLabel }}</dd></div>
+            <div><dt>Machines</dt><dd>{{ machines.length }}</dd></div>
+            <div><dt>Live updates</dt><dd>{{ sseLabel }}</dd></div>
+          </dl>
+        </section>
+
+        <section class="card" aria-labelledby="sess-title">
+          <h2 id="sess-title" class="card-title">Session</h2>
+          <p class="muted small">Your login is stored in this browser. If you lost a device or used a shared computer, sign out everywhere: every dashboard login stops working at once.</p>
+          <div class="field-row">
+            <button type="button" class="btn" @click="logout"><AppIcon name="logout" :size="18" /> Sign out</button>
+            <button type="button" class="btn btn-warn" @click="dialog = { kind: 'revoke' }"><AppIcon name="shield" :size="18" /> Sign out everywhere</button>
+          </div>
+        </section>
+
+        <section class="card desk-only" aria-labelledby="keys-title">
+          <h2 id="keys-title" class="card-title">Keyboard shortcuts</h2>
+          <dl class="kv kv-keys">
+            <div><dt><kbd>j</kbd> <kbd>k</kbd></dt><dd>Move through machines</dd></div>
+            <div><dt><kbd>Enter</kbd></dt><dd>Open machine</dd></div>
+            <div><dt><kbd>Esc</kbd></dt><dd>Back</dd></div>
+            <div><dt><kbd>c</kbd></dt><dd>Copy ssh command</dd></div>
+            <div><dt><kbd>a</kbd></dt><dd>Review the first request (asks before approving)</dd></div>
+            <div><dt><kbd>/</kbd></dt><dd>Find a machine</dd></div>
+          </dl>
+        </section>
       </template>
     </main>
 
-    <!-- Mobile tabs -->
-    <nav class="mobile-tabs">
-      <button class="mobile-tab" :class="{ active: mobileTab === 'inbox' }" @click="mobileTab = 'inbox'; selectedId = null">
-        <span>{{ pendingCount > 0 ? `(${pendingCount})` : '' }} Inbox</span>
-      </button>
-      <button class="mobile-tab" :class="{ active: mobileTab === 'machines' }" @click="mobileTab = 'machines'">
+    <!-- Phone bottom tabs, inside thumb reach -->
+    <nav class="tabbar" aria-label="Sections">
+      <button type="button" class="tab" :aria-current="tab === 'machines' ? 'page' : undefined" @click="setTab('machines')">
+        <AppIcon name="list" :size="22" />
         <span>Machines</span>
+        <span v-if="attentionCount" class="tab-dot" :aria-label="`${attentionCount} need attention`">{{ attentionCount }}</span>
       </button>
-      <button class="mobile-tab" :class="{ active: mobileTab === 'settings' }" @click="mobileTab = 'settings'">
+      <button type="button" class="tab" :aria-current="tab === 'requests' ? 'page' : undefined" @click="setTab('requests')">
+        <AppIcon name="inbox" :size="22" />
+        <span>Requests</span>
+        <span v-if="pendingCount" class="tab-dot tab-dot-pending" :aria-label="`${pendingCount} waiting`">{{ pendingCount }}</span>
+      </button>
+      <button type="button" class="tab" :aria-current="tab === 'settings' ? 'page' : undefined" @click="setTab('settings')">
+        <AppIcon name="settings" :size="22" />
         <span>Settings</span>
       </button>
     </nav>
 
-    <!-- Toast container -->
-    <div class="toast-container">
-      <div v-for="t in toasts" :key="t.id" class="toast" :class="t.type">
-        {{ t.message }}
-      </div>
+    <div class="toasts" role="status" aria-live="polite">
+      <div v-for="t in toasts" :key="t.id" class="toast" :class="t.type">{{ t.message }}</div>
     </div>
 
-    <!-- Keyboard shortcuts overlay -->
-    <div v-if="showShortcuts" class="shortcuts-overlay" @click.self="showShortcuts = false">
-      <div class="shortcuts-card">
-        <h2>Keyboard shortcuts</h2>
-        <div class="shortcut-row"><span>Navigate fleet</span><span class="shortcut-key">j</span> / <span class="shortcut-key">k</span></div>
-        <div class="shortcut-row"><span>Open selected</span><span class="shortcut-key">Enter</span></div>
-        <div class="shortcut-row"><span>Back to summary</span><span class="shortcut-key">Esc</span></div>
-        <div class="shortcut-row"><span>Copy SSH command</span><span class="shortcut-key">c</span></div>
-        <div class="shortcut-row"><span>Approve first pending</span><span class="shortcut-key">a</span></div>
-        <div class="shortcut-row"><span>Filter fleet</span><span class="shortcut-key">/</span></div>
-        <div class="shortcut-row"><span>Show this dialog</span><span class="shortcut-key">?</span></div>
-        <div style="margin-top: 16px; text-align: right;">
-          <button class="btn btn-sm" @click="showShortcuts = false">Close</button>
-        </div>
-      </div>
-    </div>
+    <!-- Request dialogs -->
+    <ConfirmDialog
+      v-if="dialog?.kind === 'approve'"
+      :title="`Approve ${dialog.req.name}?`"
+      confirm-label="Approve"
+      :busy="dialogBusy"
+      @cancel="dialog = null"
+      @confirm="approve(dialog.req)"
+    >
+      <p>It gets a tunnel account on the hub and shows up on your Mac as
+        <span class="mono">ssh {{ requestSlug(dialog.req).value || '(name chosen at setup)' }}</span>.</p>
+      <ul v-if="requestWarnings(dialog.req, existingSlugs).length" class="dialog-warnings">
+        <li v-for="w in requestWarnings(dialog.req, existingSlugs)" :key="w"><AppIcon name="alert" :size="16" /> {{ w }}</li>
+      </ul>
+      <p class="muted small">Only approve if you know who sent this. Source IP and system details are what the requester claims.</p>
+    </ConfirmDialog>
+    <ConfirmDialog
+      v-if="dialog?.kind === 'deny'"
+      :title="`Deny ${dialog.req.name}?`"
+      confirm-label="Deny"
+      danger
+      :busy="dialogBusy"
+      @cancel="dialog = null"
+      @confirm="deny(dialog.req)"
+    >
+      <p>The setup on that machine stops. They can send a new request later.</p>
+    </ConfirmDialog>
+    <ConfirmDialog
+      v-if="dialog?.kind === 'bulk-disable'"
+      :title="bulkTargets.length ? `Disable ${bulkTargets.length} dormant machine${bulkTargets.length === 1 ? '' : 's'}?` : 'Nothing left to disable'"
+      :confirm-label="`Disable ${bulkTargets.length}`"
+      danger
+      :busy="dialogBusy"
+      :confirm-disabled="bulkTargets.length === 0"
+      @cancel="dialog = null"
+      @confirm="bulkDisable(dialog.ids)"
+    >
+      <p>Their tunnel keys stop working, so a stolen copy of an old agent config is useless. Nothing is deleted; you can Enable any of them later.</p>
+      <p v-if="bulkTargets.length" class="mono small wrap bulk-list">{{ bulkTargets.map(i => i.machine.slug).join(', ') }}</p>
+      <p v-if="bulkDropped.length" class="bulk-dropped" role="status">
+        <AppIcon name="alert" :size="16" />
+        No longer dormant, left out: <span class="mono">{{ bulkDropped.join(', ') }}</span>
+      </p>
+    </ConfirmDialog>
+    <ConfirmDialog
+      v-if="dialog?.kind === 'revoke'"
+      title="Sign out everywhere?"
+      confirm-label="Sign out everywhere"
+      danger
+      :busy="dialogBusy"
+      @cancel="dialog = null"
+      @confirm="revokeAll"
+    >
+      <p>Every dashboard login, including this one, stops working. You will need your password to sign in again.</p>
+      <p class="muted small">The Mac ssh-config agent keeps working.</p>
+    </ConfirmDialog>
   </div>
 </template>
 
 <script setup lang="ts">
+import { setupCommand, websocketSetupCommand, windowsSetupCommand } from '~/utils/commands'
+import { requestSlug, requestWarnings } from '~/utils/requests'
+import { STATUS_LABEL, type UiStatus } from '~/utils/status'
+import { mapSettledLimited } from '~/utils/concurrency'
+import { goToLoginOnce, parseSignOutBroadcast, SIGNOUT_KEY } from '~/composables/useReachApi'
+
+type Tab = 'machines' | 'requests' | 'settings'
+type Dialog =
+  | { kind: 'approve'; req: RequestRow }
+  | { kind: 'deny'; req: RequestRow }
+  | { kind: 'bulk-disable'; ids: string[] }
+  | { kind: 'revoke' }
+
 const api = useReachApi()
 const sse = useSSE()
 const fleet = useFleet()
-const rt = useRelativeTime()
 const toast = useToast()
 const themeCtrl = useTheme()
 const runtimeConfig = useRuntimeConfig()
+const route = useRoute()
+const router = useRouter()
+useClock()
 
+const {
+  machines, pending, loading, loaded, error: fleetError, selectedId, selectedMachine,
+  statusOf, groups, counts, attentionCount, pendingCount,
+} = fleet
+const toasts = toast.toasts
+
+const mainEl = ref<HTMLElement | null>(null)
+const sidebarList = ref<{ focusFilter: () => void; flat: MachineWithTunnels[] } | null>(null)
+const focusedId = ref<string | null>(null)
+const dialog = ref<Dialog | null>(null)
+const dialogBusy = ref(false)
+const isDark = ref(true)
+// Render one fleet list, not two: the sidebar on desktop, the home list on phones.
+const desktopQuery = import.meta.client ? window.matchMedia('(min-width: 900px)') : null
+const isDesktop = ref(!!desktopQuery?.matches)
+const syncDesktop = () => { isDesktop.value = !!desktopQuery?.matches }
+const notifState = ref<'default' | 'granted' | 'denied' | 'unsupported'>('unsupported')
+
+const themes = [
+  { value: 'system', label: 'System' },
+  { value: 'light', label: 'Light' },
+  { value: 'dark', label: 'Dark' },
+] as const
+
+// ---- routing: tab and selected machine live in the URL so the phone back button works
+const tab = computed<Tab>(() => {
+  const t = route.query.tab
+  return t === 'requests' || t === 'settings' ? t : 'machines'
+})
+watch(() => route.query.m, (m) => {
+  selectedId.value = typeof m === 'string' && m ? m : null
+}, { immediate: true })
+
+function setTab(next: Tab) {
+  if (next === tab.value && !selectedId.value) return
+  router.push({ query: next === 'machines' ? {} : { tab: next } })
+}
+function goHome() { setTab('machines') }
+function openMachine(id: string) {
+  focusedId.value = id
+  if (selectedId.value === id && tab.value === 'machines') return
+  router.push({ query: { m: id } })
+}
+function closeMachine() {
+  if (window.history.state?.back) router.back()
+  else router.replace({ query: {} })
+}
+watch([tab, selectedId], () => nextTick(() => mainEl.value?.scrollTo?.({ top: 0 })))
+
+// ---- derived view data
 const reachBaseUrl = computed(() => {
   const configured = String(runtimeConfig.public.reachBaseUrl || '').replace(/\/$/, '')
   if (configured) return configured
   if (import.meta.client) return window.location.origin
   return 'https://tunnels.your-domain.example'
 })
-const setupCommand = computed(() => `curl -fsSL ${reachBaseUrl.value}/setup.sh | bash -s -- --yes`)
-const websocketSetupCommand = computed(() => `${setupCommand.value} --transport websocket`)
 const reachHostLabel = computed(() => {
   try { return new URL(reachBaseUrl.value).host } catch { return reachBaseUrl.value }
 })
+const setupCommands = computed(() => [
+  { label: 'Linux / macOS', hint: '', cmd: setupCommand(reachBaseUrl.value) },
+  { label: 'Linux / macOS on a network that blocks SSH', hint: 'Tunnels over HTTPS (WebSocket) instead of SSH port 443.', cmd: websocketSetupCommand(reachBaseUrl.value) },
+  { label: 'Windows (PowerShell)', hint: 'Non-admin PowerShell installs for the current user only.', cmd: windowsSetupCommand(reachBaseUrl.value) },
+])
 
-// Unwrap fleet refs for clean template access
-const {
-  machines, requests, loading, error: fleetError, selectedId,
-  pendingRequests: pendingReqs, pendingCount, onlineCount,
-  degradedCount, offlineCount, grouped, selectedMachine,
-  recentlyChanged,
-} = fleet
+const existingSlugs = computed(() => new Set(machines.value.map(m => m.machine.slug)))
 
-const toasts = toast.toasts
-
-const filter = ref('')
-const filterInput = ref<HTMLInputElement | null>(null)
-const stripRef = ref<HTMLElement | null>(null)
-const stageRef = ref<HTMLElement | null>(null)
-const showShortcuts = ref(false)
-const mobileTab = ref<'inbox' | 'machines' | 'settings'>('machines')
-const expandedGroups = reactive(new Set<string>())
-const focusedIndex = ref(-1)
-const machineEvents = ref<any[]>([])
-const isMobile = ref(false)
-const isDark = computed(() => themeCtrl.resolved() === 'dark')
-const timeTick = ref(0)
-const showSettings = computed(() => isMobile.value && mobileTab.value === 'settings' && !selectedId.value)
-
-const sseStatusClass = computed(() => sse.status.value)
 const sseLabel = computed(() => {
   switch (sse.status.value) {
     case 'live': return 'Live'
-    case 'reconnecting': return 'Reconnecting...'
+    case 'reconnecting': return 'Reconnecting'
     case 'stale': return 'Stale'
-    default: return 'Connecting...'
+    default: return 'Connecting'
   }
 })
 
-const filteredGroups = computed(() => {
-  const q = filter.value.toLowerCase().trim()
-  if (!q) return grouped.value
-  return grouped.value
-    .map(g => ({
-      ...g,
-      machines: g.machines.filter(m => m.machine.slug.toLowerCase().includes(q)),
-    }))
-    .filter(g => g.machines.length > 0)
+const statCards = computed(() => {
+  const c = counts.value
+  const list: Array<{ status: UiStatus; count: number; label: string }> = [
+    { status: 'online', count: c.online, label: STATUS_LABEL.online },
+    { status: 'degraded', count: c.degraded, label: STATUS_LABEL.degraded },
+    { status: 'offline', count: c.offline, label: 'Offline < 7d' },
+    { status: 'dormant', count: c.dormant, label: STATUS_LABEL.dormant },
+    { status: 'disabled', count: c.disabled, label: STATUS_LABEL.disabled },
+  ]
+  if (c.stuck + c.failed > 0) list.push({ status: 'stuck', count: c.stuck + c.failed, label: 'Removal stuck' })
+  if (c.disable_failed > 0) list.push({ status: 'disable_failed', count: c.disable_failed, label: 'Disable failed' })
+  return list
 })
 
-const flatMachines = computed(() => {
-  const result: MachineWithTunnels[] = []
-  for (const g of filteredGroups.value) {
-    if (g.collapsed && !expandedGroups.has(g.label)) continue
-    result.push(...g.machines)
+const todoItems = computed(() => {
+  const out: Array<{ key: string; status: UiStatus; text: string; go: () => void }> = []
+  const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`
+  if (pendingCount.value) {
+    out.push({ key: 'req', status: 'pending', text: `${plural(pendingCount.value, 'request', 'requests')} waiting for approval`, go: () => setTab('requests') })
   }
-  return result
+  const attention = groups.value.find(g => g.key === 'attention')?.items || []
+  const byStatus = (s: UiStatus[]) => attention.filter(i => s.includes(statusOf.value.get(i.machine.id) || 'unknown'))
+  const sections: Array<{ s: UiStatus[]; icon: UiStatus; one: string; many: string }> = [
+    { s: ['offline'], icon: 'offline', one: 'machine dropped offline', many: 'machines dropped offline' },
+    { s: ['degraded'], icon: 'degraded', one: 'machine degraded', many: 'machines degraded' },
+    { s: ['disable_failed'], icon: 'disable_failed', one: 'disable did not finish', many: 'disables did not finish' },
+    { s: ['stuck', 'failed'], icon: 'stuck', one: 'removal stuck', many: 'removals stuck' },
+  ]
+  for (const sec of sections) {
+    const items = byStatus(sec.s)
+    if (!items.length) continue
+    const names = items.slice(0, 3).map(i => i.machine.slug).join(', ') + (items.length > 3 ? '...' : '')
+    out.push({
+      key: sec.icon,
+      status: sec.icon,
+      text: `${plural(items.length, sec.one, sec.many)}: ${names}`,
+      go: () => items.length === 1 ? openMachine(items[0]!.machine.id) : focusGroup('attention'),
+    })
+  }
+  return out
 })
 
-function flatIndex(groupIdx: number, itemIdx: number): number {
-  let idx = 0
-  for (let g = 0; g < groupIdx; g++) {
-    const group = filteredGroups.value[g]
-    if (!group) continue
-    if (group.collapsed && !expandedGroups.has(group.label)) continue
-    idx += group.machines.length
-  }
-  return idx + itemIdx
+function focusGroup(key: string) {
+  nextTick(() => document.querySelector<HTMLElement>(`.main .fgroup-${key}, .sidebar .fgroup-${key}`)?.scrollIntoView({ block: 'start', behavior: 'smooth' }))
 }
 
-function dotClass(item: MachineWithTunnels): string {
-  const m = item.machine
-  if (m.desired_state === 'disabled' || m.desired_state === 'retired') return m.desired_state
-  if (m.status === 'pending') return 'pending'
-  return m.observed_state || 'unknown'
-}
-
-function selectMachine(id: string) {
-  selectedId.value = id
-  focusedIndex.value = flatMachines.value.findIndex(m => m.machine.id === id)
-}
-
-function toggleTheme() {
-  themeCtrl.toggle()
-}
-
-async function approveRequest(id: string) {
+// ---- actions
+async function copyText(text: string) {
   try {
-    await api.approve(id)
-    toast.success('Request approved')
-    await fleet.refresh()
-  } catch (e: any) {
-    toast.error(e.message || 'Approve failed')
+    await navigator.clipboard.writeText(text)
+    toast.success(`Copied: ${text.length > 40 ? text.slice(0, 40) + '...' : text}`)
+  } catch {
+    toast.error('Copy failed. Long-press the command to copy it.')
   }
 }
 
-async function approveAs(req: RequestRow) {
-  const name = prompt('Approve as (new name):', req.name)
-  if (!name || name.trim() === '') return
-  // The API approve endpoint doesn't support rename — approve first, then the client
-  // will provision with the original name. For now, approve normally.
-  // TODO: Add rename-on-approve to the Go API.
-  await approveRequest(req.id)
+function askApprove(req: RequestRow) { dialog.value = { kind: 'approve', req } }
+function askDeny(req: RequestRow) { dialog.value = { kind: 'deny', req } }
+// The dialog keeps machine ids, not objects: the list it shows and the list it sends are
+// both recomputed from the live fleet, so a machine that comes back online while the dialog
+// is open drops out instead of being disabled (astra F07).
+function askBulkDisable(items: MachineWithTunnels[]) {
+  if (items.length) dialog.value = { kind: 'bulk-disable', ids: items.map(i => i.machine.id) }
 }
+function stillDormant(id: string) {
+  const item = fleet.byId.get(id)
+  return !!item && item.machine.desired_state === 'active' && statusOf.value.get(id) === 'dormant'
+}
+const bulkTargets = computed(() => {
+  const d = dialog.value
+  if (d?.kind !== 'bulk-disable') return []
+  return d.ids.filter(stillDormant).map(id => fleet.byId.get(id)!)
+})
+const bulkDropped = computed(() => {
+  const d = dialog.value
+  if (d?.kind !== 'bulk-disable') return []
+  return d.ids.filter(id => !stillDormant(id)).map(id => fleet.byId.get(id)?.machine.slug || id)
+})
 
-async function denyRequest(id: string) {
-  if (!confirm('Deny this request?')) return
+async function withDialog(fn: () => Promise<void>) {
+  dialogBusy.value = true
   try {
-    await api.deny(id)
-    toast.success('Request denied')
-    await fleet.refresh()
-  } catch (e: any) {
-    toast.error(e.message || 'Deny failed')
+    await fn()
+    dialog.value = null
+  } finally {
+    dialogBusy.value = false
   }
 }
 
-async function handleMachineAction(action: string, id: string) {
+function approve(req: RequestRow) {
+  return withDialog(async () => {
+    try {
+      await api.approve(req.id)
+      toast.success(`Approved ${req.name}. Setup on that machine continues by itself.`)
+    } catch (e: any) {
+      toast.error(e.message || 'Approve failed')
+    }
+    await fleet.refreshRequests()
+  })
+}
+
+function deny(req: RequestRow) {
+  return withDialog(async () => {
+    try {
+      await api.deny(req.id)
+      toast.success(`Denied ${req.name}`)
+    } catch (e: any) {
+      toast.error(e.message || 'Deny failed')
+    }
+    await fleet.refreshRequests()
+  })
+}
+
+function bulkDisable(shownIds: string[]) {
+  // Re-check at the moment of the tap, not when the dialog opened.
+  const ids = shownIds.filter(stillDormant)
+  if (ids.length === 0) return
+  return withDialog(async () => {
+    const results = await mapSettledLimited(ids, 2, id => api.disable(id))
+    const failures = results
+      .map((r, i) => ({ r, slug: fleet.byId.get(ids[i]!)?.machine.slug || ids[i]! }))
+      .filter(x => x.r.status === 'rejected')
+    if (failures.length) {
+      const first = failures[0]!
+      const reason = (first.r as PromiseRejectedResult).reason?.message || 'failed'
+      toast.error(`${failures.length} of ${ids.length} not disabled (${failures.map(f => f.slug).join(', ')}): ${reason}`)
+    } else {
+      toast.success(`Disabled ${ids.length} dormant machine${ids.length === 1 ? '' : 's'}`)
+    }
+    await fleet.refresh()
+  })
+}
+
+// Only a 2xx means the server revoked anything (daybreak P3-5). A 401 means this login was
+// already invalid and the handler never ran: sign in again and confirm again.
+//
+// The answer can arrive late: the server may already have closed our stream, the stream's
+// 401 sent us to the login page, and the user may have signed in again. Every branch below
+// only acts if the session the request was sent with is still the current one (astra R2-01).
+async function revokeAll() {
+  const sentWith = api.currentToken()
+  await withDialog(async () => {
+    try {
+      await api.revokeAllSessions(false)
+    } catch (e: any) {
+      if (api.currentToken() !== sentWith) return
+      if (e?.status === 404) {
+        toast.error('This hub version cannot do that yet. Update reachd first.')
+        return
+      }
+      if (e?.status === 401) {
+        fleet.dispose()
+        api.signOutLocally(sentWith, 'expired')
+        await navigateTo({ path: '/login', query: { then: 'revoke-all' } })
+        return
+      }
+      toast.error(`Sign out everywhere failed: ${e?.message || 'unknown error'}. Nothing was revoked.`)
+      return
+    }
+    if (api.signOutLocally(sentWith, 'all')) {
+      fleet.dispose()
+      await navigateTo({ path: '/login', query: { reason: 'signed-out-everywhere' } })
+    } else if (!api.currentToken()) {
+      // Already sent to the login page by the closed stream; say what actually happened.
+      await navigateTo({ path: '/login', query: { reason: 'signed-out-everywhere' } }, { replace: true })
+    }
+    // Otherwise the user has signed in again since: leave that new session alone.
+  })
+}
+
+const ACTION_DONE: Record<string, string> = {
+  disable: 'Disabled', enable: 'Enabled', remove: 'Removal started', 'retire-now': 'Retired',
+}
+
+async function handleMachineAction(action: 'disable' | 'enable' | 'remove' | 'retire-now', id: string, done: () => void) {
   try {
     if (action === 'enable') await api.enable(id)
     else if (action === 'disable') await api.disable(id)
     else if (action === 'remove') await api.remove(id)
-    toast.success(`Machine ${action}d`)
-    await fleet.refresh()
+    else await api.retireNow(id)
+    toast.success(ACTION_DONE[action] || 'Done')
+    if (action === 'retire-now') {
+      await fleet.refresh()
+      closeMachine()
+    } else {
+      await fleet.refreshMachine(id)
+    }
   } catch (e: any) {
     toast.error(e.message || `${action} failed`)
+    void fleet.refreshMachine(id)
+  } finally {
+    done()
   }
 }
 
-async function copyText(text: string) {
+async function enableNotifications() {
+  if (!('Notification' in window)) return
   try {
-    await navigator.clipboard.writeText(text)
-    toast.success('Copied!')
+    notifState.value = await Notification.requestPermission()
   } catch {
-    toast.error('Copy failed')
+    notifState.value = Notification.permission
   }
 }
 
-function copySSH(slug: string) {
-  copyText(`ssh ${slug}`)
-}
-
-function getWarnings(req: RequestRow): string[] {
-  const warnings: string[] = []
-  if (req.metadata?.target_user === 'root') warnings.push('root user')
-  if (machines.value.some(m => m.machine.slug === req.metadata?.slug)) {
-    warnings.push('duplicate name')
-  }
-  return warnings
-}
-
-async function logout() {
+// The user's intent is fixed at the tap (astra R3-02): the logout request is started first
+// (it captures this tab's token synchronously), then this browser signs out everywhere
+// immediately. A 401 or a peer's 'expired' that arrives later can no longer swallow 'all'.
+function logout() {
+  const pending = api.logout().catch(() => { /* the server forgets the token on expiry anyway */ })
   fleet.dispose()
-  try {
-    await api.logout()
-  } catch {
-    // Still clear the local token if the network request fails.
-  }
-  api.setToken(null)
+  api.signOutLocally(undefined, 'all')
+  void pending
   navigateTo('/login')
 }
 
-// Keyboard shortcuts
-function onKeydown(e: KeyboardEvent) {
-  if (showShortcuts.value) {
-    if (e.key === 'Escape' || e.key === '?') {
-      showShortcuts.value = false
-      e.preventDefault()
-    }
-    return
-  }
+// Another tab of this browser signed out. An explicit sign-out ends every tab; a rejected
+// (expired/revoked) token only ends tabs that still hold that same token, so a tab that
+// signed in on its own keeps working (astra R2-01, R3-01).
+async function onStorage(e: StorageEvent) {
+  if (e.key !== SIGNOUT_KEY) return
+  const msg = parseSignOutBroadcast(e.newValue)
+  if (!msg) return
+  if (!(await api.receiveSignOut(msg))) return
+  fleet.dispose()
+  void goToLoginOnce()
+}
 
-  const tag = (e.target as HTMLElement).tagName
-  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return
+// ---- keyboard (desktop)
+function onKeydown(e: KeyboardEvent) {
+  if (dialog.value || e.metaKey || e.ctrlKey || e.altKey) return
+  const el = e.target as HTMLElement
+  if (el.closest('input, textarea, select, [contenteditable="true"], .dialog')) return
+  const flat = sidebarList.value?.flat || []
+  const idx = flat.findIndex(m => m.machine.id === focusedId.value)
 
   switch (e.key) {
-    case 'j': {
-      e.preventDefault()
-      const max = flatMachines.value.length - 1
-      if (max < 0) return
-      focusedIndex.value = Math.min(focusedIndex.value + 1, max)
-      break
-    }
+    case 'j':
     case 'k': {
       e.preventDefault()
-      if (flatMachines.value.length === 0) return
-      focusedIndex.value = Math.max(focusedIndex.value - 1, 0)
+      if (!flat.length) return
+      const next = e.key === 'j' ? Math.min(idx + 1, flat.length - 1) : Math.max(idx - 1, 0)
+      focusedId.value = flat[next]!.machine.id
+      nextTick(() => document.querySelector('.sidebar .mrow.focused')?.scrollIntoView({ block: 'nearest' }))
       break
     }
-    case 'Enter': {
-      e.preventDefault()
-      const m = flatMachines.value[focusedIndex.value]
-      if (m) selectMachine(m.machine.id)
+    case 'Enter':
+      if (focusedId.value && el.tagName !== 'BUTTON') { e.preventDefault(); openMachine(focusedId.value) }
       break
-    }
-    case 'Escape': {
-      e.preventDefault()
-      selectedId.value = null
+    case 'Escape':
+      if (selectedId.value) { e.preventDefault(); closeMachine() }
       break
-    }
     case 'c': {
-      e.preventDefault()
-      const sel = selectedMachine.value
-      if (sel) copySSH(sel.machine.slug)
-      else {
-        const f = flatMachines.value[focusedIndex.value]
-        if (f) copySSH(f.machine.slug)
-      }
+      const target = selectedMachine.value || flat[idx]
+      if (target) { e.preventDefault(); copyText(`ssh ${target.machine.slug}`) }
       break
     }
     case 'a': {
-      e.preventDefault()
-      const first = pendingReqs.value[0]
-      if (first) approveRequest(first.id)
+      // Never approves directly: opens the same confirmation as the button.
+      const first = pending.value[0]
+      if (first) { e.preventDefault(); askApprove(first) }
       break
     }
-    case '/': {
+    case '/':
       e.preventDefault()
-      filterInput.value?.focus()
+      sidebarList.value?.focusFilter()
       break
-    }
-    case '?': {
-      e.preventDefault()
-      showShortcuts.value = true
-      break
-    }
   }
 }
 
-let timeInterval: ReturnType<typeof setInterval> | undefined
+let mq: MediaQueryList | null = null
+const syncDark = () => { isDark.value = themeCtrl.resolved() === 'dark' }
+watch(() => themeCtrl.theme.value, syncDark)
 
 onMounted(() => {
-  fleet.setupSSE()
+  // Subscribe first; the stream's hello triggers the snapshot, so nothing falls in between.
+  fleet.start()
   document.addEventListener('keydown', onKeydown)
-  checkMobile()
-  window.addEventListener('resize', checkMobile)
-  timeInterval = setInterval(() => timeTick.value++, 15_000)
-  void fleet.refresh()
-
-  if ('Notification' in window && Notification.permission === 'default') {
-    void Notification.requestPermission()
+  window.addEventListener('storage', onStorage)
+  // Back from the login detour of a revoke-all that hit 401: ask again, do not do it silently.
+  if (route.query.then === 'revoke-all') {
+    dialog.value = { kind: 'revoke' }
+    router.replace({ query: { tab: 'settings' } })
   }
+  mq = window.matchMedia('(prefers-color-scheme: dark)')
+  mq.addEventListener('change', syncDark)
+  desktopQuery?.addEventListener('change', syncDesktop)
+  syncDark()
+  notifState.value = 'Notification' in window ? Notification.permission : 'unsupported'
 })
 
 onBeforeUnmount(() => {
   fleet.dispose()
   document.removeEventListener('keydown', onKeydown)
-  window.removeEventListener('resize', checkMobile)
-  if (timeInterval) clearInterval(timeInterval)
+  window.removeEventListener('storage', onStorage)
+  mq?.removeEventListener('change', syncDark)
+  desktopQuery?.removeEventListener('change', syncDesktop)
 })
-
-function checkMobile() {
-  isMobile.value = window.innerWidth < 769
-}
 </script>
