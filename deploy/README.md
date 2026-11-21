@@ -1,8 +1,16 @@
 # Deployment configuration (hub)
 
-**Deploy only from the `release/reach-2026-11` branch** (backend and
-dashboard merged). The deploy scripts on `fix/dashboard-2026-11` are older:
-they would downgrade reachd and publish an agent release. Do not run them.
+**Deploy only the exact pushed tip of `release/reach-2026-11`** (backend and
+dashboard merged; one deploy swaps reachd, carrier, dashboard and drop-in).
+`deploy-from-mac.sh`, the hub side it starts, and a direct
+`deploy-jason.sh` run all fetch that branch and refuse unless HEAD equals
+`origin/release/reach-2026-11` exactly (an older commit of the branch is
+refused too). There is no override (`scripts/release-gate.sh`), and a detached
+HEAD is never switched to `main`. For a direct run on the hub:
+`git fetch origin && git checkout --detach origin/release/reach-2026-11`
+first. The deploy scripts on `fix/dashboard-2026-11` are older: they would
+downgrade reachd and publish an agent release. Do not run them, and do not
+deploy the dashboard separately.
 
 Stage 4 preconditions: `fuser` (psmisc) installed, and provisioning frozen
 (`scripts/preflight-provisioning-freeze.sh` runs automatically and refuses

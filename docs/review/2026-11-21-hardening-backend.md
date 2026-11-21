@@ -92,13 +92,13 @@
 
 ## 部署順序（daybreak round 3 的兩階段；每一步之間至少觀察一天）
 
-**只能從 `release/reach-2026-11` 分支部署**（後端＋dashboard 已合併在這裡）。`fix/dashboard-2026-11` 分支上的 deploy 腳本是舊版，會把 reachd 降級並發布 agent，**不准使用**；`fix/hardening-2026-11` 停在 3261072，也不要再從它部署（daybreak round 5 N1）。
+**只能從 `release/reach-2026-11` 分支的最新 commit 部署**（後端＋dashboard 已合併在這裡）。`deploy-from-mac.sh`、hub 端、直接跑 `deploy-jason.sh` 都會 fetch 這個分支，要求 HEAD 和 `origin/release/reach-2026-11` 完全相同（舊 commit 也拒絕），沒有任何 override。`fix/dashboard-2026-11` 分支上的 deploy 腳本是舊版，會把 reachd 降級並發布 agent，**不准使用**；`fix/hardening-2026-11` 停在 3261072，也不要再從它部署（daybreak round 5 N1）。
 
 **Stage 4：只部署 server 端，不發布 agent。**
 
 1. **部署前（唯讀）**：確認 jason 現行 unit、DB 路徑、carrier mode、websocket target 數量（`agent_observations.transport='websocket'`）、沒有 pending request。
 2. **reachd + 資源上限 drop-in**（`deploy-from-mac.sh`，不帶 `REACH_INSTALL_REACHD_UNIT`；`REACH_PUBLISH_AGENT_RELEASE` 預設 0）。前提：jason 已裝 `psmisc`。流程：停 reachd（確認真的停了、沒人開著 DB）→ 在 writers lock 下清掉 retired token、記錄 fence、做 snapshot（這個順序）→ 在 snapshot 私有副本上演練 rollback → 換 binary（另存 probe 副本）→ 旋轉 `jwt_secret` → 啟動 → TCP 加認證的 readiness → carrier 101。部署後：從外面 `ssh omarchy`、`ssh jack`；dashboard 重新登入；確認 carrier 起來、2 台 websocket 機器連上（用 README 的 101 preflight，不要把 secret path 印出來）。
-3. **dashboard 前端**（`fix/dashboard-2026-11`），可以和第 2 步同一天，但在 reachd 之後。
+3. （已刪除：舊的「從 `fix/dashboard-2026-11` 部署 dashboard」步驟。release 分支的 full deploy 會一起 build 並換 dashboard，不需要也不准另外部署。daybreak round 6 R6-P1-01）
 4. **Mac 上換新的 reach-mac-agent**。確認 `~/.ssh/reach-tunnels.conf` 內容正確、`ssh -G jack` 正常。
 5. **nginx 範本**：先在 jason 上 `nginx -t`（1.24），再 reload。觀察 429。
 6. **HAProxy 建議 diff**：Arthur 看過後才套；套完從外面測 SSH 和 HTTPS。

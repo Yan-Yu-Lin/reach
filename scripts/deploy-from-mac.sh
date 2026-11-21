@@ -30,29 +30,22 @@ require_clean_product_tree() {
 }
 
 require_clean_product_tree
+# Release gate (daybreak round 6 R6-P1-01): deploy only from the one release
+# branch, and only its exact pushed tip -- not an older commit of it. The hub
+# checks the same thing again after fetching. No override exists.
+# shellcheck source=release-gate.sh
+. scripts/release-gate.sh
 DEPLOY_BRANCH="$(git symbolic-ref --quiet --short HEAD)" || {
-  echo "[mac] ERROR: deploy-from-mac requires a branch, not detached HEAD" >&2
+  echo "[mac] ERROR: deploy-from-mac requires the ${REACH_RELEASE_BRANCH} branch, not detached HEAD" >&2
   exit 1
 }
-# Deploy only from a release branch (daybreak round 5 N1): the older
-# feature branches carry deploy scripts that downgrade reachd and publish
-# an agent. REACH_ALLOW_BRANCH=<name> overrides for tests.
-case "$DEPLOY_BRANCH" in
-  release/*) ;;
-  *)
-    if [ "${REACH_ALLOW_BRANCH:-}" != "$DEPLOY_BRANCH" ]; then
-      echo "[mac] ERROR: deploy only from a release/* branch (current: $DEPLOY_BRANCH)" >&2
-      exit 1
-    fi ;;
-esac
-DEPLOY_COMMIT="$(git rev-parse HEAD)"
-echo "[mac] fetching origin/${DEPLOY_BRANCH} and verifying ${DEPLOY_COMMIT} is pushed..."
-git fetch origin "$DEPLOY_BRANCH"
-if ! git rev-parse --verify --quiet "origin/$DEPLOY_BRANCH^{commit}" >/dev/null || \
-   ! git merge-base --is-ancestor "$DEPLOY_COMMIT" "origin/$DEPLOY_BRANCH"; then
-  echo "[mac] ERROR: HEAD ${DEPLOY_COMMIT} is not reachable from origin/${DEPLOY_BRANCH}" >&2
+if [ "$DEPLOY_BRANCH" != "$REACH_RELEASE_BRANCH" ]; then
+  echo "[mac] ERROR: deploy only from ${REACH_RELEASE_BRANCH} (current: $DEPLOY_BRANCH)" >&2
   exit 1
 fi
+echo "[mac] fetching origin/${REACH_RELEASE_BRANCH} and verifying HEAD is its tip..."
+require_release_head "[mac]" || exit 1
+DEPLOY_COMMIT="$(git rev-parse HEAD)"
 
 version_from_git() {
   local tag sha ts base
@@ -188,14 +181,16 @@ fi
 # runs that commit's deployment script. No source files are copied from the Mac.
 INSTALL_REACHD_UNIT="${REACH_INSTALL_REACHD_UNIT:-0}"
 case "$INSTALL_REACHD_UNIT" in 0|1) ;; *) echo "[mac] ERROR: REACH_INSTALL_REACHD_UNIT must be 0 or 1" >&2; exit 1 ;; esac
-ssh "${DEPLOY_HOST}" "bash -s" -- "$DEPLOY_COMMIT" "${REMOTE_ARTIFACT_DIR:--}" "${REMOTE_AGENT_TAR:--}" "$AGENT_VERSION" "$INSTALL_REACHD_UNIT" "$PUBLISH_AGENT_RELEASE" <<'REMOTE_DEPLOY'
+ssh "${DEPLOY_HOST}" "bash -s" -- "$DEPLOY_COMMIT" "$REACH_RELEASE_BRANCH" "${REMOTE_ARTIFACT_DIR:--}" "${REMOTE_AGENT_TAR:--}" "$AGENT_VERSION" "$INSTALL_REACHD_UNIT" "$PUBLISH_AGENT_RELEASE" <<'REMOTE_DEPLOY'
 set -Eeuo pipefail
 deploy_commit="$1"
-artifact_dir="$2"
-artifact_tar="$3"
-agent_version="$4"
-install_reachd_unit="$5"
-publish_agent_release="$6"
+release_branch="$2"
+artifact_dir="$3"
+artifact_tar="$4"
+agent_version="$5"
+install_reachd_unit="$6"
+publish_agent_release="$7"
+case "$release_branch" in release/*) ;; *) echo "[mac] ERROR: bad release branch" >&2; exit 1 ;; esac
 case "$publish_agent_release" in 0|1) ;; *) echo "[mac] ERROR: bad publish flag" >&2; exit 1 ;; esac
 cleanup_remote() {
   [ "$publish_agent_release" = 1 ] || return 0
@@ -249,13 +244,15 @@ if [ -n "$status" ]; then
   printf '%s\n' "$status" >&2
   exit 1
 fi
-git fetch origin
-if ! git cat-file -e "${deploy_commit}^{commit}" 2>/dev/null; then
-  echo "[mac] ERROR: pushed commit ${deploy_commit} is unavailable on hub" >&2
+# Fetch exactly the release branch and require its tip to be the commit the
+# Mac verified (an older commit of the branch is refused).
+git fetch --quiet --no-tags origin "+refs/heads/${release_branch}:refs/remotes/origin/${release_branch}"
+release_tip="$(git rev-parse --verify --quiet "refs/remotes/origin/${release_branch}^{commit}")" || {
+  echo "[mac] ERROR: origin/${release_branch} is unavailable on hub" >&2
   exit 1
-fi
-if [ -z "$(git for-each-ref --format='%(refname)' --contains "$deploy_commit" refs/remotes/origin/)" ]; then
-  echo "[mac] ERROR: commit ${deploy_commit} is not reachable from an origin branch on hub" >&2
+}
+if [ "$release_tip" != "$deploy_commit" ]; then
+  echo "[mac] ERROR: hub sees origin/${release_branch} at ${release_tip}, not ${deploy_commit}" >&2
   exit 1
 fi
 git checkout --detach "$deploy_commit"

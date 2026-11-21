@@ -2,8 +2,10 @@
 set -Eeuo pipefail
 
 # Deploy Reach to a hub server from the repo checked out on that hub.
-# Example: ssh <hub-alias> 'cd ~/reach && bash scripts/deploy-jason.sh'
-# Or locally on the hub: cd ~/reach && bash scripts/deploy-jason.sh
+# Normally started by scripts/deploy-from-mac.sh. For a direct run on the hub:
+#   cd ~/reach && git fetch origin && git checkout --detach origin/release/reach-2026-11
+#   bash scripts/deploy-jason.sh
+# It refuses anything but the exact tip of the release branch (release-gate.sh).
 #
 # - Existing deployments leave hosted reach-agent artifacts unchanged by default.
 #   Set REACH_PUBLISH_AGENT_RELEASE=1 to build/install/publish an agent release.
@@ -150,38 +152,21 @@ require_clean_tree() {
 }
 
 require_clean_tree
-if [ -n "${REACH_DEPLOY_COMMIT:-}" ]; then
-  echo "[deploy] checking out explicit commit ${REACH_DEPLOY_COMMIT}..."
-  git fetch origin
-  if ! git cat-file -e "${REACH_DEPLOY_COMMIT}^{commit}" 2>/dev/null; then
-    echo "[deploy] ERROR: commit ${REACH_DEPLOY_COMMIT} is unavailable after fetching origin" >&2
-    exit 1
-  fi
-  deploy_commit="$(git rev-parse "${REACH_DEPLOY_COMMIT}^{commit}")"
-  if [ -z "$(git for-each-ref --format='%(refname)' --contains "$deploy_commit" refs/remotes/origin/)" ]; then
-    echo "[deploy] ERROR: commit ${deploy_commit} is not reachable from an origin branch" >&2
-    exit 1
-  fi
-  git checkout --detach "$deploy_commit"
-  test "$(git rev-parse HEAD)" = "$deploy_commit"
-else
-  if ! current_branch="$(git symbolic-ref --quiet --short HEAD)"; then
-    default_branch="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)"
-    default_branch="${default_branch#origin/}"
-    if [ -z "$default_branch" ]; then
-      default_branch=main
-    fi
-    echo "[deploy] detached HEAD; switching to ${default_branch}..."
-    if git show-ref --verify --quiet "refs/heads/$default_branch"; then
-      git switch "$default_branch"
-    else
-      git switch --track -c "$default_branch" "origin/$default_branch"
-    fi
-  fi
-  echo "[deploy] pulling latest..."
-  git pull --ff-only
-  deploy_commit="$(git rev-parse HEAD)"
+# Release gate (daybreak round 6 R6-P1-01): deploy only the exact pushed tip
+# of the one release branch. This script never switches branches or pulls:
+# the checkout must already be that tip (deploy-from-mac.sh checks it out
+# before starting this script; for a direct run on the hub, run
+#   git fetch origin && git checkout --detach origin/<release branch>
+# first). A detached HEAD is never moved to main.
+# shellcheck source=release-gate.sh
+. scripts/release-gate.sh
+require_release_head "[deploy]" || exit 1
+deploy_commit="$(git rev-parse HEAD)"
+if [ -n "${REACH_DEPLOY_COMMIT:-}" ] && [ "$REACH_DEPLOY_COMMIT" != "$deploy_commit" ]; then
+  echo "[deploy] ERROR: REACH_DEPLOY_COMMIT ${REACH_DEPLOY_COMMIT} is not the checked-out release tip ${deploy_commit}" >&2
+  exit 1
 fi
+echo "[deploy] deploying ${REACH_RELEASE_BRANCH} at ${deploy_commit}"
 
 AGENT_VERSION="${REACH_AGENT_VERSION:-$(version_from_git)}"
 bash scripts/validate-release-version.sh "$AGENT_VERSION" || {
