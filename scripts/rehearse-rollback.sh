@@ -82,8 +82,9 @@ stop() {
   done
 }
 heartbeat() {
+  printf 'header = "Authorization: Bearer %s"\n' "$canary_token" | \
   curl -s -o /dev/null -w '%{http_code}' -X POST "http://$listen/api/client/agent/heartbeat" \
-    -H "Authorization: Bearer $canary_token" -H 'Content-Type: application/json' \
+    --config - -H 'Content-Type: application/json' \
     -d '{"machine_id":"'"$canary_id"'","agent_version":"rehearsal","applied_generation":1,"observed":{"local_ssh":{"state":"healthy"},"tunnel":{"state":"stopped"},"persistence":{},"keys":{}}}'
 }
 restore_copy() { rm -f "$work/reach.db-wal" "$work/reach.db-shm"; cp "$work/snapshot.db" "$work/reach.db.tmp"; mv -f "$work/reach.db.tmp" "$work/reach.db"; }

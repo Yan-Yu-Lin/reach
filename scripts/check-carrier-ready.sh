@@ -12,9 +12,13 @@ path="$(sed -n 's/^REACH_WS_PATH_PREFIX=//p' "$env_file" | head -1)"
 case "$path" in /*/) ;; *) echo "check-carrier-ready: no usable REACH_WS_PATH_PREFIX in $env_file" >&2; exit 1 ;; esac
 # Read only the status line; the carrier then waits for frames, so the
 # connection is closed after a short timeout.
-code="$(curl -s -o /dev/null -w '%{http_code}' --http1.1 --max-time 3 \
-  -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' \
-  -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' "http://$listen$path" || true)"
+# The secret path goes to curl on stdin (--config -), never in argv
+# (daybreak round 5 N8). printf is a bash builtin.
+code="$(printf 'url = "http://%s%s"\n' "$listen" "$path" \
+  | curl -s -o /dev/null -w '%{http_code}' --http1.1 --max-time 3 \
+    -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' \
+    -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' --config - || true)"
+unset path
 if [ "$code" != 101 ]; then
   echo "check-carrier-ready: upgrade on the configured path returned ${code:-nothing}" >&2
   exit 1

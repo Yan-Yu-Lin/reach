@@ -16,8 +16,10 @@ reachd_bin="$1"; config="$2"; listen="$3"
 case "$listen" in 127.0.0.1:*|localhost:*) ;; *) echo "check-reachd-ready: listen address must be loopback" >&2; exit 2 ;; esac
 token="$("$reachd_bin" admin-probe-token --config "$config" 2>/dev/null)" || {
   echo "check-reachd-ready: could not mint probe token" >&2; exit 1; }
-code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-  -H "Authorization: Bearer $token" "http://$listen/api/admin/health")" || code=000
+# The token goes to curl on stdin (--config -), never in argv: /proc on the
+# hub is world-readable (daybreak round 5 N8). printf is a bash builtin.
+code="$(printf 'header = "Authorization: Bearer %s"\nurl = "http://%s/api/admin/health"\n' "$token" "$listen" \
+  | curl -s -o /dev/null -w '%{http_code}' --max-time 5 --config -)" || code=000
 unset token
 if [ "$code" != 200 ]; then
   echo "check-reachd-ready: authenticated GET /api/admin/health returned $code" >&2
