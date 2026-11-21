@@ -110,7 +110,9 @@ Stage 5 前必修／必驗（daybreak round 4 的評估）：
 
 - **P2-G Windows junction**：handle-relative writer（設計在 `docs/design/2026-11-21-windows-keyfile-traversal.md`），或至少在 Windows VM 做高次數 junction race 和 ACL 驗證。這是 SYSTEM→target user 的權限邊界，不能發布後再補。
 - **Windows VM 實測**：Disabled／Manual／Automatic sshd、`-InstallOpenSSH`、`setup.ps1 -Reinstall` 的 preflight（目前只在 Linux PowerShell 7 加 mock 測過）、ACL。
-- **P2-F bootstrap trust root**：如果 Stage 5 要重新開放新增或重裝機器，setup 腳本必須先改從獨立的 immutable origin（GitHub release）取得；只更新既有 agent 的話可以晚一點，但新增機器要繼續關閉。
+- **P2-F bootstrap trust root（daybreak round 5：不能延後）**：現在的 `REACH_PUBLISH_AGENT_RELEASE=1` 會一起換掉公開的 `setup.sh`／`setup.ps1` 和 latest pointer，所以它不是「只更新既有 agent」。Stage 5 前二選一：(a) 先做一個真正的 agent-artifacts-only 發布模式（只放新版 artifact 和 manifest，不動 setup 腳本、不開放新增機器），或 (b) 先完成 P2-F，把 setup 腳本改從獨立的 immutable origin（GitHub release）取得。
+- **Go 版本**：如果 fleet 裡還有 CentOS 6／Linux 2.6.32，agent 要用 Go ≤ 1.23.x 編譯（Go 1.24 起不支援這麼舊的 kernel），並在真的 VM 上 smoke。現在的 Stage 5 wrapper 用環境裡的 Go，沒有 pin。
+- **daybreak round 5 的實機 gate**：PID 1 systemd 下的 watcher 死亡、startup restore、self-restart、pre-hardening binary 的 backup；雙棧／DNS64 的 IPv6 translation。
 - **P2-C carrier per-machine credential**：建議 Stage 5 的 agent 就帶 phase 1（送 credential），等 fleet 都更新後 carrier 才強制。過渡期：exact nginx route、部署前數 websocket target、出事要 rotate path。
 - **P2-D internal-sshd 本身降權**：既有 agent 的更新可以先做；但新的 system 安裝如果會用到 root internal-sshd，在完成降權前只開放給可以救回、明確接受風險的 target。
 - RSA-only／OpenSSH 5.3 target 的 update confirm（RSA 一次性 key）要在真的舊 sshd 上驗一次。
@@ -252,3 +254,35 @@ Stage 5 前必修／必驗（daybreak round 4 的評估）：
 - PowerShell 7（Linux container）：setup.ps1 解析與 reinstall preflight（mock）。
 - Mac：`go test -race ./...` 全過；`scripts/test-deploy-from-mac.sh`、`scripts/test-reach-sync-mac.sh`、`scripts/test-setup-bootstrap.sh`。
 - **還沒有實測**：Windows（VM）、CentOS 6、OpenSSH 5.3／RSA-only 的 update confirm、HAProxy 2.8、PID 1 systemd 下完整的部署和 rollback、sandbox unit、外部 vantage 的 WebSocket／SSH E2E。
+
+## astra round 4 + daybreak round 5（審 3261072／fd5d7de，2026-11-21）
+
+兩份報告：`~/30-39-Research/34-tech-research/2026-11-21-reach-hardening-astra-review-r4.md`、`2026-11-21-reach-security-deep-daybreak-round5.md`。重複的合併成一列。所有新測試都做過 mutation 或「在舊版會失敗」驗證（少數不能編譯或沒有效果的 mutant 換成有效的再測）。
+
+**分支：** 從 `fix/hardening-2026-11`（3261072）開 `release/reach-2026-11`，merge `fix/dashboard-2026-11`（fd5d7de）（e2df69b）。merge 後後端與 3261072 完全相同、`dashboard/` 與 fd5d7de 完全相同。之後的修正都在 release 分支；hardening 分支停在 3261072。
+
+| 編號 | 發現 | 怎麼修 | 證明 | commit |
+|---|---|---|---|---|
+| daybreak N1（P1） | 兩個分支沒有安全的整合部署路徑；dashboard 分支的 deploy 腳本會降級 reachd 並發布 agent | 建 release 分支並 merge dashboard；`deploy-from-mac.sh` 只接受 `release/*` 分支；文件寫明只能從 release 分支部署、dashboard 分支的腳本不准用 | merge 後驗證：`go test -race ./...`、dashboard vitest 90/90、typecheck、generate、container A～L；`scripts/test-deploy-from-mac.sh` 加上非 release 分支被拒 | e2df69b、390857e |
+| astra R4-01（P1）＋ daybreak N6 | writers lock 沒涵蓋 fence check→restore，CLI 寫入被 restore 吃掉還印成功；JWT rotation 的 marker 檢查有 TOCTOU | 兩個 critical section 各由**一個** reachd process 持 exclusive writers lock 完成：`reachd deploy-prepare`（清 retired token→fence→snapshot→在同一把鎖裡判斷 marker 並旋轉 jwt_secret）、`reachd deploy-restore`（forensic copy→fence check→snapshot restore）。執行期間 reachd／CLI 都起不來；deploy-prepare 之後到新版啟動前的寫入會在 fence 之上，restore 會拒絕；deploy-restore 之後的寫入落在已還原的 DB 上，不會被覆蓋 | container 情境 L（restore 持鎖時 CLI 寫入被拒、沒有任何寫入遺失）；astra 的 `review-rollback-lock-gap.sh` 改成新流程後通過（沒有寫入遺失）；`TestRestoreRefusedWhileAWriterRuns`、`TestRestoreRefusedAfterDurableAction`、`TestRestoreWithoutDurableActions`、`TestDeployPrepareRotatesUnderTheLock` | 8189645 |
+| astra R4-02（P1） | CAS 輸了、補償失敗，卻留下 retired／complete、port 已釋放 | 沒證明 hub 乾淨就在一個 transaction 裡：machine 改 retiring／cleanup_failed、撤 token；tunnel 拿回原本的 user／port、標 cleanup_failed、清 cleanup_verified_at。port 已被別台拿走就記錄衝突交人處理，不覆寫新 owner。SQL 錯誤寫 log | `TestFailedProvisionCompensationKeepsTombstone`（port 沒被占／已被占兩種） | 7043afe |
+| daybreak N3 ＝ astra R4-04 | delivered 依賴 agent 自報 tunnel 狀態：合法但 tunnel 起不來的機器被撤銷；偷 token 者可假報 connected | 任何通過認證、observation 寫入成功的 heartbeat 都標 delivered（錯誤不吞）；tunnel 健康交給 hub probe。recovery 也不撤銷有 observation 的 response_pending。文件寫明：provision 後一小時內完全沒 heartbeat 才會被撤銷 | `TestStoppedTunnelHeartbeatStillMarksDelivered`（astra 的 PoC） | 385024d |
+| daybreak N8 | readiness 的 admin JWT 和 carrier path 出現在 curl argv（jason 的 /proc 沒有 hidepid） | JWT、carrier path、rehearsal canary token 都用 bash builtin `printf` 經 stdin 給 `curl --config -` | `scripts/test-readiness-argv.sh`（假 curl 記錄 argv／stdin；舊版失敗） | fcc4c42 |
+| Stage 4 前提 | provisioning 要凍結 | `scripts/preflight-provisioning-freeze.sh`（唯讀）在部署改任何東西之前檢查：pending／approved／provisioning 的 request、claimed／os_created／response_pending／cleanup_pending 的 provision 都必須是 0；文件：從 fence 到 Stage 5 結束不新增、不重裝、不手動安裝 | smoke（乾淨→通過，有 pending／response_pending→拒絕） | 390857e |
+| astra R4-03 ＋ daybreak N7 | 同一個 DB 用 symlink alias 會拿到另一組 lock；lock 檔、shell `exec 9>`、config rotation 都會跟隨 symlink | SQLite 和 lock 用同一個 canonical 絕對路徑，DB 路徑本身是 symlink 就拒絕；lock 檔用 `openat(O_NOFOLLOW)`，在檢查過的目錄下，fstat 必須是自己的、0600、link count 1 的 regular file；shell 改用 `open_deploy_lock`（目錄必須是自己的、group／other 不可寫，lock 不能是 symlink，`exec 9<>` 不截斷）；config rotation 只接受自己的、link count 1、group／other 不可寫的 regular file，directory fsync 錯誤會回報 | `TestDatabaseAndLockAliasesRefused`、`TestRotateRefusesSymlinkAndLooseConfig`、`scripts/test-deploy-lock.sh`（Mac＋Ubuntu） | 8189645、b9dd60a |
+| daybreak N4 | admin 帳號叫 `system` 時，手動 update 不寫 journal、fence 也忽略 | `queueAgentUpdate` 改用 typed origin（`updateManual`／`updateAutoPolicy`）；自動 policy 的 audit 改成 `machine.agent_update.auto_queue`；`system` 等 Reach 自己用的 actor 名稱不能當 initial admin username | `TestUpdateOriginIsTyped` | 48fe5d6 |
+| daybreak N5 ＋ astra R4-08、R4-09 | `100.64/10`、NAT64、6to4 等沒擋；carrier 的 URL 自己授權自己的 origin | 只允許明確的 global unicast，並排除 RFC 6890 的特殊用途區段（`100.64/10`、benchmark、documentation、reserved、`64:ff9b::/96`、`64:ff9b:1::/48`、`2002::/16`、Teredo 等）；carrier 下載的 origin 只能來自 installer 設定的 API URL | `TestSpecialPurposeAddressesRefused`、`TestCarrierDownloadOnlyFromConfiguredAPI`（foreign origin 一次 request 都沒收到） | f856628 |
+| daybreak N2 ＝ astra R4-05、R4-06 | 舊 watcher 會回滾下一次 attempt；backup 在 lock 外、同秒同名可被覆蓋 | watcher 帶 `--attempt`，在 update lock 裡比對，不一致就不動；startup re-arm 也帶 attempt。backup 在 lock 裡由擁有 attempt 的 worker 建立，檔名用 attempt，`O_EXCL|O_NOFOLLOW`、fsync | `TestOldWatcherLeavesNewAttemptAlone`、`TestBackupIsCreatedExclusively` | 1544728 |
+| astra R4-07 | 同版本 rollback 的 restart_pending 永遠收不了尾 | 用正在執行的 image 的 hash（`/proc/self/exe`）比對 backup hash，不再比版本字串 | `TestRestartPendingFinishedByRunningImage` | 1544728 |
+| daybreak N10（Stage 5） | DataDir 檢查在 I/O 之後；probe key 清理失敗時靜默 confirm | 讀 state 前先檢查 DataDir（symlink／別人的目錄直接拒絕）；一次性 key 清不掉就讓 probe 失敗，不 confirm。**restart／mark 由存活的 helper 處理、逐層 openat、pre-hardening backup 的實測**：只做到「restored binary 自己在啟動時用 image hash 收尾」，完整 helper 與 PID 1 實測列為 Stage 5 gate | `TestSymlinkedDataDirNotRead` | 1544728 |
+| astra R4-11（P3） | 沒有 hash 的 state 仍會重放 restore | 沒有 identity 的 state 直接結束，不重放 | `TestHashlessStateIsNotReplayed` | 1544728 |
+| daybreak N9 ＋ astra R4-10 | 同值 process-title 每次都寫 journal、加 generation；同值 policy 仍寫 decision audit；舊 fence 在 prune 後會誤判；備份沒有成組清理 | process-title 跟 canonical 值相同就不寫（不加 generation、沒有 journal）；policy 沒變就不寫 audit；`deploy-restore` 拒絕超過 30 天的 fence（journal 保留 90 天）；fence、snapshot、probe、config backup、forensic set 依部署時間成組清理 | `TestRepeatedSettingsAreNoOps`、`TestRestoreRefusesOldFence`、group prune smoke | b458a6b、8189645 |
+| astra R4-12（P3） | 未發布中間版的 linked provisioned／NULL phase 不會被接手 | one-shot backfill：有 observation 的標 delivered，其餘標 response_pending；沒有 machine link 的（production 8c74086）不動 | `TestProvisionPhaseBackfill` | b458a6b |
+| astra R4-13（P3） | 不用處理（協調者指示） | — | — | — |
+| Stage 5 前提 | P2-F 不能延後；Go 版本 pin | 寫進「部署順序」的 Stage 5 前提（見上） | 文件 | 本 commit |
+
+### 平台驗證現況（round 5 後，release 分支）
+
+- Linux（Ubuntu 24.04 container）：rollback A～L（真的 `deploy-jason.sh` 函式、真的 `deploy-prepare`／`deploy-restore`、正式路徑、真的 8c74086 和新版 reachd、新版 carrier）；astra 的 lock-gap 重現（改成新流程）；跨 process flock；reach-agent 與根套件全部測試；deploy lock helper。
+- Mac：`go test -race ./...` 全過；dashboard vitest 90/90、typecheck、generate；`test-deploy-from-mac.sh`、`test-readiness-argv.sh`、`test-deploy-lock.sh`、`test-reach-sync-mac.sh`、`test-setup-bootstrap.sh`。
+- **還沒有實測**：Windows VM、CentOS 6、OpenSSH 5.3、HAProxy 2.8、PID 1 systemd 下完整的部署／rollback／agent self-restart、sandbox unit、外部 vantage 的 E2E、雙棧／DNS64。
