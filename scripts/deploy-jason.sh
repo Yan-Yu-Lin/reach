@@ -330,14 +330,16 @@ install_new_reachd() {
 # The forensic copy, fence check and snapshot restore are done by
 # "reachd deploy-restore" under the writers lock (deploy_txn.go).
 
-# restore_previous_reachd_binary: copy (never move) the rollback backup back
-# to /opt/reach/reachd and verify it.
-restore_previous_reachd_binary() {
-  sudo test -f "$REACHD_ROLLBACK" || { echo "[deploy] ERROR: rollback binary $REACHD_ROLLBACK is missing" >&2; return 1; }
-  sudo install -m 0755 "$REACHD_ROLLBACK" /opt/reach/reachd.rollback-candidate || return 1
-  sudo mv -f /opt/reach/reachd.rollback-candidate /opt/reach/reachd || return 1
-  sudo test -x /opt/reach/reachd && sudo cmp -s "$REACHD_ROLLBACK" /opt/reach/reachd
+# handoff_args: what deploy-restore / deploy-handoff put at /opt/reach/reachd
+# before unlocking: the rollback copy, or (fresh install) nothing.
+handoff_args() {
+  if [ "$REACHD_EXISTED" = 1 ]; then
+    printf -- '--binary-target /opt/reach/reachd --rollback-binary %s' "$REACHD_ROLLBACK"
+  else
+    printf -- '--binary-target /opt/reach/reachd --remove-binary'
+  fi
 }
+
 
 # reachd_ready: TCP plus an authenticated admin request, the token minted by
 # the private probe copy of the new binary.
@@ -577,9 +579,11 @@ rollback_reachd() {
       if [ -z "$DEPLOY_FENCE" ] || [ -z "$PROBE_BIN" ] || ! sudo test -x "$PROBE_BIN"; then
         echo "[deploy] ERROR: no deploy fence or fence checker; NOT restoring the database automatically" >&2
         db_restore_ok=0
-      elif ! sudo "$PROBE_BIN" deploy-restore --config /etc/reach/config.yaml --fence "$DEPLOY_FENCE" --snapshot "$DB_BACKUP_PATH" --forensic "$failed_db_dir" >&2; then
-        echo "[deploy] ERROR: database NOT restored automatically (durable actions after the fence, a writer holds the lock, or a restore step failed)" >&2
+      elif ! sudo "$PROBE_BIN" deploy-restore --config /etc/reach/config.yaml --fence "$DEPLOY_FENCE" --snapshot "$DB_BACKUP_PATH" --forensic "$failed_db_dir" $(handoff_args) >&2; then
+        echo "[deploy] ERROR: database NOT restored automatically, or the previous binary could not be put back (durable actions after the fence, a writer holds the lock, or a restore/handoff step failed)" >&2
         db_restore_ok=0
+      else
+        binary_handed_off=1
       fi
     fi
     if [ "$db_restore_ok" != 1 ]; then
@@ -590,9 +594,23 @@ rollback_reachd() {
       echo "[deploy] ERROR: options: start the new binary as is, or restore the snapshot (losing the actions listed above) and the old binary" >&2
       exit "$exit_code"
     fi
+    # The previous binary goes back to /opt/reach/reachd while the writers
+    # lock is still held (inside deploy-restore, or deploy-handoff when the
+    # DB was not touched): nobody can start the new binary on the restored
+    # database in between (astra R5-01). The service is started only after
+    # the lock is released, so a previous reachd that takes the lock shared
+    # does not lock itself out.
+    if [ "${binary_handed_off:-0}" != 1 ]; then
+      if [ -z "$PROBE_BIN" ] || ! sudo test -x "$PROBE_BIN" || ! sudo "$PROBE_BIN" deploy-handoff --config /etc/reach/config.yaml $(handoff_args) >&2; then
+        rollback_incomplete "previous reachd binary not put back"
+        report_incomplete
+        echo "[deploy] ERROR: leaving reachd stopped; the binary at /opt/reach/reachd may still be the new one" >&2
+        exit "$exit_code"
+      fi
+    fi
     rollback_ready=0
     if [ "$REACHD_EXISTED" = 1 ]; then
-      if restore_previous_reachd_binary && sudo systemctl start reachd; then
+      if sudo cmp -s "$REACHD_ROLLBACK" /opt/reach/reachd && sudo systemctl start reachd; then
         for attempt in $(seq 1 30); do
           # TCP plus an authenticated admin request against the restored DB,
           # token minted by the probe copy (the old binary cannot).
@@ -606,9 +624,8 @@ rollback_reachd() {
         echo "[deploy] ERROR: could not put the previous reachd binary back" >&2
       fi
     else
-      echo "[deploy] removing partial fresh reachd installation" >&2
-      if sudo test -e /opt/reach/reachd; then sudo mv /opt/reach/reachd "/opt/reach/reachd.failed.$DEPLOY_TS"; fi
-      rollback_ready=1
+      echo "[deploy] partial fresh reachd installation moved away" >&2
+      if sudo test -e /opt/reach/reachd; then rollback_incomplete "new reachd still at /opt/reach/reachd"; else rollback_ready=1; fi
     fi
     if [ "$rollback_ready" != 1 ]; then
       sudo systemctl stop reachd

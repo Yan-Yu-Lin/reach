@@ -27,6 +27,10 @@
 #   L. a CLI writer runs while the rollback restores the DB: it is refused
 #      (writers lock held by deploy-restore), nothing it wrote is lost
 #      (astra R4-01).
+#   M. reachd is started while the rollback holds the lock: the previous
+#      binary is put back before the lock is released, so the process that
+#      runs afterwards is the previous one, never the new one on the
+#      restored DB (astra R5-01).
 #   I. fuser is missing -> cannot prove nobody holds the DB -> stopped,
 #      DB untouched (astra R3-03).
 #   J. another SQLite client holds the DB -> stopped, DB untouched.
@@ -59,7 +63,8 @@ pat='/opt/reach/reachd serve --config'
 case "$*" in
   "stop reachd") [ -e /tmp/fail-stop ] && exit 70
     pkill -f "$pat"; for i in $(seq 1 50); do pgrep -f "$pat" >/dev/null || break; sleep 0.1; done ;;
-  "start reachd") setsid /opt/reach/reachd serve --config /etc/reach/config.yaml >>/var/log/reachd.log 2>&1 < /dev/null &
+  "start reachd") pgrep -f "$pat" >/dev/null && exit 0   # like systemd: start of an active unit is a no-op
+    setsid /opt/reach/reachd serve --config /etc/reach/config.yaml >>/var/log/reachd.log 2>&1 < /dev/null &
     for i in $(seq 1 50); do curl -s -o /dev/null http://127.0.0.1:9300/ && break; sleep 0.1; done ;;
   "is-active --quiet reachd") pgrep -f "$pat" >/dev/null ;;
   "show -p MainPID --value reachd") p="$(pgrep -f "$pat" | head -1)"; echo "${p:-0}" ;;
@@ -162,6 +167,10 @@ scenario() { # name kind
       # holds the writers lock. A sudo wrapper pauses deploy-restore
       # right after it started (it holds the lock from its first step).
       mkdir -p /tmp/lockpause; /usr/bin/rm -f /tmp/lockpause/*; touch /tmp/pause-restore ;;
+    lateStart)
+      # M (astra R5-01): someone starts reachd while the rollback holds
+      # the lock; the binary on disk is handed back inside the lock.
+      mkdir -p /tmp/lockpause; /usr/bin/rm -f /tmp/lockpause/*; touch /tmp/pause-restore ;;
     nofuser) mv /usr/bin/fuser /usr/bin/fuser.off ;;
     holder)
       # Another SQLite client keeps the DB open (a CLI, a backup script).
@@ -175,7 +184,20 @@ scenario() { # name kind
 
   # --- a later deploy step fails: run the real rollback --------------------
   set +e
-  if [ "$2" = latecli ]; then
+  if [ "$2" = lateStart ]; then
+    ( ROLLBACK_EXIT_CODE=1 rollback_reachd ) > /tmp/rollback.out 2>&1 &
+    rbpid=$!
+    for _ in $(seq 1 300); do [ -e /tmp/lockpause/holding ] && break; sleep 0.05; done
+    [ -e /tmp/lockpause/holding ] || { cat /tmp/rollback.out; fail "M: deploy-restore never took the lock"; }
+    systemctl start reachd || true   # a start during the critical section
+    sleep 1
+    touch /tmp/lockpause/release
+    wait $rbpid
+    out="$(cat /tmp/rollback.out)"
+    m_pid="$(pgrep -f '/opt/reach/reachd serve --config' | head -1)"
+    m_running="$( [ -n "$m_pid" ] && sha256sum /proc/$m_pid/exe | cut -d' ' -f1)"
+    /usr/bin/rm -f /tmp/pause-restore /tmp/lockpause/*
+  elif [ "$2" = latecli ]; then
     ( ROLLBACK_EXIT_CODE=1 rollback_reachd ) > /tmp/rollback.out 2>&1 &
     rbpid=$!
     for _ in $(seq 1 300); do [ -e /tmp/lockpause/holding ] && break; sleep 0.05; done
@@ -208,6 +230,13 @@ scenario() { # name kind
       [ -f /opt/reach/reachd.rollback.$DEPLOY_TS ] || fail "A: rollback backup was consumed"
       [ "$claimed" = 1 ] || fail "A: success not reported"
       [ -s $DB_BACKUP_DIR/failed.$DEPLOY_TS/reach.db ] || fail "A: forensic set missing" ;;
+    lateStart)
+      old_sha="$(sha256sum $W/reachd-old | cut -d' ' -f1)"
+      [ "$m_running" = "$old_sha" ] || { printf '%s\n' "$out"; fail "M: the running reachd is not the previous binary"; }
+      cmp -s /opt/reach/reachd $W/reachd-old || fail "M: previous binary not on disk"
+      [ "$result" = running/200 ] || fail "M: expected the previous reachd running"
+      [ "$claimed" = 1 ] || fail "M: success not reported"
+      echo "M: start during the locked restore: running image is the previous binary" ;;
     latecli)
       [ "$late_rc" != 0 ] || { cat /tmp/rollback.out /tmp/late.out; fail "L: CLI write succeeded during the locked restore"; }
       [ "$late_count" = 0 ] || fail "L: CLI write landed during the locked restore"
@@ -289,12 +318,13 @@ echo "== D: systemctl stop fails ==";                scenario D stopfail
 echo "== E: forensic copy fails ==";                 scenario E forensic
 echo "== F: revoke-all while audit inserts fail =="; scenario F auditfail
 echo "== L: CLI write during the locked restore ==";  scenario L latecli
+echo "== M: reachd started during the locked restore =="; scenario M lateStart
 echo "== I: fuser missing ==";                       scenario I nofuser
 echo "== J: another process holds the DB ==";        scenario J holder
 echo "== G: carrier rollback ==";                   carrier_case G 1 none; carrier_case G0 0 none
 echo "== H: previous carrier fails to start ==";      carrier_case H 1 start
 echo "== H2: carrier env restore fails ==";          carrier_case H2 1 env
-echo "PASS: rollback scenarios A-L"
+echo "PASS: rollback scenarios A-M"
 EOS
 chmod +x "$work/run.sh"
 docker run --rm -v "$work:/w" ubuntu:24.04 bash /w/run.sh

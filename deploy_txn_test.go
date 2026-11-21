@@ -186,3 +186,31 @@ func TestRotateRefusesSymlinkAndLooseConfig(t *testing.T) {
 		t.Fatal("hard-linked config rotated")
 	}
 }
+
+// Astra R5-01: the previous binary is put back inside the locked restore;
+// fresh installs move the new binary away.
+func TestRestoreHandsBackTheBinary(t *testing.T) {
+	_, store, fence, snap, dir := txnFixture(t)
+	path := store.path
+	_ = store.Close()
+	target := filepath.Join(dir, "reachd")
+	rollback := filepath.Join(dir, "reachd.rollback")
+	_ = os.WriteFile(target, []byte("new"), 0o755)
+	_ = os.WriteFile(rollback, []byte("old"), 0o755)
+	rb, remove := rollback, false
+	h := binaryHandoff{target: &target, rollback: &rb, remove: &remove}
+	if err := restoreUnderLockWithHandoff(context.Background(), path, fence, snap, filepath.Join(dir, "failed"), time.Now(), h); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(target); string(b) != "old" {
+		t.Fatalf("binary after restore: %q", b)
+	}
+	empty, rm := "", true
+	h2 := binaryHandoff{target: &target, rollback: &empty, remove: &rm}
+	if err := h2.apply(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(target); err == nil {
+		t.Fatal("fresh-install binary not moved away")
+	}
+}

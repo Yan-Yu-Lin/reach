@@ -88,20 +88,143 @@ func cliDeployRestore(ctx context.Context, args []string) error {
 	fencePath := fs.String("fence", "", "fence recorded by deploy-prepare")
 	snapshotPath := fs.String("snapshot", "", "snapshot written by deploy-prepare")
 	forensicDir := fs.String("forensic", "", "directory to create for the failed database files")
+	h := handoffFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *fencePath == "" || *snapshotPath == "" || *forensicDir == "" {
 		return errors.New("--fence, --snapshot and --forensic are required")
 	}
+	if err := h.validate(); err != nil {
+		return err
+	}
 	cfg, err := LoadConfig(*cfgPath)
 	if err != nil {
 		return err
 	}
-	return restoreUnderLock(ctx, cfg.DBPath, *fencePath, *snapshotPath, *forensicDir, time.Now())
+	return restoreUnderLockWithHandoff(ctx, cfg.DBPath, *fencePath, *snapshotPath, *forensicDir, time.Now(), h)
+}
+
+// binaryHandoff: what to put at the reachd binary path before the writers
+// lock is released (astra R5-01). Exactly one of rollback/remove is set.
+type binaryHandoff struct {
+	target   *string
+	rollback *string
+	remove   *bool
+}
+
+func handoffFlags(fs interface {
+	String(string, string, string) *string
+	Bool(string, bool, string) *bool
+}) binaryHandoff {
+	return binaryHandoff{
+		target:   fs.String("binary-target", "", "reachd binary path to hand back before unlocking"),
+		rollback: fs.String("rollback-binary", "", "previous reachd binary to install at --binary-target"),
+		remove:   fs.Bool("remove-binary", false, "fresh install: move the new binary away instead"),
+	}
+}
+
+func (h binaryHandoff) set() bool { return h.target != nil && *h.target != "" }
+
+func (h binaryHandoff) validate() error {
+	if !h.set() {
+		if (h.rollback != nil && *h.rollback != "") || (h.remove != nil && *h.remove) {
+			return errors.New("--rollback-binary/--remove-binary need --binary-target")
+		}
+		return nil
+	}
+	if (*h.rollback == "") == !*h.remove {
+		return errors.New("give exactly one of --rollback-binary or --remove-binary")
+	}
+	return nil
+}
+
+// apply puts the previous binary (or nothing) at the target: a verified
+// copy, fsync, atomic rename, hash check. Runs while the caller holds the
+// writers lock, so no process can start the new binary on the restored
+// database in between.
+func (h binaryHandoff) apply() error {
+	target := *h.target
+	if *h.remove {
+		if _, err := os.Lstat(target); errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err := os.Rename(target, target+".failed."+time.Now().UTC().Format("20060102T150405Z")); err != nil {
+			return fmt.Errorf("move new binary away: %w", err)
+		}
+		return syncDirPath(filepath.Dir(target))
+	}
+	cand := target + ".rollback-candidate"
+	_ = os.Remove(cand)
+	if err := copyFileExact(*h.rollback, cand, 0o755); err != nil {
+		return fmt.Errorf("stage previous binary: %w", err)
+	}
+	if err := os.Chmod(cand, 0o755); err != nil {
+		return err
+	}
+	if err := os.Rename(cand, target); err != nil {
+		return fmt.Errorf("install previous binary: %w", err)
+	}
+	if err := syncDirPath(filepath.Dir(target)); err != nil {
+		return err
+	}
+	if same, err := sameContent(*h.rollback, target); err != nil || !same {
+		return fmt.Errorf("installed binary does not match the rollback copy: %v", err)
+	}
+	return nil
+}
+
+// cliDeployHandoff: reachd deploy-handoff --config C --binary-target T
+// (--rollback-binary R | --remove-binary). Binary handoff alone, under the
+// writers lock, for rollbacks that did not touch the database.
+func cliDeployHandoff(ctx context.Context, args []string) error {
+	fs, cfgPath := baseFS("deploy-handoff", args)
+	h := handoffFlags(fs)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if !h.set() {
+		return errors.New("--binary-target is required")
+	}
+	if err := h.validate(); err != nil {
+		return err
+	}
+	cfg, err := LoadConfig(*cfgPath)
+	if err != nil {
+		return err
+	}
+	lock, err := acquireWritersExclusive(cfg.DBPath)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if err := h.apply(); err != nil {
+		return err
+	}
+	fmt.Println("deploy-handoff: previous binary in place")
+	return nil
+}
+
+func restoreUnderLockWithHandoff(ctx context.Context, dbPath, fencePath, snapshotPath, forensicDir string, now time.Time, h binaryHandoff) error {
+	return restoreUnderLockHook(ctx, dbPath, fencePath, snapshotPath, forensicDir, now, func() error {
+		if !h.set() {
+			return nil
+		}
+		if err := h.apply(); err != nil {
+			return fmt.Errorf("database restored, but the binary handoff failed: %w", err)
+		}
+		fmt.Println("deploy-restore: previous binary in place")
+		return nil
+	})
 }
 
 func restoreUnderLock(ctx context.Context, dbPath, fencePath, snapshotPath, forensicDir string, now time.Time) error {
+	return restoreUnderLockHook(ctx, dbPath, fencePath, snapshotPath, forensicDir, now, nil)
+}
+
+// restoreUnderLockHook: afterRestore runs after the DB restore, still
+// holding the writers lock.
+func restoreUnderLockHook(ctx context.Context, dbPath, fencePath, snapshotPath, forensicDir string, now time.Time, afterRestore func() error) error {
 	dbPath, err := canonicalDBPath(dbPath)
 	if err != nil {
 		return err
@@ -172,6 +295,9 @@ func restoreUnderLock(ctx context.Context, dbPath, fencePath, snapshotPath, fore
 		return fmt.Errorf("restored database does not match the snapshot: %v", err)
 	}
 	fmt.Println("deploy-restore: pre-deploy snapshot restored")
+	if afterRestore != nil {
+		return afterRestore()
+	}
 	return nil
 }
 
