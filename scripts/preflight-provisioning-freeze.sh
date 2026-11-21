@@ -5,8 +5,8 @@
 # serving, not a switch that stays on: a client can register in the minutes
 # before reachd is stopped. The binding check runs again inside
 # `reachd deploy-prepare` (reachd stopped, writers lock held, before fence and
-# snapshot; daybreak round 6 R6-P1-02). To keep enrollment closed between
-# Stage 4 and Stage 5, set `enrollment_frozen: true` in config.yaml.
+# snapshot; daybreak round 6 R6-P1-02). Between Stage 4 and Stage 5 the
+# freeze is kept by the operator (no new or reinstalled machines).
 #
 # Fails closed, like deploy-prepare: only finished states pass (requests
 # provisioned/expired/denied with provision_phase NULL, delivered or cleaned;

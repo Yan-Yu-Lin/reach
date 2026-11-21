@@ -49,16 +49,6 @@ type Config struct {
 	// value can break every ssh on the Mac (daybreak P1-2/P1-4). The JSON
 	// endpoint used by current reach-mac-agent always carries them.
 	LegacySSHConfigOptions bool `yaml:"legacy_ssh_config_options"`
-	// EnrollmentFrozen refuses every new enrollment while true: client
-	// register (503), request approve (503), client provision (503, before
-	// the setup token is consumed) and `reachd create`. Heartbeats, admin
-	// actions on existing machines and uninstall keep working. Set it for
-	// the Stage 4 -> Stage 5 freeze so the freeze holds between deploys,
-	// not only at the moment of the preflight (daybreak round 6 R6-P1-02).
-	// reachd reads it at start: restart reachd after changing it. The
-	// previous release (8c74086) ignores the key, so it does not hold
-	// after a rollback.
-	EnrollmentFrozen bool `yaml:"enrollment_frozen"`
 }
 
 type InitialAdmin struct {

@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"os"
@@ -122,68 +121,5 @@ func TestFreezeCheckOnLegacySchema(t *testing.T) {
 	}
 	if err := checkProvisioningFrozen(ctx, db); !errors.Is(err, errNotFrozen) {
 		t.Fatalf("legacy approved request passed: %v", err)
-	}
-}
-
-// enrollment_frozen: register, approve and provision are refused with 503
-// and leave no trace; the setup token is not consumed; CreateMachine is
-// refused. Heartbeats are not affected (covered by the agent tests).
-func TestEnrollmentFrozenRefusesEveryEnrollmentStep(t *testing.T) {
-	server, store, cfg := newReliabilityTestServer(t)
-	id, secret := registerAndApprove(t, server, cfg, `{"mode":"system","local_port":22,"name":"pre-freeze"}`)
-	tok := setupTokenFor(t, server, id, secret)
-	// A second request still pending when the freeze starts.
-	rec := doJSON(t, server, http.MethodPost, "/api/client/register", `{"mode":"system","local_port":22,"name":"pending-box"}`, "")
-	var pend struct {
-		RequestID string `json:"request_id"`
-	}
-	_ = json.Unmarshal(rec.Body.Bytes(), &pend)
-
-	frozen := cfg
-	frozen.EnrollmentFrozen = true
-	fs := NewServer(frozen, store, NewProvisioner(store, frozen))
-	var before int
-	_ = store.db.QueryRow(`SELECT COUNT(*) FROM requests`).Scan(&before)
-	if rec := doJSON(t, fs, http.MethodPost, "/api/client/register", `{"mode":"system","local_port":22,"name":"frozen-box"}`, ""); rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("register while frozen = %d", rec.Code)
-	}
-	admin, _ := adminTestToken(t, store, cfg)
-	if rec := doJSON(t, fs, http.MethodPost, "/api/admin/requests/"+pend.RequestID+"/approve", "", admin); rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("approve while frozen = %d", rec.Code)
-	}
-	if rec := doJSON(t, fs, http.MethodPost, "/api/client/provision", provisionBody(id, tok, map[string]any{"mode": "system", "local_port": 22}), ""); rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("provision while frozen = %d", rec.Code)
-	}
-	var after int
-	_ = store.db.QueryRow(`SELECT COUNT(*) FROM requests`).Scan(&after)
-	var st, pst string
-	var hash *string
-	_ = store.db.QueryRow(`SELECT status,setup_token_hash FROM requests WHERE id=?`, id).Scan(&st, &hash)
-	_ = store.db.QueryRow(`SELECT status FROM requests WHERE id=?`, pend.RequestID).Scan(&pst)
-	if after != before || st != "approved" || hash == nil || pst != "pending" {
-		t.Fatalf("frozen hub changed requests: count %d->%d, approved=%s token=%v pending=%s", before, after, st, hash != nil, pst)
-	}
-	// Deny still works: it finishes a request, it does not add a machine.
-	if rec := doJSON(t, fs, http.MethodPost, "/api/admin/requests/"+pend.RequestID+"/deny", "", admin); rec.Code != 200 {
-		t.Fatalf("deny while frozen = %d", rec.Code)
-	}
-	if _, err := fs.prov.CreateMachine(context.Background(), CreateMachineInput{Slug: "cli-box", Pubkey: testPubkey}); !errors.Is(err, errEnrollmentFrozen) {
-		t.Fatalf("CreateMachine while frozen: %v", err)
-	}
-	// Unfrozen, the same provision goes through (the token was kept).
-	if rec := doJSON(t, server, http.MethodPost, "/api/client/provision", provisionBody(id, tok, map[string]any{"mode": "system", "local_port": 22}), ""); rec.Code != 200 {
-		t.Fatalf("provision after unfreeze = %d %s", rec.Code, rec.Body.String())
-	}
-}
-
-func TestEnrollmentFrozenParsesFromConfig(t *testing.T) {
-	p := filepath.Join(t.TempDir(), "c.yaml")
-	_ = os.WriteFile(p, []byte("jwt_secret: \"0123456789abcdef0123456789abcdef\"\nenrollment_frozen: true\n"), 0o600)
-	cfg, err := LoadConfig(p)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !cfg.EnrollmentFrozen {
-		t.Fatal("enrollment_frozen not read")
 	}
 }
