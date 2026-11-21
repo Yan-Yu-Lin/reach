@@ -34,6 +34,17 @@ DEPLOY_BRANCH="$(git symbolic-ref --quiet --short HEAD)" || {
   echo "[mac] ERROR: deploy-from-mac requires a branch, not detached HEAD" >&2
   exit 1
 }
+# Deploy only from a release branch (daybreak round 5 N1): the older
+# feature branches carry deploy scripts that downgrade reachd and publish
+# an agent. REACH_ALLOW_BRANCH=<name> overrides for tests.
+case "$DEPLOY_BRANCH" in
+  release/*) ;;
+  *)
+    if [ "${REACH_ALLOW_BRANCH:-}" != "$DEPLOY_BRANCH" ]; then
+      echo "[mac] ERROR: deploy only from a release/* branch (current: $DEPLOY_BRANCH)" >&2
+      exit 1
+    fi ;;
+esac
 DEPLOY_COMMIT="$(git rev-parse HEAD)"
 echo "[mac] fetching origin/${DEPLOY_BRANCH} and verifying ${DEPLOY_COMMIT} is pushed..."
 git fetch origin "$DEPLOY_BRANCH"

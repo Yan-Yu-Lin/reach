@@ -63,7 +63,7 @@
 - 新 mac-agent 接舊 reachd 8c74086：退回解析文字，可以正常同步。
 - 舊 mac-agent 接新 reachd：文字 API 保留，可以用，但預設不再帶 target 回報的演算法選項（`legacy_ssh_config_options: false`）。
 - 舊 agent：**已經裝好的機器**，heartbeat 格式沒變，照常運作。部署前就已建立、但還沒 provision 的 request 仍然可以 poll、可以被核准，但 **provision 時**會收到 410，要重新跑 setup。部署時盡量不要有 pending request，也不要去核准舊的 pending。
-- **舊的 installer（8c74086 的 setup.sh／setup.ps1／reach-agent）不能再新增機器**：register 時就回 **426 Upgrade Required**，並提示要更新（astra R2-08）。以前是核准後 provision 才 403。新版後端上線後、新版 agent release（Stage 5）發布前，**這段期間不能新增或重裝機器**，除非手動用新版 reach-agent 安裝。binding 規則沒有放寬。
+- **舊的 installer（8c74086 的 setup.sh／setup.ps1／reach-agent）不能再新增機器**：register 時就回 **426 Upgrade Required**，並提示要更新（astra R2-08）。以前是核准後 provision 才 403。新版後端上線後、新版 agent release（Stage 5）發布前，**這段期間不能新增或重裝機器**（provisioning 凍結，見「要 Arthur 決定」第 10 點；也不要手動安裝）。binding 規則沒有放寬。
 - **新安裝、而且機器上沒有 sshd 的 target，會改用 agent 內建的 internal-sshd**（只聽 loopback；沒有 sftp；system 安裝時 session 以 target user 身分跑）。已經裝好的機器不受影響。Windows 系統安裝如果還沒裝 OpenSSH Server，要加 `-InstallOpenSSH` 才會裝。
 - 部署 rollback 在 Ubuntu 24.04 container 裡實測 A～K 情境（加上 carrier 的 G／H／H2、fuser 的 I、外部 DB holder 的 J、JWT 復活的 K），載入的是 `deploy-jason.sh` 裡真正的 transaction 步驟、正式路徑（`scripts/test-rollback-in-container.sh`）。
 - **部署會旋轉 `jwt_secret`**（只在 session migration 還沒跑過的 DB 上）：所有人要重新登入；rollback 後舊 binary 也用新 secret，所以部署前的 JWT 不會復活（daybreak round 4 P1-03）。`config.yaml` 部署前會備份到 `/var/lib/reach/deploy-backups/config.yaml.<ts>`，但 rollback 不會還原它（刻意的）。
@@ -86,11 +86,13 @@
 7. **carrier 現在沒有 path 就不啟動**：deploy 會從 config 的 `websocket_tunnel.path_prefix` 自動寫 `/etc/reach/ws-carrier.env`。目前有 2 台用 websocket transport。
 8. **revoke-all 會讓 mac-agent 斷線**：如果勾「連 service token 一起撤銷」，Mac 上要重新拿 token。
 9. **rollback 規則**：部署失敗時，如果新版上線後 `durable_actions` journal 沒有新的列（provision、approve／deny、disable／enable／retire、invite、service token、登出、revoke-all、update policy、process title；包括只寫了 intent、OS 動作做到一半的），就自動把 DB snapshot 和舊 binary 一起還原；有的話，reachd 會停著，等人決定。這些動作的 journal 列和動作本身在同一個 transaction，journal 寫不進去動作就不會發生（回 5xx）。heartbeat、token 遷移、observation 這些可丟的寫入不會擋自動回滾。另外：stop 不成功、forensic copy 失敗、找不到 probe binary，也都不會自動還原。
-10. **新增機器的空窗**：見「相容性」。Stage 4 之後、Stage 5 之前，舊 installer 會收到 426。如果這段期間一定要加機器，用新版 `reach-agent` 手動 install。
+10. **Provisioning 凍結**（daybreak round 5）：從 Stage 4 的 fence 開始到 Stage 5 結束，**不新增、不重裝任何機器，也不手動安裝**。部署前 `scripts/preflight-provisioning-freeze.sh` 會自動檢查：pending、approved、provisioning 的 request，以及 response_pending、cleanup_pending 等進行中的 provision 都必須是 0，否則拒絕部署。另外：新安裝的機器如果在 provision 後一小時內**完全沒有 heartbeat**，會被撤銷並退役（有 heartbeat 就不會，不管 tunnel 狀態）。
 11. **新 agent 的 update confirm 比較嚴格**：更新前是 active 的機器，新版要 tunnel 連上、local sshd 健康，並且真的用一次性 key SSH 登入跑一個指令成功，才會 confirm；做不到就在 5 分鐘後自動 rollback。
 12. **Stage 4 用 `deploy-from-mac.sh` 時不要設 `REACH_PUBLISH_AGENT_RELEASE`**：預設 0，不會 build、簽、上傳或發布 agent。只有 Stage 5 才設 1。
 
 ## 部署順序（daybreak round 3 的兩階段；每一步之間至少觀察一天）
+
+**只能從 `release/reach-2026-11` 分支部署**（後端＋dashboard 已合併在這裡）。`fix/dashboard-2026-11` 分支上的 deploy 腳本是舊版，會把 reachd 降級並發布 agent，**不准使用**；`fix/hardening-2026-11` 停在 3261072，也不要再從它部署（daybreak round 5 N1）。
 
 **Stage 4：只部署 server 端，不發布 agent。**
 
@@ -116,7 +118,7 @@ Stage 5 前必修／必驗（daybreak round 4 的評估）：
 - 前提：Linux container 和 **Windows VM** 都驗證過「不會重新開啟全介面的 port 22」（Disabled／Manual 的 OpenSSH 在沒有 `-InstallOpenSSH` 時保持原樣）、Windows authorized_keys ACL／junction、update confirm 的真實 tunnel + SSH 登入 gate。**我們現在沒有 Windows VM，所以這一步要等 Arthur 有 Windows 測試環境再做。**
 - 三平台 artifact 和 manifest 簽章完成後，才更新 release manifest 和 setup 腳本（`REACH_PUBLISH_AGENT_RELEASE=1`）。
 - 先從可以實體救回的機器開始，用 update policy 逐台更新。
-- 評估過「setup.sh 和 reachd 一起發、agent 之後再發」：不可行。新的 setup.sh 只會下載並驗證已發布的 agent，沒有新 agent 就不能用；而舊 agent 正是 register 被 426 的那一個。所以新增機器的空窗只能靠「縮短 Stage 4 到 Stage 5 的時間」或「空窗期間用新版 reach-agent 手動安裝」處理。
+- 評估過「setup.sh 和 reachd 一起發、agent 之後再發」：不可行。新的 setup.sh 只會下載並驗證已發布的 agent，沒有新 agent 就不能用；而舊 agent 正是 register 被 426 的那一個。所以新增機器的空窗只能靠「縮短 Stage 4 到 Stage 5 的時間」處理；空窗期間 provisioning 凍結，不手動安裝。
 
 ## astra round 1（審 17707dc，2026-11-21）
 

@@ -62,7 +62,7 @@ run() { # publish-flag ("" = unset)
   : > "$log"; : > "$work/remote-env"
   (
     cd "$work/src"
-    export PATH="$bin:$PATH" REACH_DEPLOY_HOST=fake-hub HOME="$work/home"
+    export PATH="$bin:$PATH" REACH_DEPLOY_HOST=fake-hub HOME="$work/home" REACH_ALLOW_BRANCH=stage4-test
     mkdir -p "$HOME"
     if [ -n "$1" ]; then export REACH_PUBLISH_AGENT_RELEASE="$1"; else unset REACH_PUBLISH_AGENT_RELEASE; fi
     bash scripts/deploy-from-mac.sh
@@ -90,4 +90,10 @@ grep -q 'release signing key not found' "$work/out" || fail "publish=1 did not c
 if grep -q 'bash -s' "$log"; then fail "publish=1 without key reached the hub"; fi
 echo "ok: REACH_PUBLISH_AGENT_RELEASE=1 still requires the signing key"
 
+# Only release/* branches may deploy.
+if (cd "$work/src" && PATH="$bin:$PATH" REACH_DEPLOY_HOST=fake-hub HOME="$work/home" bash scripts/deploy-from-mac.sh) > "$work/out" 2>&1; then
+  fail "deploy from a non-release branch accepted"
+fi
+grep -q 'deploy only from a release' "$work/out" || fail "non-release branch not explained"
+echo "ok: only release/* branches deploy"
 echo "PASS: deploy-from-mac publication gate"

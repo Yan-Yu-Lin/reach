@@ -1,5 +1,14 @@
 # Deployment configuration (hub)
 
+**Deploy only from the `release/reach-2026-11` branch** (backend and
+dashboard merged). The deploy scripts on `fix/dashboard-2026-11` are older:
+they would downgrade reachd and publish an agent release. Do not run them.
+
+Stage 4 preconditions: `fuser` (psmisc) installed, and provisioning frozen
+(`scripts/preflight-provisioning-freeze.sh` runs automatically and refuses
+while any request is pending/approved/provisioning or any provision is in
+flight). Do not add or reinstall machines from the fence until Stage 5.
+
 Nothing in this directory is applied by default. Each file states how it is
 installed and what to test first.
 
@@ -48,9 +57,11 @@ Old fence files (without journal fields) never allow an automatic restore.
 
 ### Round 4 changes (fence order, writers lock, JWT secret, carrier)
 
-- `deploy-fence record --snapshot` clears retired machines' tokens, then
-  records the fence, then writes the snapshot, all while holding
-  `<dbdir>/locks/writers.lock` exclusively. reachd and every CLI writer
+- `reachd deploy-prepare` clears retired machines' tokens, records the
+  fence, writes the snapshot and rotates `jwt_secret` (while the session
+  migration is pending), all in one process holding
+  `<dbdir>/locks/writers.lock` exclusively; `reachd deploy-restore` does the
+  forensic copy, fence check and snapshot restore the same way. reachd and every CLI writer
   hold it shared, so CLI writes during that step fail with "deployment in
   progress".
 - `fuser` (package `psmisc`) is required.

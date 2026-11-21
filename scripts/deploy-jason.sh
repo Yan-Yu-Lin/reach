@@ -740,6 +740,11 @@ case "$LISTEN_ADDR" in
   127.0.0.1:*|localhost:*) ;;
   *) echo "[deploy] ERROR: refusing listen_addr not accepted by Reach: $LISTEN_ADDR" >&2; exit 1 ;;
 esac
+# Stage 4 precondition: no enrollment in flight (daybreak round 5).
+# Read-only; runs before anything is changed.
+if sudo test -f "$DB_PATH"; then
+  bash scripts/preflight-provisioning-freeze.sh "$DB_PATH"
+fi
 
 export FNM_PATH="$HOME/.local/share/fnm"
 if [ -d "$FNM_PATH" ]; then
