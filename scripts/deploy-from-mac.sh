@@ -211,9 +211,28 @@ cleanup_remote() {
 trap cleanup_remote EXIT
 cd "$HOME"
 command -v flock >/dev/null || { echo "[mac] ERROR: flock is required on hub" >&2; exit 1; }
-lock_dir="${XDG_RUNTIME_DIR:-$HOME/.cache/reach}"
-mkdir -p "$lock_dir"
-exec 9>"$lock_dir/deploy.lock"
+# Safe deploy lock (daybreak round 5 N7): the lock directory must be a real
+# directory owned by us and not group/other writable, and the lock file a
+# regular file (not a symlink); it is opened without truncation, so a
+# planted symlink can neither redirect the lock nor clobber a file.
+open_deploy_lock() {
+  local dir="$1" f="$1/deploy.lock" owner mode
+  mkdir -p -m 0700 "$dir"
+  owner="$(stat -c %u "$dir" 2>/dev/null || stat -f %u "$dir")"
+  mode="$(stat -c %a "$dir" 2>/dev/null || stat -f %Lp "$dir")"
+  if [ -L "$dir" ] || [ ! -d "$dir" ] || [ "$owner" != "$(id -u)" ]; then
+    echo "ERROR: deploy lock directory $dir is not a private directory of ours" >&2; return 1
+  fi
+  if [ $(( 8#$mode & 8#022 )) -ne 0 ]; then
+    echo "ERROR: deploy lock directory $dir is group/other writable" >&2; return 1
+  fi
+  if [ -L "$f" ] || { [ -e "$f" ] && [ ! -f "$f" ]; }; then
+    echo "ERROR: deploy lock $f is not a regular file" >&2; return 1
+  fi
+  exec 9<>"$f"
+}
+lock_dir="${XDG_RUNTIME_DIR:-$HOME/.cache/reach}/reach"
+open_deploy_lock "$lock_dir" || exit 1
 if ! flock -n 9; then
   echo "[mac] ERROR: another Reach deployment is running" >&2
   exit 1

@@ -33,15 +33,34 @@ fi
 UV_BIN="$(cd "$(dirname "$UV_BIN")" && pwd)/$(basename "$UV_BIN")"
 
 command -v flock >/dev/null || { echo "[deploy] ERROR: flock is required" >&2; exit 1; }
-LOCK_DIR="${XDG_RUNTIME_DIR:-$HOME/.cache/reach}"
-mkdir -p "$LOCK_DIR"
+# Safe deploy lock (daybreak round 5 N7): the lock directory must be a real
+# directory owned by us and not group/other writable, and the lock file a
+# regular file (not a symlink); it is opened without truncation, so a
+# planted symlink can neither redirect the lock nor clobber a file.
+open_deploy_lock() {
+  local dir="$1" f="$1/deploy.lock" owner mode
+  mkdir -p -m 0700 "$dir"
+  owner="$(stat -c %u "$dir" 2>/dev/null || stat -f %u "$dir")"
+  mode="$(stat -c %a "$dir" 2>/dev/null || stat -f %Lp "$dir")"
+  if [ -L "$dir" ] || [ ! -d "$dir" ] || [ "$owner" != "$(id -u)" ]; then
+    echo "ERROR: deploy lock directory $dir is not a private directory of ours" >&2; return 1
+  fi
+  if [ $(( 8#$mode & 8#022 )) -ne 0 ]; then
+    echo "ERROR: deploy lock directory $dir is group/other writable" >&2; return 1
+  fi
+  if [ -L "$f" ] || { [ -e "$f" ] && [ ! -f "$f" ]; }; then
+    echo "ERROR: deploy lock $f is not a regular file" >&2; return 1
+  fi
+  exec 9<>"$f"
+}
+LOCK_DIR="${XDG_RUNTIME_DIR:-$HOME/.cache/reach}/reach"
 if [ "${REACH_DEPLOY_LOCK_HELD:-0}" = 1 ]; then
   if ! flock -n 9; then
     echo "[deploy] ERROR: inherited deployment lock is not held" >&2
     exit 1
   fi
 else
-  exec 9>"$LOCK_DIR/deploy.lock"
+  open_deploy_lock "$LOCK_DIR" || exit 1
   if ! flock -n 9; then
     echo "[deploy] ERROR: another Reach deployment is running" >&2
     exit 1

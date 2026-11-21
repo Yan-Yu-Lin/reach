@@ -23,7 +23,7 @@ git -C "$work/src" -c user.name=test -c user.email=test@invalid commit -qam "tes
 git -C "$work/src" push -q origin stage4-test
 
 hub="$work/hub"
-mkdir -p "$hub"
+mkdir -p "$hub" "$work/run"
 git clone -q "$work/origin.git" "$hub/reach"
 log="$work/calls"
 bin="$work/bin"
@@ -44,7 +44,7 @@ if [ "$2" = "bash -s" ]; then
   case "$body" in
     *scripts/deploy-jason.sh*)
       body="${body//bash scripts\/deploy-jason.sh/bash $TEST_WORK\/fake-deploy-jason.sh}"
-      HOME="$TEST_WORK/hub" XDG_RUNTIME_DIR="$TEST_WORK/hub" bash -c "$body" remote "$@"
+      HOME="$TEST_WORK/hub" XDG_RUNTIME_DIR="$TEST_WORK/run" bash -c "$body" remote "$@"
       exit $? ;;
   esac
   exit 0
