@@ -20,15 +20,14 @@ import (
 // machines. A deploy rollback restores the pre-deploy DB snapshot and would
 // bring both back. Neither is a journalled operator action, so instead:
 //
-//   - JWTs: the deploy rotates jwt_secret in config.yaml before the new
-//     binary first starts, while the session migration is still pending.
-//     The rollback never restores config.yaml, so the old binary also
-//     verifies with the new secret and every pre-upgrade JWT stays dead.
+//   - JWTs: every deploy rotates jwt_secret in config.yaml before the new
+//     binary first starts (deploy-prepare, unconditionally: daybreak round
+//     6 R6-P1-03). The rollback never restores config.yaml, so the old
+//     binary also verifies with the new secret and every pre-upgrade JWT
+//     stays dead.
 //   - Retired tokens: cleared in the live DB before the fence and the
 //     snapshot (an UPDATE the old schema understands), so the snapshot
 //     itself no longer contains them.
-
-const sessionMigrationName = "2026-11-21-invalidate-pre-session-version-jwts"
 
 var jwtSecretLineRE = regexp.MustCompile(`(?m)^jwt_secret:[^\n]*$`)
 
@@ -89,16 +88,6 @@ func rotateJWTSecret(path string) error {
 	return syncDirPath(filepath.Dir(path))
 }
 
-func sessionMigrationApplied(ctx context.Context, db *sql.DB) (bool, error) {
-	ok, err := tableExists(ctx, db, "schema_migrations")
-	if err != nil || !ok {
-		return false, err
-	}
-	var n int
-	err = db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE name=?`, sessionMigrationName).Scan(&n)
-	return n > 0, err
-}
-
 // clearRetiredTokens is the retired-token migration in a form every schema
 // since desired_state was added understands.
 func clearRetiredTokens(ctx context.Context, db *sql.DB) error {
@@ -113,31 +102,14 @@ func clearRetiredTokens(ctx context.Context, db *sql.DB) error {
 	return err
 }
 
-// cliRotateJWTSecret: reachd rotate-jwt-secret --config C [--if-session-migration-pending]
+// cliRotateJWTSecret: reachd rotate-jwt-secret --config C
+// Always rotates. There is no "only if the session migration is pending"
+// mode any more: the DB marker does not prove the secret was rotated
+// (daybreak round 6 R6-P1-03).
 func cliRotateJWTSecret(ctx context.Context, args []string) error {
 	fs, cfgPath := baseFS("rotate-jwt-secret", args)
-	onlyPending := fs.Bool("if-session-migration-pending", false, "rotate only if the pre-upgrade JWT invalidation has not run on this DB yet")
 	if err := fs.Parse(args); err != nil {
 		return err
-	}
-	if *onlyPending {
-		cfg, err := LoadConfig(*cfgPath)
-		if err != nil {
-			return err
-		}
-		store, err := OpenStore(cfg.DBPath)
-		if err != nil {
-			return err
-		}
-		applied, err := sessionMigrationApplied(ctx, store.db)
-		_ = store.Close()
-		if err != nil {
-			return err
-		}
-		if applied {
-			fmt.Println("session migration already applied; jwt_secret unchanged")
-			return nil
-		}
 	}
 	if err := rotateJWTSecret(*cfgPath); err != nil {
 		return err

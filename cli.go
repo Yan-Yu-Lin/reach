@@ -353,7 +353,7 @@ Usage:
   reachd deploy-prepare --config C --fence F --snapshot S
   reachd deploy-restore --config C --fence F --snapshot S --forensic DIR [--binary-target T (--rollback-binary R | --remove-binary)]
   reachd deploy-handoff --config C --binary-target T (--rollback-binary R | --remove-binary)
-  reachd rotate-jwt-secret [--config /etc/reach/config.yaml] [--if-session-migration-pending]
+  reachd rotate-jwt-secret [--config /etc/reach/config.yaml]
   printf 'secret' | reachd hash-secret`)
 }
 

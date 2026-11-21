@@ -108,9 +108,6 @@ func TestRestoreRefusesOldFence(t *testing.T) {
 // CLI cannot run the session migration between snapshot and rotation.
 func TestDeployPrepareRotatesUnderTheLock(t *testing.T) {
 	_, store, cfg := newReliabilityTestServer(t)
-	if _, err := store.db.Exec(`DELETE FROM schema_migrations`); err != nil {
-		t.Fatal(err)
-	}
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.yaml")
 	body := "db_path: " + store.path + "\njwt_secret: \"" + cfg.JWTSecret + "\"\n"
@@ -130,7 +127,7 @@ func TestDeployPrepareRotatesUnderTheLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	if b, _ := os.ReadFile(cfgPath); strings.Contains(string(b), cfg.JWTSecret) {
-		t.Fatal("jwt_secret not rotated while the session migration is pending")
+		t.Fatal("jwt_secret not rotated by deploy-prepare")
 	}
 }
 

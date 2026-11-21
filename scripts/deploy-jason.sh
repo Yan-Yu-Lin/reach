@@ -958,8 +958,8 @@ fi
 DEPLOY_FENCE="${DB_BACKUP_DIR}/deploy-fence.${DEPLOY_TS}.json"
 sudo cp -a /etc/reach/config.yaml "/var/lib/reach/deploy-backups/config.yaml.${DEPLOY_TS}"
 # One locked process: clear retired tokens, fence, snapshot, and rotate
-# jwt_secret if the session migration is still pending, all under the
-# exclusive writers lock (astra R4-01, daybreak round 5 N6).
+# jwt_secret (always), all under the exclusive writers lock (astra R4-01,
+# daybreak round 5 N6, daybreak round 6 R6-P1-03).
 sudo /tmp/reachd-build deploy-prepare --config /etc/reach/config.yaml --fence "$DEPLOY_FENCE" --snapshot "$DB_BACKUP_PATH"
 if [ "$(sudo sqlite3 "$DB_BACKUP_PATH" 'PRAGMA quick_check;')" != "ok" ]; then
   echo "[deploy] ERROR: backup database failed PRAGMA quick_check" >&2
@@ -977,8 +977,8 @@ fi
 
 install_new_reachd
 
-# jwt_secret was rotated by deploy-prepare (when the session migration is
-# still pending): config.yaml is not part of the rollback, so pre-upgrade
+# jwt_secret was rotated by deploy-prepare, unconditionally (daybreak
+# round 6 R6-P1-03): config.yaml is not part of the rollback, so pre-upgrade
 # JWTs stay invalid even after a snapshot restore (daybreak round 4 P1-03).
 
 DB_MAY_HAVE_MIGRATED=1

@@ -20,9 +20,8 @@ import (
 // that takes the lock exclusively and does every step itself:
 //
 //	deploy-prepare   (reachd verifiably stopped)
-//	                 clear retired tokens -> fence -> snapshot ->
-//	                 rotate jwt_secret (if the session migration is still
-//	                 pending, checked under the same lock)
+//	                 provisioning freeze check -> clear retired tokens ->
+//	                 fence -> snapshot -> rotate jwt_secret (always)
 //	deploy-restore   (reachd verifiably stopped)
 //	                 forensic copy -> fence check -> snapshot restore
 //
@@ -58,21 +57,14 @@ func cliDeployPrepare(ctx context.Context, args []string) error {
 	if err := recordFenceAndSnapshotLocked(ctx, cfg.DBPath, *fencePath, *snapshotPath); err != nil {
 		return err
 	}
-	// Decide and rotate under the same lock: no CLI can run the session
-	// migration in between (daybreak round 5 N6).
-	store, err := OpenStore(cfg.DBPath)
-	if err != nil {
-		return err
-	}
-	applied, err := sessionMigrationApplied(ctx, store.db)
-	_ = store.Close()
-	if err != nil {
-		return err
-	}
-	if applied {
-		fmt.Println("deploy-prepare: fence and snapshot written; session migration already applied, jwt_secret unchanged")
-		return nil
-	}
+	// Rotate jwt_secret on every deploy, unconditionally, while reachd is
+	// stopped and the lock is held (daybreak round 6 R6-P1-03). Whether
+	// the DB already carries the session migration says nothing about
+	// the secret: a newer CLI run against the live DB can create the
+	// marker with the secret unchanged, and a rollback to the old binary
+	// would then accept every pre-deploy JWT again. config.yaml is not
+	// part of a rollback, so the old binary verifies with the new secret.
+	// Cost: every admin logs in again after each deploy.
 	if err := rotateJWTSecret(*cfgPath); err != nil {
 		return fmt.Errorf("rotate jwt_secret: %w", err)
 	}

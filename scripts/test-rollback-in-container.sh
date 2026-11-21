@@ -136,6 +136,13 @@ scenario() { # name kind
   REACHD_EXISTED=1 ROLLBACK_ARMED=0 DEPLOY_COMMITTED=0 SERVICE_STOPPED=1 DB_MAY_HAVE_MIGRATED=0 PROBE_BIN="" REACHD_ROLLBACK=""
   PUBLICATION_ARMED=0 DASHBOARD_SWAP_ARMED=0 CARRIER_STATE_SNAPSHOTTED=0 REACHD_UNIT_MUTATED=0 LIMITS_MUTATED=0
   stop_reachd_verified || fail "$1: initial stop"
+  if [ "$2" = premigrated ]; then
+    # N (daybreak round 6 R6-P1-03): a newer CLI already ran against the
+    # live DB, so the session-migration marker exists while config.yaml
+    # still has the old secret.
+    $W/reachd-new list --config /etc/reach/config.yaml >/dev/null
+    [ "$(sqlite3 $DB_PATH "SELECT COUNT(*) FROM schema_migrations WHERE name='2026-11-21-invalidate-pre-session-version-jwts'")" = 1 ] || fail "N: marker not created"
+  fi
   DB_BACKUP_DIR=/var/lib/reach/backups; DB_BACKUP_PATH=$DB_BACKUP_DIR/reach.db.$DEPLOY_TS
   cp $W/reachd-new /tmp/reachd-build
   # A pre-deploy admin JWT, signed with the old secret. (8c74086 has no
@@ -219,7 +226,7 @@ scenario() { # name kind
   echo "after rollback: $result"
   claimed=0; printf '%s' "$out" | grep -q 'previous reachd restored and ready' && claimed=1
   case "$2" in
-    lazy)
+    lazy|premigrated)
       [ "$result" = running/200 ] || fail "A: expected old reachd running with legacy heartbeat 200"
       # K (daybreak round 4 P1-03): the DB was rolled back, yet the
       # pre-deploy JWT must stay invalid on the old binary.
@@ -312,6 +319,7 @@ while True: c,_=s.accept()" reach-fake-sshd >/dev/null 2>&1 < /dev/null & sleep 
 }
 
 echo "== A: failure after lazy token migration ==";  scenario A lazy
+echo "== N: pre-migrated DB, then failure ==";     scenario N premigrated
 echo "== B: failure after an operator disable ==";   scenario B durable
 echo "== C: probe/fence binary missing ==";          scenario C noprobe
 echo "== D: systemctl stop fails ==";                scenario D stopfail
@@ -324,7 +332,7 @@ echo "== J: another process holds the DB ==";        scenario J holder
 echo "== G: carrier rollback ==";                   carrier_case G 1 none; carrier_case G0 0 none
 echo "== H: previous carrier fails to start ==";      carrier_case H 1 start
 echo "== H2: carrier env restore fails ==";          carrier_case H2 1 env
-echo "PASS: rollback scenarios A-M"
+echo "PASS: rollback scenarios A-N"
 EOS
 chmod +x "$work/run.sh"
 docker run --rm -v "$work:/w" ubuntu:24.04 bash /w/run.sh

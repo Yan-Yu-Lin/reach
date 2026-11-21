@@ -66,17 +66,21 @@ Old fence files (without journal fields) never allow an automatic restore.
 ### Round 4 changes (fence order, writers lock, JWT secret, carrier)
 
 - `reachd deploy-prepare` clears retired machines' tokens, records the
-  fence, writes the snapshot and rotates `jwt_secret` (while the session
-  migration is pending), all in one process holding
+  fence, writes the snapshot and rotates `jwt_secret` (always, on every
+  deploy), all in one process holding
   `<dbdir>/locks/writers.lock` exclusively; `reachd deploy-restore` does the
   forensic copy, fence check and snapshot restore the same way. reachd and every CLI writer
   hold it shared, so CLI writes during that step fail with "deployment in
   progress".
 - `fuser` (package `psmisc`) is required.
-- Before the new binary first starts, `reachd rotate-jwt-secret
-  --if-session-migration-pending` replaces `jwt_secret` in config.yaml
-  (backup in `deploy-backups/config.yaml.<ts>`). Rollback does not
-  restore config.yaml, so pre-deploy admin JWTs stay invalid.
+- Before the new binary first starts, `deploy-prepare` replaces
+  `jwt_secret` in config.yaml **unconditionally** (backup in
+  `deploy-backups/config.yaml.<ts>`). It no longer infers "already rotated"
+  from the DB migration marker: a newer CLI can create that marker while
+  the secret is unchanged (daybreak round 6 R6-P1-03). Rollback does not
+  restore config.yaml, so pre-deploy admin JWTs stay invalid. Every admin
+  logs in again after every deploy; a conditional rotation would need a
+  rollback-proof marker bound to the secret itself (not built).
 - The carrier must answer a WebSocket upgrade with 101 on its configured
   path (`scripts/check-carrier-ready.sh`), on deploy and on rollback. Any
   rollback step that fails is reported as `rollback_incomplete` and the

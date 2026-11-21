@@ -54,26 +54,59 @@ func TestRotateJWTSecretRefusesAmbiguousConfig(t *testing.T) {
 	}
 }
 
-// Only while the session migration is pending.
-func TestRotateOnlyIfSessionMigrationPending(t *testing.T) {
+// Daybreak round 6 R6-P1-03: a DB that a newer CLI already migrated
+// (session marker present, secret unchanged) must still get its secret
+// rotated by deploy-prepare. After a rollback (snapshot restored, old
+// binary: no session_version check) the pre-deploy JWT must fail.
+func TestDeployPrepareRotatesOnPreMigratedDB(t *testing.T) {
+	server, store, cfg := newReliabilityTestServer(t)
+	old, _ := adminTestToken(t, store, cfg)
+	var marker int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE name='2026-11-21-invalidate-pre-session-version-jwts'`).Scan(&marker); err != nil || marker != 1 {
+		t.Fatalf("fixture: session marker %d %v", marker, err)
+	}
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	body := "db_path: " + store.path + "\njwt_secret: \"" + cfg.JWTSecret + "\"\n"
+	if err := os.WriteFile(cfgPath, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := cliDeployPrepare(context.Background(), []string{"--config", cfgPath, "--fence", filepath.Join(dir, "f.json"), "--snapshot", filepath.Join(dir, "s.db")}); err != nil {
+		t.Fatal(err)
+	}
+	newCfg, err := LoadConfig(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newCfg.JWTSecret == cfg.JWTSecret {
+		t.Fatal("deploy-prepare kept jwt_secret because the DB marker was present")
+	}
+	// The legacy binary does not check session_version: model it by
+	// verifying the old JWT's signature only, with the config it would read.
+	if _, err := ParseJWT(newCfg.JWTSecret, old); err == nil {
+		t.Fatal("pre-deploy JWT still verifies with the rotated secret")
+	}
+	if _, err := ParseJWT(cfg.JWTSecret, old); err != nil {
+		t.Fatalf("fixture: JWT did not verify with the old secret: %v", err)
+	}
+	server2 := NewServer(newCfg, store, server.prov)
+	if rec := doJSON(t, server2, http.MethodGet, "/api/admin/machines", "", old); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("pre-deploy JWT after deploy-prepare = %d", rec.Code)
+	}
+}
+
+func TestRotateJWTSecretCommandAlwaysRotates(t *testing.T) {
 	_, store, cfg := newReliabilityTestServer(t)
 	path := filepath.Join(t.TempDir(), "config.yaml")
-	body := "db_path: " + store.path + "\njwt_secret: \"" + cfg.JWTSecret + "\"\n"
-	_ = os.WriteFile(path, []byte(body), 0o600)
-	if err := cliRotateJWTSecret(context.Background(), []string{"--config", path, "--if-session-migration-pending"}); err != nil {
-		t.Fatal(err)
-	}
-	if b, _ := os.ReadFile(path); string(b) != body {
-		t.Fatal("rotated although the migration already ran")
-	}
-	if _, err := store.db.Exec(`DELETE FROM schema_migrations`); err != nil {
-		t.Fatal(err)
-	}
-	if err := cliRotateJWTSecret(context.Background(), []string{"--config", path, "--if-session-migration-pending"}); err != nil {
+	_ = os.WriteFile(path, []byte("db_path: "+store.path+"\njwt_secret: \""+cfg.JWTSecret+"\"\n"), 0o600)
+	if err := cliRotateJWTSecret(context.Background(), []string{"--config", path}); err != nil {
 		t.Fatal(err)
 	}
 	if b, _ := os.ReadFile(path); strings.Contains(string(b), cfg.JWTSecret) {
-		t.Fatal("not rotated although the migration is pending")
+		t.Fatal("not rotated")
+	}
+	if err := cliRotateJWTSecret(context.Background(), []string{"--config", path, "--if-session-migration-pending"}); err == nil {
+		t.Fatal("the removed conditional flag is still accepted")
 	}
 }
 
