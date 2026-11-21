@@ -60,7 +60,8 @@ func tableExists(ctx context.Context, db *sql.DB, table string) (bool, error) {
 // discardableAudit are audit actions written by automatic processes whose
 // effect is re-created or harmless to lose.
 var discardableAudit = map[string]bool{
-	"machine.retiring_timed_out": true,
+	"machine.agent_update.auto_queue": true,
+	"machine.retiring_timed_out":      true,
 }
 
 func recordDeployFence(ctx context.Context, db *sql.DB, now time.Time) (deployFence, error) {
@@ -147,7 +148,7 @@ func durableWritesSince(ctx context.Context, db *sql.DB, f deployFence) ([]strin
 		if discardableAudit[action] {
 			continue
 		}
-		if action == "machine.agent_update.queue" && actor == "system" {
+		if action == "machine.agent_update.auto_queue" {
 			continue // auto policy; requeued by the next heartbeat
 		}
 		out = append(out, fmt.Sprintf("audit #%d %s by %s machine=%s at %s", id, action, actor, machine, at))

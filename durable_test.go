@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -370,5 +372,42 @@ func TestJournalSkipsNoOpsAndIsPruned(t *testing.T) {
 	}
 	if count() != 0 {
 		t.Fatalf("%d old journal rows left", count())
+	}
+}
+
+// Daybreak round 5 N4: whether an update is durable comes from its origin,
+// not from the actor's name. An admin called "system" (legacy DB row) is
+// still journalled; the auto policy never is; "system" cannot be
+// configured as an admin name.
+func TestUpdateOriginIsTyped(t *testing.T) {
+	s, store, _ := newReliabilityTestServer(t)
+	insertRetireFixture(t, s, "m_o", "o-box", "rt-obox1111", 9258)
+	s.cfg.AgentUpdates.Enabled = true
+	s.cfg.AgentUpdates.LatestVersion = "99.0.0"
+	m, _ := s.prov.GetMachine(context.Background(), "m_o")
+	f := fenceNow(t, s)
+	if err := s.queueAgentUpdate(context.Background(), m, "system", updateManual); err != nil {
+		t.Fatal(err)
+	}
+	if w := durable(t, s, f); !strings.Contains(strings.Join(w, "\n"), "journal #") {
+		t.Fatalf("manual update by an admin named system not journalled: %v", w)
+	}
+	if _, err := store.db.Exec(`UPDATE agent_commands SET status='acked'`); err != nil {
+		t.Fatal(err)
+	}
+	f2 := fenceNow(t, s)
+	if _, err := store.db.Exec(`UPDATE machines SET created_at='2026-01-01T00:00:00Z'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.queueAgentUpdate(context.Background(), m, "anyone", updateAutoPolicy); err != nil {
+		t.Fatal(err)
+	}
+	if w := durable(t, s, f2); len(w) != 0 {
+		t.Fatalf("auto-policy update blocks rollback: %v", w)
+	}
+	path := filepath.Join(t.TempDir(), "c.yaml")
+	_ = os.WriteFile(path, []byte("initial_admin:\n  username: system\n"), 0o600)
+	if _, err := LoadConfig(path); err == nil {
+		t.Fatal("reserved admin username accepted")
 	}
 }

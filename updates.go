@@ -123,7 +123,21 @@ func updateAgentPayload(rel agentUpdateRelease) map[string]any {
 	return payload
 }
 
-func (s *Server) queueAgentUpdate(ctx context.Context, m Machine, actor, reason string) error {
+// updateOrigin says who decided an update; not derived from a username
+// (daybreak round 5 N4).
+type updateOrigin int
+
+const (
+	updateManual     updateOrigin = iota // an operator; durable
+	updateAutoPolicy                     // the auto policy; discardable
+)
+
+func (s *Server) queueAgentUpdate(ctx context.Context, m Machine, actor string, origin updateOrigin) error {
+	reason := "manual"
+	if origin == updateAutoPolicy {
+		reason = "auto_policy"
+		actor = "system"
+	}
 	if m.UpdatePolicy == UpdatePolicyDisabled {
 		return fmt.Errorf("agent updates are disabled for this machine")
 	}
@@ -149,7 +163,7 @@ func (s *Server) queueAgentUpdate(ctx context.Context, m Machine, actor, reason 
 		if err := queueCommandTx(ctx, tx, m.ID, m.DesiredGeneration, "update_agent", updateAgentPayload(rel), 24*time.Hour); err != nil {
 			return err
 		}
-		if actor != "system" {
+		if origin == updateManual {
 			if _, err := recordDurable(ctx, tx, "machine.agent_update.queue", m.ID, actor, durableDone); err != nil {
 				return err
 			}
@@ -159,7 +173,11 @@ func (s *Server) queueAgentUpdate(ctx context.Context, m Machine, actor, reason 
 	if err != nil {
 		return err
 	}
-	s.store.Audit(ctx, "machine.agent_update.queue", actor, m.ID, "version="+rel.Version+" reason="+reason)
+	auditAction := "machine.agent_update.queue"
+	if origin == updateAutoPolicy {
+		auditAction = "machine.agent_update.auto_queue"
+	}
+	s.store.Audit(ctx, auditAction, actor, m.ID, "version="+rel.Version+" reason="+reason)
 	s.publishEvent(ctx, "agent.update_queued", m.ID, map[string]any{"machine_id": m.ID, "version": rel.Version, "reason": reason})
 	return nil
 }
@@ -190,7 +208,16 @@ func (s *Server) maybeQueueAutoAgentUpdate(ctx context.Context, m Machine, hb Ag
 	if s.hasRecentUpdateCommand(ctx, m.ID, time.Now().UTC().Add(-6*time.Hour)) {
 		return
 	}
-	if err := s.queueAgentUpdate(ctx, m, "system", "auto_policy"); err != nil && !errors.Is(err, errUpdateAlreadyQueued) {
+	if err := s.queueAgentUpdate(ctx, m, "system", updateAutoPolicy); err != nil && !errors.Is(err, errUpdateAlreadyQueued) {
 		log.Printf("queue auto agent update for %s: %v", m.ID, err)
 	}
+}
+
+// reservedActorName: names Reach writes as the actor of automatic actions.
+func reservedActorName(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "system", "system-expire", "system-provision-recovery", "cli", "agent-uninstall":
+		return true
+	}
+	return strings.HasPrefix(strings.ToLower(name), "service:")
 }

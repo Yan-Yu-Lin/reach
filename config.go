@@ -225,6 +225,11 @@ func LoadConfig(path string) (Config, error) {
 	if cfg.InitialAdmin.Username == "" {
 		cfg.InitialAdmin.Username = envDefault("REACH_INITIAL_ADMIN_USERNAME", "admin")
 	}
+	// Actor names Reach itself uses in audit and journal rows; an admin
+	// account may not take one (daybreak round 5 N4).
+	if reservedActorName(cfg.InitialAdmin.Username) {
+		return cfg, fmt.Errorf("initial_admin.username %q is reserved", cfg.InitialAdmin.Username)
+	}
 	if len(cfg.HubHostKeys) == 0 && len(cfg.DeprecatedHostKeys) > 0 {
 		cfg.HubHostKeys = cfg.DeprecatedHostKeys
 	}

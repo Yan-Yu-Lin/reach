@@ -1843,7 +1843,7 @@ func (s *Server) handleAdminMachineUpdateAgent(w http.ResponseWriter, r *http.Re
 		writeErr(w, 404, "machine not found")
 		return
 	}
-	if err := s.queueAgentUpdate(r.Context(), m, actor, "manual"); err != nil {
+	if err := s.queueAgentUpdate(r.Context(), m, actor, updateManual); err != nil {
 		if errors.Is(err, errNoAgentUpdateAvailable) {
 			writeErr(w, 400, "no latest agent version configured")
 			return
