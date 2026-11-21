@@ -94,15 +94,38 @@
 
 **只能從 `release/reach-2026-11` 分支的最新 commit 部署**（後端＋dashboard 已合併在這裡）。`deploy-from-mac.sh`、hub 端、直接跑 `deploy-jason.sh` 都會 fetch 這個分支，要求 HEAD 和 `origin/release/reach-2026-11` 完全相同（舊 commit 也拒絕），沒有任何 override。`fix/dashboard-2026-11` 分支上的 deploy 腳本是舊版，會把 reachd 降級並發布 agent，**不准使用**；`fix/hardening-2026-11` 停在 3261072，也不要再從它部署（daybreak round 5 N1）。
 
-**Stage 4：只部署 server 端，不發布 agent。**
+**Stage 4：只部署 server 端，不發布 agent。**（daybreak round 6 後改寫，照 `deploy-from-mac.sh` → `deploy-jason.sh` 的實際順序）
 
-1. **部署前（唯讀）**：確認 jason 現行 unit、DB 路徑、carrier mode、websocket target 數量（`agent_observations.transport='websocket'`）、沒有 pending request。
-2. **reachd + 資源上限 drop-in**（`deploy-from-mac.sh`，不帶 `REACH_INSTALL_REACHD_UNIT`；`REACH_PUBLISH_AGENT_RELEASE` 預設 0）。前提：jason 已裝 `psmisc`。流程：停 reachd（確認真的停了、沒人開著 DB）→ 在 writers lock 下清掉 retired token、記錄 fence、做 snapshot（這個順序）→ 在 snapshot 私有副本上演練 rollback → 換 binary（另存 probe 副本）→ 旋轉 `jwt_secret` → 啟動 → TCP 加認證的 readiness → carrier 101。部署後：從外面 `ssh omarchy`、`ssh jack`；dashboard 重新登入；確認 carrier 起來、2 台 websocket 機器連上（用 README 的 101 preflight，不要把 secret path 印出來）。
-3. （已刪除：舊的「從 `fix/dashboard-2026-11` 部署 dashboard」步驟。release 分支的 full deploy 會一起 build 並換 dashboard，不需要也不准另外部署。daybreak round 6 R6-P1-01）
-4. **Mac 上換新的 reach-mac-agent**。確認 `~/.ssh/reach-tunnels.conf` 內容正確、`ssh -G jack` 正常。
-5. **nginx 範本**：先在 jason 上 `nginx -t`（1.24），再 reload。觀察 429。
-6. **HAProxy 建議 diff**：Arthur 看過後才套；套完從外面測 SSH 和 HTTPS。
-7. **sandbox unit**（`REACH_INSTALL_REACHD_UNIT=1`）：只在有退路的時候，並實際做一次 新增→停用→啟用→退役。
+**部署前（Arthur，唯讀）**
+
+1. jason 已裝 `psmisc`（`fuser`）。
+2. 確認沒有進行中的 enrollment（pending／approved／provisioning 的 request 是 0）。從這裡到 Stage 5 結束，**不新增、不重裝機器**。這要靠操作的人自己遵守：preflight 和 `deploy-prepare` 只是在部署當下各檢查一次，不是持續生效的開關。
+3. 目前 active 的 WebSocket target 是 0，所以部署後只驗 carrier 會回 101，不用等任何 WebSocket 機器重連。
+
+**一次部署（Mac 上 `bash scripts/deploy-from-mac.sh`，不設 `REACH_PUBLISH_AGENT_RELEASE`、不設 `REACH_INSTALL_REACHD_UNIT`）**
+
+腳本自動照這個順序做；任何一步失敗都會自動 rollback：
+
+1. **release gate**：Mac 確認在 `release/reach-2026-11` 上、HEAD 等於剛 fetch 的 `origin/release/reach-2026-11`；hub fetch 後再比一次 SHA，`checkout --detach` 到那個 commit。
+2. **hub 上 build**：reachd、carrier、dashboard（Node 22）。
+3. **preflight freeze**（早期檢查，reachd 還在跑）：有未完成的 enrollment 就停止，什麼都還沒改。
+4. **換 carrier**：備份舊 binary／unit／env → 裝新 binary、寫 env、unit（carrier 先不重啟）。
+5. **換 dashboard**（atomic swap，舊的留備份）。
+6. **裝 reachd 資源上限 drop-in**（`10-reach-limits.conf`，有變才裝，舊的備份）。
+7. **停 reachd**，確認真的停了、沒有其他 process 開著 DB（`fuser`）。
+8. **`reachd deploy-prepare`**（一個 process、拿 exclusive writers lock）：**再檢查一次 freeze**（fail closed，只放行 delivered／cleaned／legacy NULL）→ 清 retired token → 記 fence → snapshot → **無條件 rotate `jwt_secret`**。
+9. 在 snapshot 的私有副本上演練 rollback（舊 binary 讀得懂）。
+10. **裝新 reachd**（舊的留 `reachd.rollback.<ts>`，新的另存 probe 副本）→ 啟動 → TCP＋有認證的 readiness → `db-check`。
+11. **重啟 carrier**，驗 101（`check-carrier-ready.sh`，不印 secret path）。
+12. prune 舊備份（成組）。
+
+**部署後（Arthur）**
+
+1. 從外面 `ssh omarchy`、`ssh jack`。
+2. dashboard 重新登入（`jwt_secret` 換了，所有人都要重登）。
+3. Mac 上換新的 reach-mac-agent；確認 `~/.ssh/reach-tunnels.conf` 內容正確、`ssh -G jack` 正常。
+4. 之後各自找時間：nginx 範本（先 `nginx -t` 再 reload，觀察 429）；HAProxy 建議 diff（Arthur 看過才套）。
+5. **sandbox unit**（`REACH_INSTALL_REACHD_UNIT=1`）**不在 freeze 期間做**：它需要一次 新增→停用→啟用→退役 的實測，會新增機器。放到 Stage 5 之後，或在隔離的 lab 做。
 
 **Stage 5：發布 agent（等 Arthur 有 Windows 測試環境再做）。**
 
@@ -286,3 +309,41 @@ Stage 5 前必修／必驗（daybreak round 4 的評估）：
 - Linux（Ubuntu 24.04 container）：rollback A～L（真的 `deploy-jason.sh` 函式、真的 `deploy-prepare`／`deploy-restore`、正式路徑、真的 8c74086 和新版 reachd、新版 carrier）；astra 的 lock-gap 重現（改成新流程）；跨 process flock；reach-agent 與根套件全部測試；deploy lock helper。
 - Mac：`go test -race ./...` 全過；dashboard vitest 90/90、typecheck、generate；`test-deploy-from-mac.sh`、`test-readiness-argv.sh`、`test-deploy-lock.sh`、`test-reach-sync-mac.sh`、`test-setup-bootstrap.sh`。
 - **還沒有實測**：Windows VM、CentOS 6、OpenSSH 5.3、HAProxy 2.8、PID 1 systemd 下完整的部署／rollback／agent self-restart、sandbox unit、外部 vantage 的 E2E、雙棧／DNS64。
+
+## astra round 5 + daybreak round 6（審 release 522af64；協調者指示：Stage 4 只修 4 項）
+
+報告：`~/30-39-Research/34-tech-research/2026-11-21-reach-hardening-astra-review-r5.md`、`2026-11-21-reach-security-round6.md`。這一輪照協調者的收斂指示只修 Stage 4 blocker，其餘列在下一節。
+
+| 編號 | 發現 | 怎麼修 | 證明 | commit |
+|---|---|---|---|---|
+| daybreak R6-P1-01 ＝ astra R5-05 | release gate 接受舊 ancestor、任何 `release/*`、`REACH_ALLOW_BRANCH`；hub 只要求 commit 在任一 origin branch；直接跑 `deploy-jason.sh` 會 pull、detached 時切回 main；文件還叫人從 dashboard 分支部署 | `scripts/release-gate.sh`：唯一的 `release/reach-2026-11`，fetch 這個 ref，要求 HEAD 和 `origin/release/reach-2026-11` **SHA 完全相同**。Mac、hub 端（再 fetch、再比一次）、直接跑 `deploy-jason.sh` 都套用；拿掉 `REACH_ALLOW_BRANCH`、拿掉 pull 和切 main。刪掉文件裡從 dashboard 分支部署的步驟 | `scripts/test-deploy-from-mac.sh`（fixture 用同名 release 分支）：非 release 分支（即使設 `REACH_ALLOW_BRANCH`）、`release/other`、detached、舊 ancestor、Mac 檢查後 tip 被推進（hub 拒絕）、直接跑 deploy-jason 在舊 commit／落後 tip 都被拒且 HEAD 不動；把檢查改回 ancestor 或拿掉 hub 比對，測試都會失敗 | 98b0245 |
+| daybreak R6-P1-02 | preflight 之後到停 reachd 之間可以新 register；未知 phase fail open | `deploy-prepare` 在 exclusive writers lock 裡、fence／snapshot 之前，用一個 read transaction 再檢查：request 只能是 provisioned／expired／denied，phase 只能是 NULL（legacy）／delivered／cleaned，沒有 status=provisioning 的 machine；其他（含未知值）一律拒絕，什麼都不寫（沒有 fence、snapshot，secret 不換）。snapshot 寫完再檢查一次。shell preflight 也改成同樣的 fail closed，文件寫明它只是早期、單一時間點的檢查。`enrollment_frozen` 開關依指示不做 | `TestDeployPrepareRefusesRegistrationAfterPreflight`（daybreak PoC：preflight 後 register）、`TestFreezeCheckFailsClosed`（含 `future_phase`、未知 status、provisioning machine）、`TestFreezeCheckOnLegacySchema`、`scripts/test-preflight-freeze.sh` | bf33d96、cb8ea5f |
+| daybreak R6-P1-03 | DB 有 migration marker 不代表 secret 換過；pre-migrated DB＋rollback 後舊 JWT 復活 | `deploy-prepare` 每次部署都**無條件** rotate `jwt_secret`（reachd 停著、持 lock）；`rotate-jwt-secret` 拿掉 `--if-session-migration-pending` | `TestDeployPrepareRotatesOnPreMigratedDB`（marker 存在、舊 JWT 在新 secret 下 401）；container 情境 N（先用新版 CLI 建 marker、部署、rollback 到 8c74086，部署前的 JWT 是 401） | 367e4c0 |
+| astra R5-01 | rollback 先 unlock 才換回舊 binary，中間啟動的 reachd 會是新版 | `deploy-restore` 在同一把 exclusive lock 裡把舊 binary 用 atomic install（copy→rename→dir fsync→比對內容）放回去，之後才 unlock；新增 `deploy-handoff` 給沒有 snapshot restore 的路徑 | container 情境 M（restore 持鎖時有人 start reachd，跑起來的是舊 binary）；`TestRestoreHandsBackTheBinary` | 2bb82a8 |
+| 文件 | Stage 4 部署順序跟腳本不一致 | 「部署順序」的 Stage 4 段照實際腳本順序改寫；active WebSocket target 是 0，只驗 carrier 101；sandbox unit 移出 freeze 期間；寫明 freeze 要靠操作的人遵守 | — | 本 commit |
+
+### 驗證
+
+- `go test -race ./...`：全部通過。
+- container（Ubuntu 24.04，真的 8c74086 與新版 reachd）：rollback A～N 全部通過（N 是本輪新增）。
+- `test-deploy-from-mac.sh`、`test-preflight-freeze.sh`、`test-deploy-lock.sh`、`test-readiness-argv.sh`：通過。
+
+## 延後到 Stage 5 前／之後（協調者指示，這一輪不做）
+
+- astra R5-02 ＝ daybreak R6-P2-02：recovery claim 要重驗 `NOT EXISTS observation`，heartbeat 與 claim 要有一致的 transaction 邊界（做了一半的 patch 存在 `~/30-39-Research/34-tech-research/2026-11-21-reach-deferred-heartbeat-atomicity.patch`，未 commit）。
+- daybreak R6-P2-03：observation、delivery、command result 同一個 transaction；`storeCommandResults` 錯誤要回傳（同上 patch）。
+- astra R5-03：update recovery 不該被 `canSelfUpdate` 擋住（Darwin restart_pending smoke）。
+- astra R5-04：DB parent 不存在時，要在拿 lock 前安全建立。
+- astra R5-06：README 的 carrier 101 probe 改用 printf＋`curl --config -`。
+- astra E1：confirm 前在 update lock 裡要求 running image hash == candidate hash。
+- daybreak R6-P2-01：fence manifest 加 deploy ID、snapshot SHA-256／size、DB identity，restore 前全部比對。
+- daybreak R6-P2-04：文件寫明 bearer ≠ agent／tunnel possession；challenge-bound 設計放 Stage 5 之後。
+- daybreak R6-P2-05：readiness 腳本 `set +x`、curl `-q`、loopback `--noproxy '*'`，加 xtrace／curlrc／proxy 測試。
+- daybreak R6-P2-06：DB nlink／owner／mode 檢查；shell deploy lock open 後驗 fd；config rotation 用 dir fd＋openat。
+- daybreak R6-P2-07：anti-rollback floor 在 update lock 裡重驗；confirm 拒絕低於 floor 的 candidate。
+- daybreak R6-P2-08：IPv6 加 `fec0::/10`、IPv4-compatible、`3fff::/20`、`5f00::/16`、Pref64；dial 依序試所有允許的位址。
+- daybreak R6-P3-01：setter 回傳 changed，只有變更才 publish event。
+- daybreak R6-P3-02：拒絕未來時間的 fence；手動 `deploy-fence check` 也驗 age。
+- daybreak N10 剩餘與 Stage 5 的 6 個前提（floor 重驗、完整 IPv6 policy、雙棧 fallback、pre-hardening backup＋PID 1 recovery、same-attempt watcher、N10 標準路徑 preflight）。
+- `enrollment_frozen` 設定開關（Stage 4～5 若跨很多天、需要由 server 真的拒絕 register 時再做）。
+- deploy/README 的整體整理（A～N 情境清單、prepare 說明、自動／opt-in 項目分開）。

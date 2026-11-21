@@ -44,7 +44,7 @@ enable, retire, then `systemd-analyze security reachd`.
 
 The steps are the functions between `BEGIN/END reachd transaction steps` in
 `scripts/deploy-jason.sh`; `scripts/test-rollback-in-container.sh` runs those
-same functions in Ubuntu 24.04 (scenarios A–G).
+same functions in Ubuntu 24.04 (scenarios A–N).
 
 1. reachd is stopped and the stop is proven (unit inactive, old PID gone,
    nobody holding the DB), then the DB snapshot and the deploy fence
