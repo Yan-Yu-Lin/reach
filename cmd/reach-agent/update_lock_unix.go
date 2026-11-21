@@ -31,3 +31,5 @@ func checkOwnedByMe(st os.FileInfo) error {
 	}
 	return nil
 }
+
+const oNoFollow = syscall.O_NOFOLLOW

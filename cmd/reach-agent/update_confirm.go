@@ -95,7 +95,7 @@ func (d *Daemon) proveSSHPath(ctx context.Context) error {
 
 // localSSHLoginProbe logs into the local sshd with a one-time key and runs
 // a harmless command whose output it checks.
-func (d *Daemon) localSSHLoginProbe(ctx context.Context) error {
+func (d *Daemon) localSSHLoginProbe(ctx context.Context) (retErr error) {
 	auth := d.cfg.LocalSSH.AuthFile
 	if auth == "" {
 		return fmt.Errorf("no authorized_keys path configured; cannot prove SSH login")
@@ -116,6 +116,11 @@ func (d *Daemon) localSSHLoginProbe(ctx context.Context) error {
 	if err := d.editAuthorizedKeys(func(lines []string) []string { return append(lines, line) }); err != nil {
 		return fmt.Errorf("add one-time key: %w", err)
 	}
+	// The one-time key must be gone before the probe can count as a
+	// success: a leftover key is authorization residue, so a failed
+	// cleanup fails the probe and the update is not confirmed (daybreak
+	// round 5 N10). It is retried on the next confirm attempt; sync_keys
+	// removes it too.
 	defer func() {
 		if err := d.editAuthorizedKeys(func(lines []string) []string {
 			out := lines[:0]
@@ -126,7 +131,10 @@ func (d *Daemon) localSSHLoginProbe(ctx context.Context) error {
 			}
 			return out
 		}); err != nil {
-			d.logger.Printf("could not remove the one-time confirm key (sync_keys will): %v", err)
+			d.logger.Printf("could not remove the one-time confirm key: %v", err)
+			if retErr == nil {
+				retErr = fmt.Errorf("one-time confirm key could not be removed: %w", err)
+			}
 		}
 	}()
 	user := d.cfg.LocalSSH.TargetUser

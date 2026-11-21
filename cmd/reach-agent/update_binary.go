@@ -76,6 +76,7 @@ type updateBinaryOptions struct {
 	configPath      string
 	dataDir         string
 	logPath         string
+	attempt         string
 }
 
 type reachInstallState struct {
@@ -108,6 +109,7 @@ func updateBinaryCommand(ctx context.Context, args []string) error {
 	fs.StringVar(&opt.configPath, "config", "", "internal: agent config path")
 	fs.StringVar(&opt.dataDir, "data-dir", "", "internal: data directory")
 	fs.StringVar(&opt.logPath, "log", "", "internal: update log path")
+	fs.StringVar(&opt.attempt, "attempt", "", "internal: update attempt this watcher is responsible for")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -318,21 +320,7 @@ func performBinaryUpdate(ctx context.Context, st reachInstallState, opt updateBi
 	}
 	fmt.Printf("[reach] candidate binary preflight OK: version=%s\n", candidateVersion)
 
-	id := time.Now().UTC().Format("20060102T150405Z")
-	if err := os.MkdirAll(filepath.Join(st.DataDir, "update-backups"), 0o700); err != nil {
-		return err
-	}
-	backupPath := filepath.Join(st.DataDir, "update-backups", "reach-agent.backup."+id)
-	if err := copyFile(st.AgentPath, backupPath, 0o755); err != nil {
-		return fmt.Errorf("backup current binary: %w", err)
-	}
-	fmt.Printf("[reach] backed up current binary to %s\n", backupPath)
-
 	candidateSHA, err := fileSHA256Hex(candidatePath)
-	if err != nil {
-		return err
-	}
-	backupSHA, err := fileSHA256Hex(backupPath)
 	if err != nil {
 		return err
 	}
@@ -340,9 +328,10 @@ func performBinaryUpdate(ctx context.Context, st reachInstallState, opt updateBi
 	if err != nil {
 		return err
 	}
+	backupPath := filepath.Join(st.DataDir, "update-backups", "reach-agent.backup."+attempt)
 	now := time.Now().UTC()
-	ust := &updateState{State: updPending, Attempt: attempt, Backup: backupPath, BackupSHA256: backupSHA, AgentPath: st.AgentPath, InstallMode: st.InstallMode, ConfigPath: st.ConfigPath, CandidateVersion: candidateVersion, CandidateSHA256: candidateSHA, CandidateSequence: manifestSequence(manifest), WasActive: opt.WasActive, InstalledAt: now.Format(time.RFC3339), Deadline: now.Add(opt.RollbackAfter).Format(time.RFC3339)}
-	rollbackLog := filepath.Join(st.DataDir, "update-rollback-"+id+".log")
+	ust := &updateState{State: updPending, Attempt: attempt, Backup: backupPath, AgentPath: st.AgentPath, InstallMode: st.InstallMode, ConfigPath: st.ConfigPath, CandidateVersion: candidateVersion, CandidateSHA256: candidateSHA, CandidateSequence: manifestSequence(manifest), WasActive: opt.WasActive, InstalledAt: now.Format(time.RFC3339), Deadline: now.Add(opt.RollbackAfter).Format(time.RFC3339)}
+	rollbackLog := filepath.Join(st.DataDir, "update-rollback-"+attempt+".log")
 	// Check, record, install and arm the watcher under one lock, so two
 	// workers cannot both pass the "nothing pending" check (daybreak
 	// round 4 P2-04).
@@ -360,6 +349,22 @@ func performBinaryUpdate(ctx context.Context, st reachInstallState, opt updateBi
 			return err
 		}
 		ust.FloorBefore = floor
+		// The backup is made only by the worker that owns this attempt,
+		// under the lock, in a new file named after the attempt
+		// (O_EXCL|O_NOFOLLOW): a second worker can neither overwrite nor
+		// redirect it (astra R4-06, daybreak round 5 N2).
+		if err := os.MkdirAll(filepath.Join(st.DataDir, "update-backups"), 0o700); err != nil {
+			return err
+		}
+		if err := copyFileExclusive(st.AgentPath, backupPath, 0o755); err != nil {
+			return fmt.Errorf("backup current binary: %w", err)
+		}
+		backupSHA, err := fileSHA256Hex(backupPath)
+		if err != nil {
+			return err
+		}
+		ust.BackupSHA256 = backupSHA
+		fmt.Printf("[reach] backed up current binary to %s\n", backupPath)
 		if err := writeUpdateState(st.DataDir, ust); err != nil {
 			return fmt.Errorf("record update state: %w", err)
 		}
@@ -369,7 +374,7 @@ func performBinaryUpdate(ctx context.Context, st reachInstallState, opt updateBi
 			return err
 		}
 		fmt.Printf("[reach] installed candidate at %s\n", st.AgentPath)
-		if err := startRollbackWatcher(st, rollbackLog, opt.RollbackAfter); err != nil {
+		if err := startRollbackWatcher(st, attempt, rollbackLog, opt.RollbackAfter); err != nil {
 			ust.State = updRollingBack
 			_ = writeUpdateState(st.DataDir, ust)
 			if rerr := restoreBinary(backupPath, st.AgentPath); rerr != nil {
@@ -781,7 +786,7 @@ func syncDir(dir string) error {
 	return d.Sync()
 }
 
-func startRollbackWatcher(st reachInstallState, logPath string, after time.Duration) error {
+func startRollbackWatcher(st reachInstallState, attempt, logPath string, after time.Duration) error {
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
@@ -792,7 +797,7 @@ func startRollbackWatcher(st reachInstallState, logPath string, after time.Durat
 		return err
 	}
 	defer devNull.Close()
-	args := []string{"update-binary", "--rollback-watcher", "--agent-path", st.AgentPath, "--install-mode", st.InstallMode, "--config", st.ConfigPath, "--data-dir", st.DataDir, "--rollback-after", after.String(), "--log", logPath}
+	args := []string{"update-binary", "--rollback-watcher", "--attempt", attempt, "--agent-path", st.AgentPath, "--install-mode", st.InstallMode, "--config", st.ConfigPath, "--data-dir", st.DataDir, "--rollback-after", after.String(), "--log", logPath}
 	cmd := exec.Command(st.AgentPath, args...)
 	cmd.Stdin = devNull
 	cmd.Stdout = logFile
@@ -824,22 +829,25 @@ func runUpdateRollbackWatcher(ctx context.Context, opt updateBinaryOptions) erro
 	// Decide under the update lock from the durable state: anything but
 	// "confirmed" (including a confirm still running or one that crashed)
 	// is rolled back (astra R2-09).
-	restored, err := rollbackIfUnconfirmed(opt.dataDir)
+	if opt.attempt == "" {
+		return fmt.Errorf("rollback watcher missing --attempt")
+	}
+	restored, err := rollbackIfUnconfirmed(opt.dataDir, opt.attempt)
 	if err != nil {
 		return err
 	}
 	if !restored {
-		fmt.Printf("[reach] update was confirmed; rollback canceled\n")
+		fmt.Printf("[reach] attempt %s was confirmed or superseded; rollback canceled\n", opt.attempt)
 		return nil
 	}
 	st := reachInstallState{AgentPath: opt.agentPath, InstallMode: opt.installMode, ConfigPath: opt.configPath, DataDir: opt.dataDir, PIDFile: filepath.Join(opt.dataDir, "reach-agent.pid"), LogPath: filepath.Join(opt.dataDir, "agent.log")}
 	// restart_pending until the restart succeeds: a crash here leaves the
 	// candidate process running, and the next start finishes the job.
+	// The restored binary marks the rollback finished itself on startup
+	// (it can prove it is running the backup image); this only asks for
+	// the restart (astra R4-07).
 	if err := restartReachAgent(ctx, st); err != nil {
 		return fmt.Errorf("rollback restored binary but restart failed (state restart_pending): %w", err)
-	}
-	if err := markRestarted(opt.dataDir); err != nil {
-		return err
 	}
 	fmt.Printf("[reach] update was not confirmed; rollback complete\n")
 	return nil
@@ -859,10 +867,12 @@ func resumeInterruptedUpdate(ctx context.Context, st reachInstallState, logf fun
 		return
 	}
 	if ust.State == updRestartPending {
-		// The binary was restored but the agent never restarted on it. If
-		// we are that restored binary, the rollback is complete.
-		if fileMatches(ust.AgentPath, ust.BackupSHA256) && embeddedVersionIsNot(ust.CandidateVersion) {
-			if err := markRestarted(st.DataDir); err != nil {
+		// If this process runs the restored backup image, the rollback is
+		// complete; compared by the hash of the running image, not by a
+		// version string, so a same-version reinstall works too (astra
+		// R4-07).
+		if running, err := runningImageSHA256(); err == nil && ust.BackupSHA256 != "" && running == ust.BackupSHA256 {
+			if err := markRestarted(st.DataDir, ust.Attempt); err != nil {
 				logf("could not finish rollback: %v", err)
 			}
 			return
@@ -875,12 +885,12 @@ func resumeInterruptedUpdate(ctx context.Context, st reachInstallState, logf fun
 	remaining := time.Until(ust.deadline())
 	if remaining > 0 {
 		logPath := filepath.Join(st.DataDir, "update-rollback-resume-"+time.Now().UTC().Format("20060102T150405Z")+".log")
-		if err := startRollbackWatcher(st, logPath, remaining); err != nil {
+		if err := startRollbackWatcher(st, ust.Attempt, logPath, remaining); err != nil {
 			logf("could not re-arm rollback watcher: %v", err)
 		}
 		return
 	}
-	restored, err := rollbackIfUnconfirmed(st.DataDir)
+	restored, err := rollbackIfUnconfirmed(st.DataDir, ust.Attempt)
 	if err != nil {
 		logf("interrupted update rollback failed: %v", err)
 		return
@@ -893,9 +903,31 @@ func resumeInterruptedUpdate(ctx context.Context, st reachInstallState, logf fun
 	}
 }
 
-// embeddedVersionIsNot: this running binary is not the given candidate.
-func embeddedVersionIsNot(candidate string) bool {
-	return candidate == "" || version != candidate
+// copyFileExclusive copies src into a NEW file dst (O_EXCL|O_NOFOLLOW)
+// and fsyncs it; an existing dst or a symlink there is an error.
+func copyFileExclusive(src, dst string, mode os.FileMode) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY|oNoFollow, mode)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		_ = os.Remove(dst)
+		return err
+	}
+	if err := out.Sync(); err != nil {
+		_ = out.Close()
+		return err
+	}
+	if err := out.Close(); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(dst))
 }
 
 func randomAttemptID() (string, error) {

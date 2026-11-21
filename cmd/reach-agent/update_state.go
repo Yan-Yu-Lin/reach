@@ -102,6 +102,14 @@ func checkDataDir(dataDir string) error {
 }
 
 func readUpdateState(dataDir string) (*updateState, error) {
+	// The directory is checked before any read (daybreak round 5 N10): a
+	// symlinked or foreign DataDir is refused, not followed.
+	if err := checkDataDir(dataDir); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("update data dir: %w", err)
+	}
 	f, err := openNoFollow(filepath.Join(dataDir, updateStateFile))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -228,10 +236,12 @@ func confirmUpdateState(dataDir string) (handled bool, err error) {
 	return handled, err
 }
 
-// rollbackIfUnconfirmed is the watcher's decision, under the lock. It
-// returns true when the agent must be restarted on the restored binary
-// (the caller restarts it and then calls markRestarted).
-func rollbackIfUnconfirmed(dataDir string) (bool, error) {
+// rollbackIfUnconfirmed is the watcher's decision, under the lock. It acts
+// only on the attempt the caller is responsible for (astra R4-05): a
+// watcher left over from an earlier, confirmed attempt never touches a
+// later one. It returns true when the agent must be restarted on the
+// restored binary (the caller restarts it and then calls markRestarted).
+func rollbackIfUnconfirmed(dataDir, attempt string) (bool, error) {
 	needRestart := false
 	err := withUpdateLock(dataDir, func() error {
 		st, err := readUpdateState(dataDir)
@@ -240,6 +250,15 @@ func rollbackIfUnconfirmed(dataDir string) (bool, error) {
 		}
 		if st.terminal() {
 			return nil
+		}
+		if st.Attempt != attempt {
+			return nil // another attempt's state; not ours
+		}
+		// A state without identities (an unreleased earlier build) cannot
+		// prove what is on disk: never replay a restore from it (R4-11).
+		if st.CandidateSHA256 == "" || st.BackupSHA256 == "" {
+			st.State = updRolledBack
+			return writeUpdateState(dataDir, st)
 		}
 		switch st.State {
 		case updRestartPending:
@@ -263,11 +282,11 @@ func rollbackIfUnconfirmed(dataDir string) (bool, error) {
 		// Only restore over the binary this attempt installed. If the path
 		// now holds something else (a later update by an older agent), this
 		// state is stale: retire it, leave the binary alone (R3-07).
-		if st.CandidateSHA256 != "" && !fileMatches(st.AgentPath, st.CandidateSHA256) {
+		if !fileMatches(st.AgentPath, st.CandidateSHA256) {
 			st.State = updRolledBack
 			return writeUpdateState(dataDir, st)
 		}
-		if st.BackupSHA256 != "" && !fileMatches(st.Backup, st.BackupSHA256) {
+		if !fileMatches(st.Backup, st.BackupSHA256) {
 			return fmt.Errorf("backup %s does not match the recorded hash; not restoring", st.Backup)
 		}
 		st.State = updRollingBack
@@ -288,15 +307,30 @@ func rollbackIfUnconfirmed(dataDir string) (bool, error) {
 }
 
 // markRestarted ends a rollback once the agent runs the restored binary.
-func markRestarted(dataDir string) error {
+// attempt binds it to the rollback it finishes.
+func markRestarted(dataDir, attempt string) error {
 	return withUpdateLock(dataDir, func() error {
 		st, err := readUpdateState(dataDir)
-		if err != nil || st == nil || st.State != updRestartPending {
+		if err != nil || st == nil || st.State != updRestartPending || st.Attempt != attempt {
 			return err
 		}
 		st.State = updRolledBack
 		return writeUpdateState(dataDir, st)
 	})
+}
+
+// runningImageSHA256 hashes the binary this process was started from
+// (Linux /proc/self/exe; the open inode, not the path, so a replaced file
+// on disk does not change it).
+func runningImageSHA256() (string, error) {
+	if _, err := os.Stat("/proc/self/exe"); err == nil {
+		return fileSHA256Hex("/proc/self/exe")
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	return fileSHA256Hex(exe)
 }
 
 // updatePending reports an update that still awaits confirmation (state

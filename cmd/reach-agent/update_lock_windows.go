@@ -15,3 +15,5 @@ func openLockNoFollow(path string) (*os.File, error) {
 	return os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 }
 func checkOwnedByMe(os.FileInfo) error { return nil }
+
+const oNoFollow = 0

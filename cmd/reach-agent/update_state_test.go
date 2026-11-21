@@ -60,7 +60,7 @@ func TestConfirmRaisesFloorFromState(t *testing.T) {
 	if f, _ := readReleaseFloor(dir); f != 1_790_000_000 {
 		t.Fatalf("floor after confirm = %d", f)
 	}
-	if restored, err := rollbackIfUnconfirmed(dir); err != nil || restored {
+	if restored, err := rollbackIfUnconfirmed(dir, "a1"); err != nil || restored {
 		t.Fatalf("confirmed update rolled back: %v %v", restored, err)
 	}
 	if agentBytes(t, agent) != "candidate" {
@@ -80,7 +80,7 @@ func TestConfirmKeepsRollbackArmedWhenFloorFails(t *testing.T) {
 	if st, _ := readUpdateState(dir); st == nil || st.State != updPending {
 		t.Fatalf("state after failed confirm = %+v", st)
 	}
-	if restored, err := rollbackIfUnconfirmed(dir); err != nil || !restored || agentBytes(t, agent) != "old" {
+	if restored, err := rollbackIfUnconfirmed(dir, "a1"); err != nil || !restored || agentBytes(t, agent) != "old" {
 		t.Fatalf("rollback after failed confirm: restored=%v err=%v", restored, err)
 	}
 }
@@ -117,7 +117,7 @@ func TestWatcherDoesNotTrustAnInProgressConfirm(t *testing.T) {
 	<-inConfirm
 	watcherDone := make(chan error, 1)
 	go func() {
-		watcherDone <- runUpdateRollbackWatcher(context.Background(), updateBinaryOptions{RollbackAfter: time.Millisecond, dataDir: dir, agentPath: agent})
+		watcherDone <- runUpdateRollbackWatcher(context.Background(), updateBinaryOptions{RollbackAfter: time.Millisecond, dataDir: dir, agentPath: agent, attempt: "a1"})
 	}()
 	select {
 	case err := <-watcherDone:
@@ -144,7 +144,7 @@ func TestCrashedConfirmIsRolledBack(t *testing.T) {
 	if err := writeUpdateState(dir, st); err != nil {
 		t.Fatal(err)
 	}
-	restored, err := rollbackIfUnconfirmed(dir)
+	restored, err := rollbackIfUnconfirmed(dir, "a1")
 	if err != nil || !restored || agentBytes(t, agent) != "old" {
 		t.Fatalf("crashed confirm not rolled back: restored=%v err=%v", restored, err)
 	}
@@ -154,7 +154,7 @@ func TestCrashedConfirmIsRolledBack(t *testing.T) {
 	if err := confirmUpdate(reachInstallState{DataDir: dir}); err == nil {
 		t.Fatal("confirm during rollback succeeded")
 	}
-	if err := markRestarted(dir); err != nil {
+	if err := markRestarted(dir, "a1"); err != nil {
 		t.Fatal(err)
 	}
 	if st, _ := readUpdateState(dir); st.State != updRolledBack {
@@ -192,7 +192,7 @@ func TestCrashAfterFloorWriteFinishesConfirm(t *testing.T) {
 	if err := raiseReleaseFloor(dir, st.CandidateSequence); err != nil {
 		t.Fatal(err)
 	}
-	restored, err := rollbackIfUnconfirmed(dir)
+	restored, err := rollbackIfUnconfirmed(dir, "a1")
 	if err != nil || restored || agentBytes(t, agent) != "candidate" {
 		t.Fatalf("rolled back past a durable floor: restored=%v err=%v", restored, err)
 	}
@@ -259,7 +259,7 @@ func TestCompletedRestoreIsNotReplayed(t *testing.T) {
 	if err := os.WriteFile(st.Backup, []byte("old"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	need, err := rollbackIfUnconfirmed(dir)
+	need, err := rollbackIfUnconfirmed(dir, "a1")
 	if err != nil || !need {
 		t.Fatalf("need restart=%v err=%v", need, err)
 	}
@@ -321,5 +321,104 @@ func TestUpdateStartIsSingleFlight(t *testing.T) {
 	wg.Wait()
 	if started != 1 {
 		t.Fatalf("%d workers started an update", started)
+	}
+}
+
+// Astra R4-05 / daybreak round 5 N2: a watcher left over from attempt A
+// does not roll back attempt B.
+func TestOldWatcherLeavesNewAttemptAlone(t *testing.T) {
+	dir, agent := pendingUpdateFixture(t)
+	st, _ := readUpdateState(dir)
+	st.Attempt = "attempt-b"
+	st.Deadline = time.Now().Add(time.Minute).UTC().Format(time.RFC3339)
+	if err := writeUpdateState(dir, st); err != nil {
+		t.Fatal(err)
+	}
+	if err := runUpdateRollbackWatcher(context.Background(), updateBinaryOptions{RollbackAfter: time.Millisecond, dataDir: dir, agentPath: agent, attempt: "attempt-a"}); err != nil {
+		t.Fatal(err)
+	}
+	if agentBytes(t, agent) != "candidate" {
+		t.Fatal("attempt A's watcher rolled back attempt B")
+	}
+	if st, _ := readUpdateState(dir); st.State != updPending {
+		t.Fatalf("state = %s", st.State)
+	}
+}
+
+// Astra R4-06: the backup is created exclusively; an existing file (from a
+// second worker, or planted) is never overwritten or followed.
+func TestBackupIsCreatedExclusively(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "agent")
+	_ = os.WriteFile(src, []byte("running"), 0o755)
+	dst := filepath.Join(dir, "backup")
+	_ = os.WriteFile(dst, []byte("winner-backup"), 0o755)
+	if err := copyFileExclusive(src, dst, 0o755); err == nil {
+		t.Fatal("existing backup overwritten")
+	}
+	if b, _ := os.ReadFile(dst); string(b) != "winner-backup" {
+		t.Fatal("backup content changed")
+	}
+	link := filepath.Join(dir, "link")
+	_ = os.Symlink(filepath.Join(dir, "elsewhere"), link)
+	if err := copyFileExclusive(src, link, 0o755); err == nil {
+		t.Fatal("backup written through a symlink")
+	}
+}
+
+// Astra R4-07: restart_pending is finished by the process running the
+// backup image, compared by image hash, even when the candidate and the
+// backup carry the same version string.
+func TestRestartPendingFinishedByRunningImage(t *testing.T) {
+	dir, agent := pendingUpdateFixture(t)
+	running, err := runningImageSHA256()
+	if err != nil {
+		t.Skip("cannot hash the running image here")
+	}
+	st, _ := readUpdateState(dir)
+	st.State = updRestartPending
+	st.BackupSHA256 = running
+	st.CandidateVersion = version // same version string as this binary
+	if err := writeUpdateState(dir, st); err != nil {
+		t.Fatal(err)
+	}
+	resumeInterruptedUpdate(context.Background(), reachInstallState{DataDir: dir, AgentPath: agent}, t.Logf)
+	if st, _ := readUpdateState(dir); st.State != updRolledBack {
+		t.Fatalf("restart_pending not finished by the restored image: %s", st.State)
+	}
+}
+
+// Astra R4-11: a state without identities is never replayed.
+func TestHashlessStateIsNotReplayed(t *testing.T) {
+	dir, agent := pendingUpdateFixture(t)
+	st, _ := readUpdateState(dir)
+	st.State = updRollingBack
+	st.CandidateSHA256, st.BackupSHA256 = "", ""
+	if err := writeUpdateState(dir, st); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(agent, []byte("future-candidate"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rollbackIfUnconfirmed(dir, "a1"); err != nil {
+		t.Fatal(err)
+	}
+	if agentBytes(t, agent) != "future-candidate" {
+		t.Fatal("hashless state replayed a restore")
+	}
+}
+
+// Daybreak round 5 N10: a symlinked DataDir is refused before any read.
+func TestSymlinkedDataDirNotRead(t *testing.T) {
+	real := t.TempDir()
+	if err := writeUpdateState(real, &updateState{State: updPending, Attempt: "x"}); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "data")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	if st, err := readUpdateState(link); err == nil && st != nil {
+		t.Fatal("state read through a symlinked DataDir")
 	}
 }
