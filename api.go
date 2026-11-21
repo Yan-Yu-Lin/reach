@@ -1100,11 +1100,18 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "could not store heartbeat")
 		return
 	}
+	// An authenticated heartbeat proves the agent received its token: the
+	// provision was delivered, whatever the agent says about its tunnel
+	// (tunnel health is judged by the hub probe, not by this report)
+	// (daybreak round 5 N3, astra R4-04).
+	if _, err := s.store.db.ExecContext(r.Context(), `UPDATE requests SET provision_phase='delivered' WHERE machine_id=? AND provision_phase='response_pending'`, hb.MachineID); err != nil {
+		writeErr(w, 500, "could not store heartbeat")
+		return
+	}
 	// agent_status was a write-only duplicate of agent_observations (perf #3).
 	if hb.Observed.Tunnel.State == "connected" || hb.Observed.Tunnel.State == "running" {
 		// Only write when the status flips or last_seen_at is getting stale.
 		staleBefore := time.Now().UTC().Add(-tunnelSeenWriteInterval).Format(time.RFC3339)
-		_, _ = s.store.db.ExecContext(r.Context(), `UPDATE requests SET provision_phase='delivered' WHERE machine_id=? AND provision_phase='response_pending'`, hb.MachineID)
 		_, _ = s.store.db.ExecContext(r.Context(), `UPDATE tunnels SET status='online', last_seen_at=? WHERE machine_id=? AND status NOT IN ('disabled','retired','failed','cleanup_failed') AND (status<>'online' OR last_seen_at IS NULL OR last_seen_at<?)`, now, hb.MachineID, staleBefore)
 	}
 	old := m.ObservedState

@@ -298,3 +298,30 @@ func TestHeartbeatMarksProvisionDelivered(t *testing.T) {
 		t.Fatalf("phase = %s", phase)
 	}
 }
+
+// Daybreak round 5 N3 / astra R4-04: a valid heartbeat reporting a stopped
+// tunnel still proves delivery; the machine is not revoked an hour later.
+func TestStoppedTunnelHeartbeatStillMarksDelivered(t *testing.T) {
+	server, store, _ := newReliabilityTestServer(t)
+	server.prov.osOps = &fakeTunnelOS{}
+	insertRetireFixture(t, server, "m_slow", "slow-box", "rt-slowhb11", 9296)
+	old := time.Now().UTC().Add(-2 * time.Hour).Format(time.RFC3339)
+	future := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+	if _, err := store.db.Exec(`INSERT INTO requests(id,name,client_secret_hash,status,created_at,expires_at,slug,provisioning_started_at,machine_id,provision_phase) VALUES ('r_slow','slow','sha256:x','provisioned',?,?,'slow-box',?,'m_slow','response_pending')`, old, future, old); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"machine_id":"m_slow","agent_version":"t","applied_generation":1,"observed":{"local_ssh":{"state":"down"},"tunnel":{"state":"stopped"},"persistence":{},"keys":{}}}`
+	if rec := doJSON(t, server, http.MethodPost, "/api/client/agent/heartbeat", body, "at_m_slow"); rec.Code != 200 {
+		t.Fatalf("heartbeat %d", rec.Code)
+	}
+	if err := server.prov.recoverStuckProvisioning(context.Background(), time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	var desired, phase string
+	var token sql.NullString
+	_ = store.db.QueryRow(`SELECT desired_state,agent_token_hash FROM machines WHERE id='m_slow'`).Scan(&desired, &token)
+	_ = store.db.QueryRow(`SELECT provision_phase FROM requests WHERE id='r_slow'`).Scan(&phase)
+	if desired != DesiredActive || !token.Valid || phase != phaseDelivered {
+		t.Fatalf("heartbeating machine revoked: desired=%s token=%v phase=%s", desired, token.Valid, phase)
+	}
+}

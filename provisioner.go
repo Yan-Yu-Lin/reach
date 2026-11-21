@@ -1766,7 +1766,8 @@ func (p *Provisioner) recoverStuckProvisioning(ctx context.Context, now time.Tim
 	respCutoff := now.Add(-responseLease).Format(time.RFC3339)
 	rows, err := p.store.db.QueryContext(ctx, `SELECT id FROM requests WHERE
 		(status='provisioning' AND (provisioning_started_at IS NULL OR provisioning_started_at<?))
-		OR (status='provisioned' AND provision_phase='response_pending' AND provisioning_started_at<?)`, cutoff, respCutoff)
+		OR (status='provisioned' AND provision_phase='response_pending' AND provisioning_started_at<?
+			AND NOT EXISTS (SELECT 1 FROM agent_observations o WHERE o.machine_id=requests.machine_id))`, cutoff, respCutoff)
 	if err != nil {
 		return err
 	}
