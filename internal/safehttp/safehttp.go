@@ -135,9 +135,44 @@ func (d Downloader) allowed(u *url.URL) error {
 	return fmt.Errorf("download origin %s is not the configured Reach API", o)
 }
 
-// disallowedIP: addresses an artifact download must never reach.
+// specialRanges: RFC 6890 special-purpose blocks that are not plain
+// global unicast, plus the IPv6 translation/tunnel prefixes that embed an
+// IPv4 address (daybreak round 5 N5, astra R4-09).
+var specialRanges = func() []*net.IPNet {
+	var out []*net.IPNet
+	for _, c := range []string{
+		"0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
+		"169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24",
+		"192.88.99.0/24", "192.168.0.0/16", "198.18.0.0/15", "198.51.100.0/24",
+		"203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4", "255.255.255.255/32",
+		"::/128", "::1/128", "64:ff9b::/96", "64:ff9b:1::/48",
+		"100::/64", "2001::/23", "2001:db8::/32", "2002::/16", "fc00::/7",
+		"fe80::/10", "ff00::/8",
+	} {
+		_, n, err := net.ParseCIDR(c)
+		if err != nil {
+			panic(err)
+		}
+		out = append(out, n)
+	}
+	return out
+}()
+
+// disallowedIP: only explicit global unicast outside every special-purpose
+// block is allowed for artifact downloads.
 func disallowedIP(ip net.IP) bool {
-	return ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() || ip.IsLoopback() || ip.IsInterfaceLocalMulticast()
+	if ip == nil || !ip.IsGlobalUnicast() {
+		return true
+	}
+	if v4 := ip.To4(); v4 != nil {
+		ip = v4 // IPv4-mapped IPv6 (::ffff:a.b.c.d) is checked as the IPv4
+	}
+	for _, n := range specialRanges {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 // Client returns an http.Client enforcing the origin and address rules on

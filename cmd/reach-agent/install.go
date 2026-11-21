@@ -265,7 +265,7 @@ func installCommand(ctx context.Context, args []string) error {
 			}
 		} else if carrier == "wstunnel" {
 			wsPath = filepath.Join(opt.DataDir, "wstunnel")
-			if err := installWSTunnel(ctx, wsPath, prov.WebSocket); err != nil {
+			if err := installWSTunnel(ctx, opt.APIURL, wsPath, prov.WebSocket); err != nil {
 				return err
 			}
 		} else {
@@ -811,7 +811,10 @@ func installAdminKeys(authFile, user string, prov provisionResponse, chownFiles 
 	return applyAuthorizedKeysPermissions(authFile, user, chownFiles)
 }
 
-func installWSTunnel(ctx context.Context, dest string, ws *websocketTunnelConfig) error {
+// installWSTunnel downloads the legacy carrier only from the Reach API this
+// installer was told to use (apiURL, local config), never from an origin
+// named by the hub's response (astra R4-08, daybreak round 5 N5).
+func installWSTunnel(ctx context.Context, apiURL, dest string, ws *websocketTunnelConfig) error {
 	key := runtimeArchKey()
 	bin, ok := ws.Binaries[key]
 	if !ok {
@@ -821,7 +824,7 @@ func installWSTunnel(ctx context.Context, dest string, ws *websocketTunnelConfig
 		return fmt.Errorf("wstunnel binary for %s has no sha256 pin; refusing to install it", key)
 	}
 	fmt.Printf("[reach] installing wstunnel carrier for %s\n", key)
-	data, err := download(ctx, bin.URL)
+	data, err := download(ctx, apiURL, bin.URL)
 	if err != nil {
 		return err
 	}
@@ -846,10 +849,10 @@ func installWSTunnel(ctx context.Context, dest string, ws *websocketTunnelConfig
 // origin is the only one allowed (no cross-origin redirects), it must be
 // https and resolve to public addresses; the caller requires a pinned
 // sha256 (daybreak round 4 P2-03).
-func download(ctx context.Context, url string) ([]byte, error) {
-	origin, err := safehttp.OriginOf(url)
-	if err != nil {
-		return nil, err
+func download(ctx context.Context, apiURL, url string) ([]byte, error) {
+	origin, err := safehttp.OriginOf(apiURL)
+	if err != nil || apiURL == "" {
+		return nil, fmt.Errorf("no configured Reach API origin for downloads")
 	}
 	dl := safehttp.Downloader{Origins: []string{origin}, Timeout: 5 * time.Minute}
 	if err := dl.Check(url); err != nil {

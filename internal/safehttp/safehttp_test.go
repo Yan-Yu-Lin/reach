@@ -134,3 +134,22 @@ func TestDownloaderCheck(t *testing.T) {
 		}
 	}
 }
+
+// Daybreak round 5 N5 / astra R4-09: only plain global unicast is allowed.
+func TestSpecialPurposeAddressesRefused(t *testing.T) {
+	for _, ip := range []string{
+		"100.64.0.1", "100.100.100.200", "100.127.255.254", // RFC 6598 (tailnets)
+		"64:ff9b::a00:1", "2002:a00:1::1", "::ffff:10.0.0.1", // NAT64, 6to4, mapped
+		"198.18.0.1", "192.0.2.1", "198.51.100.1", "203.0.113.1", "2001:db8::1", // benchmark, docs
+		"240.0.0.1", "0.1.2.3", "fc00::1", "ff02::1", "192.0.0.8",
+	} {
+		if !disallowedIP(net.ParseIP(ip)) {
+			t.Errorf("%s allowed", ip)
+		}
+	}
+	for _, ip := range []string{"1.1.1.1", "125.229.144.147", "2606:4700:4700::1111"} {
+		if disallowedIP(net.ParseIP(ip)) {
+			t.Errorf("%s refused", ip)
+		}
+	}
+}
