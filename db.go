@@ -389,6 +389,21 @@ func (s *Store) Migrate(ctx context.Context, cfg Config) error {
 	// ALTER but before the bump is retried on the next start (daybreak
 	// round 3 P1-C). A deployment that already ran the earlier
 	// column-presence version bumps once more: everyone logs in again.
+	// Requests provisioned by an unreleased intermediate build carry a
+	// machine link but no phase (astra R4-12). A machine that ever
+	// heartbeated was delivered; the others go to response_pending, so
+	// recovery revokes them only if they never heartbeat. Production
+	// 8c74086 rows have no machine link and are left alone (they can never
+	// be mistaken for undelivered provisions).
+	if err := s.runOnce(ctx, "2026-11-21-backfill-provision-phase", func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `UPDATE requests SET provision_phase='delivered' WHERE status='provisioned' AND provision_phase IS NULL AND machine_id IS NOT NULL AND machine_id<>'' AND machine_id IN (SELECT machine_id FROM agent_observations)`); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, `UPDATE requests SET provision_phase='response_pending' WHERE status='provisioned' AND provision_phase IS NULL AND machine_id IS NOT NULL AND machine_id<>''`)
+		return err
+	}); err != nil {
+		return err
+	}
 	if err := s.runOnce(ctx, "2026-11-21-invalidate-pre-session-version-jwts", func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `UPDATE users SET session_version=session_version+1`)
 		return err

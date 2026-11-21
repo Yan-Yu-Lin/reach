@@ -411,3 +411,37 @@ func TestUpdateOriginIsTyped(t *testing.T) {
 		t.Fatal("reserved admin username accepted")
 	}
 }
+
+// Daybreak round 5 N9 / astra R4-10: repeating the same process title or
+// update policy changes nothing: no journal row, no decision audit, no
+// generation bump, so a safe rollback is not blocked.
+func TestRepeatedSettingsAreNoOps(t *testing.T) {
+	server, store, cfg := newReliabilityTestServer(t)
+	insertRetireFixture(t, server, "m_p", "p-box", "rt-pbox1111", 9259)
+	if _, err := store.db.Exec(`UPDATE machines SET created_at='2026-01-01T00:00:00Z'`); err != nil {
+		t.Fatal(err)
+	}
+	admin, _ := adminTestToken(t, store, cfg)
+	doJSON(t, server, http.MethodPost, "/api/admin/machines/m_p/process-title", `{"process_title_config":{"process_title":"x"}}`, admin)
+	doJSON(t, server, http.MethodPost, "/api/admin/machines/m_p/update-policy", `{"update_policy":"auto"}`, admin)
+	var gen int
+	_ = store.db.QueryRow(`SELECT desired_generation FROM machines WHERE id='m_p'`).Scan(&gen)
+	f := fenceNow(t, server)
+	time.Sleep(1100 * time.Millisecond)
+	for i := 0; i < 3; i++ {
+		if rec := doJSON(t, server, http.MethodPost, "/api/admin/machines/m_p/process-title", `{"process_title_config":{"process_title":"x"}}`, admin); rec.Code != 200 {
+			t.Fatalf("repeat title %d", rec.Code)
+		}
+		if rec := doJSON(t, server, http.MethodPost, "/api/admin/machines/m_p/update-policy", `{"update_policy":"auto"}`, admin); rec.Code != 200 {
+			t.Fatalf("repeat policy %d", rec.Code)
+		}
+	}
+	var gen2 int
+	_ = store.db.QueryRow(`SELECT desired_generation FROM machines WHERE id='m_p'`).Scan(&gen2)
+	if gen2 != gen {
+		t.Fatalf("generation bumped by no-ops: %d -> %d", gen, gen2)
+	}
+	if w := durable(t, server, f); len(w) != 0 {
+		t.Fatalf("no-ops block rollback: %v", w)
+	}
+}

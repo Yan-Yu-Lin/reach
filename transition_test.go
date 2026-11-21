@@ -325,3 +325,35 @@ func TestStoppedTunnelHeartbeatStillMarksDelivered(t *testing.T) {
 		t.Fatalf("heartbeating machine revoked: desired=%s token=%v phase=%s", desired, token.Valid, phase)
 	}
 }
+
+// Astra R4-12: provisioned rows with a machine link but no phase (an
+// unreleased build) are backfilled; production rows without a machine link
+// are untouched and never treated as undelivered.
+func TestProvisionPhaseBackfill(t *testing.T) {
+	server, store, cfg := newReliabilityTestServer(t)
+	insertRetireFixture(t, server, "m_seen", "seen-box", "rt-seenbox1", 9297)
+	insertRetireFixture(t, server, "m_unseen", "unseen-box", "rt-unseenb1", 9298)
+	old := time.Now().UTC().Add(-48 * time.Hour).Format(time.RFC3339)
+	for _, r := range [][2]string{{"r_seen", "m_seen"}, {"r_unseen", "m_unseen"}, {"r_prod", ""}} {
+		if _, err := store.db.Exec(`INSERT INTO requests(id,name,client_secret_hash,status,created_at,expires_at,slug,provisioning_started_at,machine_id) VALUES (?,?,'sha256:x','provisioned',?,?,?,?,NULLIF(?,''))`, r[0], r[0], old, old, r[0], old, r[1]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.db.Exec(`INSERT INTO agent_observations (machine_id,heartbeat_at) VALUES ('m_seen',?)`, old); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`DELETE FROM schema_migrations WHERE name='2026-11-21-backfill-provision-phase'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Migrate(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	phase := func(id string) string {
+		var p sql.NullString
+		_ = store.db.QueryRow(`SELECT provision_phase FROM requests WHERE id=?`, id).Scan(&p)
+		return p.String
+	}
+	if phase("r_seen") != phaseDelivered || phase("r_unseen") != phaseResponsePending || phase("r_prod") != "" {
+		t.Fatalf("seen=%s unseen=%s prod=%q", phase("r_seen"), phase("r_unseen"), phase("r_prod"))
+	}
+}

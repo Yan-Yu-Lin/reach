@@ -773,19 +773,25 @@ func (p *Provisioner) SetUpdatePolicy(ctx context.Context, idOrSlug, policy, act
 		return Machine{}, err
 	}
 	now := nowUTC()
+	changed := true
 	if err := p.store.durableTx(ctx, "machine.update_policy", m.ID, actor, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `UPDATE machines SET update_policy=?, updated_at=? WHERE id=? AND COALESCE(update_policy,'')<>?`, policy, now, m.ID, policy)
 		if err != nil {
 			return err
 		}
 		if n, _ := res.RowsAffected(); n == 0 {
+			changed = false
 			return errNoChange
 		}
 		return nil
 	}); err != nil {
 		return Machine{}, err
 	}
-	p.store.Audit(ctx, "machine.update_policy.update", actor, m.ID, "policy="+policy)
+	// No decision audit for a no-op: it would make the deploy fence's audit
+	// fallback block a safe rollback (astra R4-10).
+	if changed {
+		p.store.Audit(ctx, "machine.update_policy.update", actor, m.ID, "policy="+policy)
+	}
 	return p.GetMachine(ctx, m.ID)
 }
 
@@ -821,6 +827,16 @@ func (p *Provisioner) SetProcessTitleConfig(ctx context.Context, idOrSlug string
 			}
 			raw = string(b)
 		}
+	}
+	// Same canonical config as stored: nothing to do, no generation bump,
+	// no journal row (daybreak round 5 N9).
+	var cur sql.NullString
+	if err := p.store.db.QueryRowContext(ctx, `SELECT process_title_config_json FROM machines WHERE id=?`, m.ID).Scan(&cur); err != nil {
+		return Machine{}, err
+	}
+	newStr, _ := raw.(string)
+	if cur.String == newStr {
+		return m, nil
 	}
 	now := nowUTC()
 	gen := m.DesiredGeneration + 1

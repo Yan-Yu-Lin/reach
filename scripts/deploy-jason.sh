@@ -1118,13 +1118,20 @@ if ! sudo "$UV_BIN" run --script scripts/prune-deploy-backups.py --retain "$BACK
   '/var/lib/reach/deploy-backups/reachd.service.*' \
   '/var/lib/reach/deploy-backups/10-reach-limits.conf.*' \
   '/var/lib/reach/deploy-backups/ws-carrier.env.*' \
-  '/var/lib/reach/deploy-backups/reachd-probe.*' \
-  '/var/lib/reach/deploy-backups/config.yaml.*' \
   '/var/lib/reach/deploy-backups/agent-publication.*' \
-  "$AGENT_DOWNLOAD_ROOT/v*.replaced.*" \
-  "$DB_BACKUP_DIR/failed.*" \
-  "$DB_BACKUP_DIR/$(basename "$DB_PATH").*"; then
+  "$AGENT_DOWNLOAD_ROOT/v*.replaced.*"; then
   echo "[deploy] WARNING: deployment succeeded, but backup pruning failed" >&2
+fi
+# The rollback set of one deploy (fence, snapshot, probe binary, config
+# backup, forensic set) is pruned as a group (daybreak round 5 N9).
+if ! sudo "$UV_BIN" run --script scripts/prune-deploy-backups.py --retain "$BACKUP_RETAIN" \
+  --group '([0-9]{8}T[0-9]{6}Z)' \
+  "$DB_BACKUP_DIR/deploy-fence.*.json" \
+  "$DB_BACKUP_DIR/$(basename "$DB_PATH").*" \
+  "$DB_BACKUP_DIR/failed.*" \
+  '/var/lib/reach/deploy-backups/reachd-probe.*' \
+  '/var/lib/reach/deploy-backups/config.yaml.*'; then
+  echo "[deploy] WARNING: deployment succeeded, but rollback-set pruning failed" >&2
 fi
 
 if [ "$PUBLISH_AGENT_RELEASE" = 1 ]; then
